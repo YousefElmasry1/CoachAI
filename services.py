@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import threading
+import uuid
 from datetime import date, timedelta
 from typing import Any, Optional
 
@@ -28,6 +29,129 @@ import streamlit as st
 from config import DEFAULT_ANALYTICS_WINDOW, DEFAULT_USER_ID
 
 _local = threading.local()
+
+
+# ─────────────────────────────────────────────────────────────
+# Per-Session Identity (lightweight guest accounts — no real auth)
+# ─────────────────────────────────────────────────────────────
+
+def get_current_user_id() -> int:
+    """
+    Return the user_id for the current browser session.
+
+    Every visitor gets their own guest row in `users` (created by
+    create_guest_user() once they answer the name prompt), so their
+    plans/tasks/categories/analytics never mix with anyone else's.
+    Falls back to DEFAULT_USER_ID if that hasn't happened yet (e.g.
+    the key is missing, or present but still None).
+    """
+    user_id = st.session_state.get("user_id")
+    return user_id if user_id is not None else DEFAULT_USER_ID
+
+
+def create_guest_user(display_name: str) -> Optional[int]:
+    """
+    Register a brand-new, fully isolated guest account for this
+    browser session. Not real authentication (no login, no password
+    the user knows) — just a unique row so this visitor's data is
+    separate from everyone else's.
+
+    Returns the new user_id, or None on failure.
+    """
+    db = get_database()
+    guest_email = f"guest-{uuid.uuid4().hex}@coachai.local"
+    guest_password_placeholder = uuid.uuid4().hex
+    try:
+        return db.create_user(
+            email=guest_email,
+            password_hash=guest_password_placeholder,
+            display_name=display_name,
+        )
+    except Exception:
+        return None
+
+
+# ─────────────────────────────────────────────────────────────
+# Real Accounts (email + password, so people can come back to the
+# same data later). Hashing uses only the standard library (PBKDF2)
+# so no new dependency is needed.
+# ─────────────────────────────────────────────────────────────
+
+_PBKDF2_ITERATIONS: int = 260_000
+
+
+def _hash_password(password: str) -> str:
+    """Hash a plaintext password into a 'salt$hash' string for storage."""
+    import hashlib
+
+    salt = uuid.uuid4().hex
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt.encode("utf-8"), _PBKDF2_ITERATIONS
+    ).hex()
+    return f"{salt}${digest}"
+
+
+def _verify_password(password: str, stored_hash: str) -> bool:
+    """Check a plaintext password against a 'salt$hash' string from the DB."""
+    import hashlib
+    import hmac
+
+    try:
+        salt, digest = stored_hash.split("$", 1)
+    except (ValueError, AttributeError):
+        return False
+    candidate = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt.encode("utf-8"), _PBKDF2_ITERATIONS
+    ).hex()
+    return hmac.compare_digest(candidate, digest)
+
+
+def sign_up(email: str, password: str, display_name: str) -> tuple[Optional[int], Optional[str]]:
+    """
+    Create a real account with email + password.
+
+    Returns:
+        (user_id, None) on success, or (None, error_message) on failure
+        (e.g. the email is already registered).
+    """
+    cleaned_email = email.strip().lower()
+    if not cleaned_email or "@" not in cleaned_email:
+        return None, "Please enter a valid email address."
+    if len(password) < 6:
+        return None, "Password must be at least 6 characters."
+    if not display_name.strip():
+        return None, "Please enter a name."
+
+    db = get_database()
+    if db.get_user_by_email(cleaned_email) is not None:
+        return None, "An account with this email already exists — try logging in instead."
+
+    try:
+        user_id = db.create_user(
+            email=cleaned_email,
+            password_hash=_hash_password(password),
+            display_name=display_name.strip(),
+        )
+        return user_id, None
+    except Exception:
+        return None, "Something went wrong creating your account. Please try again."
+
+
+def log_in(email: str, password: str) -> tuple[Optional[int], Optional[str]]:
+    """
+    Verify email + password against an existing account.
+
+    Returns:
+        (user_id, display_name) on success, or (None, error_message) on
+        failure (unknown email or wrong password — same generic message
+        for both, so we don't leak which emails are registered).
+    """
+    cleaned_email = email.strip().lower()
+    db = get_database()
+    row = db.get_user_by_email(cleaned_email)
+    if row is None or not _verify_password(password, row["password_hash"]):
+        return None, "Incorrect email or password."
+    return row["user_id"], row["display_name"]
 
 
 # ─────────────────────────────────────────────────────────────

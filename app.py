@@ -50,6 +50,7 @@ from helpers import (
     status_badge_html,
 )
 from services import (
+    get_current_user_id,
     get_database_status,
     get_system_info,
     load_analytics_profile,
@@ -68,11 +69,13 @@ def render_dashboard() -> None:
     """Render the main executive dashboard."""
 
     # ── Load Data ────────────────────────────────────────
+    user_id = get_current_user_id()
     with st.spinner(""):
-        user = load_user()
-        plan = load_today_plan()
-        tasks = load_today_tasks()
+        user = load_user(user_id=user_id)
+        plan = load_today_plan(user_id=user_id)
+        tasks = load_today_tasks(user_id=user_id)
         profile = load_analytics_profile(
+            user_id=user_id,
             window_days=st.session_state.analytics_window,
         )
 

@@ -17,9 +17,13 @@ from config import APP_NAME, APP_TAGLINE, APP_VERSION, DEFAULT_ANALYTICS_WINDOW
 from styles import inject_styles
 from services import (
     close_out_stale_tasks,
+    create_guest_user,
+    get_current_user_id,
     get_database_status,
     get_system_info,
     load_today_plan,
+    log_in,
+    sign_up,
 )
 
 
@@ -36,6 +40,7 @@ def init_session_state() -> None:
         "last_recommendation": None,
         "last_recommendation_plan_id": None,
         "user_display_name": None,
+        "user_id": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -45,58 +50,6 @@ def init_session_state() -> None:
 def apply_theme() -> None:
     """Inject the CSS theme for the current dark/light mode setting."""
     inject_styles(dark_mode=st.session_state.get("dark_mode", True))
-
-
-# ─────────────────────────────────────────────────────────────
-# Name Gate (cosmetic personalization only — no real auth)
-# ─────────────────────────────────────────────────────────────
-
-def ensure_user_name() -> None:
-    """
-    Ask whoever opened the app what to call them, once per browser
-    session, then stop rendering the rest of the current page until
-    they answer.
-
-    This is purely cosmetic: everyone still reads/writes the same
-    single-user backend (DEFAULT_USER_ID). It only changes what name
-    is shown in greetings — it is not a login system.
-    """
-    if st.session_state.get("user_display_name"):
-        return
-
-    st.markdown(
-        """
-        <div style="max-width:420px; margin: 4rem auto 0 auto; text-align:center;">
-            <div style="font-size:2.6rem;">🧠</div>
-            <h2 style="margin-bottom:0.2rem; color:var(--text-primary);">Welcome to CoachAI</h2>
-            <p style="color:var(--text-secondary); margin-bottom:1.4rem;">
-                What should we call you?
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    _, center_col, _ = st.columns([1, 2, 1])
-    with center_col:
-        with st.form("name_gate_form"):
-            name = st.text_input(
-                "Your name",
-                placeholder="e.g. Yousef",
-                label_visibility="collapsed",
-            )
-            submitted = st.form_submit_button(
-                "Continue →", type="primary", use_container_width=True
-            )
-        if submitted:
-            cleaned = name.strip()
-            if cleaned:
-                st.session_state.user_display_name = cleaned
-                st.rerun()
-            else:
-                st.error("Please enter a name to continue.")
-
-    st.stop()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -126,7 +79,7 @@ def render_sidebar() -> None:
 
         db_status = get_database_status()
         dot_color = "#10b981" if db_status["connected"] else "#ef4444"
-        plan = load_today_plan()
+        plan = load_today_plan(user_id=get_current_user_id())
         sys_info = get_system_info()
 
         st.markdown(
@@ -157,6 +110,106 @@ def render_sidebar() -> None:
 
 
 # ─────────────────────────────────────────────────────────────
+# Name Gate (creates a real, isolated guest account per session)
+# ─────────────────────────────────────────────────────────────
+
+def ensure_authenticated() -> None:
+    """
+    Gate every page behind a small entry screen, once per browser
+    session, then stop rendering the rest of the current page until
+    the person has picked one of three ways in:
+
+      - Try as Guest: instant, isolated, throwaway account (today's
+        create_guest_user behavior).
+      - Log In: real email + password, returns to an existing
+        account and its data.
+      - Sign Up: real email + password, creates an account that can
+        be logged back into later from any device/session.
+
+    Either way, every visitor ends up with their own user_id, so
+    plans/tasks/categories/analytics never mix between people.
+    """
+    if st.session_state.get("user_id"):
+        return
+
+    st.markdown(
+        """
+        <div style="max-width:440px; margin: 3rem auto 0 auto; text-align:center;">
+            <div style="font-size:2.6rem;">🧠</div>
+            <h2 style="margin-bottom:0.2rem; color:var(--text-primary);">Welcome to CoachAI</h2>
+            <p style="color:var(--text-secondary); margin-bottom:1.2rem;">
+                Try it instantly, or sign up to keep your data for next time.
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    _, center_col, _ = st.columns([1, 2, 1])
+    with center_col:
+        tab_guest, tab_login, tab_signup = st.tabs(["⚡ Try as Guest", "🔑 Log In", "✨ Sign Up"])
+
+        with tab_guest:
+            st.caption("No account needed — instant, private workspace just for this session.")
+            with st.form("guest_gate_form"):
+                name = st.text_input("Your name", placeholder="e.g. Yousef")
+                submitted = st.form_submit_button(
+                    "Continue as Guest →", type="primary", use_container_width=True
+                )
+            if submitted:
+                cleaned = name.strip()
+                if not cleaned:
+                    st.error("Please enter a name to continue.")
+                else:
+                    new_user_id = create_guest_user(cleaned)
+                    if new_user_id is None:
+                        st.error("Something went wrong starting your session. Please try again.")
+                    else:
+                        st.session_state.user_display_name = cleaned
+                        st.session_state.user_id = new_user_id
+                        st.rerun()
+            st.caption("⚠️ Guest data can't be recovered later — sign up if you want to keep it.")
+
+        with tab_login:
+            with st.form("login_gate_form"):
+                email = st.text_input("Email", key="_login_email")
+                password = st.text_input("Password", type="password", key="_login_password")
+                submitted = st.form_submit_button(
+                    "Log In →", type="primary", use_container_width=True
+                )
+            if submitted:
+                user_id, result = log_in(email, password)
+                if user_id is None:
+                    st.error(result)
+                else:
+                    st.session_state.user_display_name = result
+                    st.session_state.user_id = user_id
+                    st.rerun()
+
+        with tab_signup:
+            with st.form("signup_gate_form"):
+                su_name = st.text_input("Your name", key="_signup_name")
+                su_email = st.text_input("Email", key="_signup_email")
+                su_password = st.text_input(
+                    "Password", type="password", key="_signup_password",
+                    help="At least 6 characters.",
+                )
+                submitted = st.form_submit_button(
+                    "Create Account →", type="primary", use_container_width=True
+                )
+            if submitted:
+                new_user_id, error = sign_up(su_email, su_password, su_name)
+                if error:
+                    st.error(error)
+                else:
+                    st.session_state.user_display_name = su_name.strip()
+                    st.session_state.user_id = new_user_id
+                    st.rerun()
+
+    st.stop()
+
+
+# ─────────────────────────────────────────────────────────────
 # Reusable Page Chrome
 # ─────────────────────────────────────────────────────────────
 
@@ -172,14 +225,15 @@ def maybe_close_out_stale_tasks() -> None:
     today_str = date.today().isoformat()
     if st.session_state.get("_stale_tasks_closed_date") == today_str:
         return
-    close_out_stale_tasks()
+    close_out_stale_tasks(user_id=get_current_user_id())
     st.session_state["_stale_tasks_closed_date"] = today_str
 
 
 def page_setup(title: str, icon: str) -> None:
     """
     Standard boilerplate every page needs, in the right order:
-    set_page_config → session defaults → theme → sidebar.
+    set_page_config → session defaults → theme → name gate → stale
+    task cleanup → sidebar.
 
     Must be the first Streamlit-related call on the page.
     """
@@ -190,10 +244,10 @@ def page_setup(title: str, icon: str) -> None:
         initial_sidebar_state="expanded",
     )
     init_session_state()
-    maybe_close_out_stale_tasks()
     apply_theme()
+    ensure_authenticated()
+    maybe_close_out_stale_tasks()
     render_sidebar()
-    ensure_user_name()
 
 
 def page_title(icon: str, title: str, subtitle: str = "") -> None:

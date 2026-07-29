@@ -23,7 +23,7 @@ from helpers import (
     get_trend_color,
     get_trend_icon,
 )
-from services import load_analytics_profile, clear_all_caches
+from services import get_current_user_id, load_analytics_profile, clear_all_caches
 from charts import (
     create_gauge,
     create_radar,
@@ -57,7 +57,7 @@ with top[2]:
         clear_all_caches()
         st.rerun()
 
-profile = load_analytics_profile(window_days=window)
+profile = load_analytics_profile(user_id=get_current_user_id(), window_days=window)
 
 if profile.sample_size == 0:
     empty_state(

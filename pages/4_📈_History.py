@@ -14,7 +14,7 @@ import streamlit as st
 
 from layout import page_setup, page_title, empty_state
 from helpers import format_date_long, format_duration, get_status_icon
-from services import load_recent_plans, load_recommendations_for_plan
+from services import get_current_user_id, load_recent_plans, load_recommendations_for_plan
 from charts import create_area_chart
 
 
@@ -40,7 +40,7 @@ days_back = st.select_slider(
     format_func=lambda d: f"{d} days",
 )
 
-plans = load_recent_plans(days=days_back)
+plans = load_recent_plans(user_id=get_current_user_id(), days=days_back)
 
 if not plans:
     empty_state(

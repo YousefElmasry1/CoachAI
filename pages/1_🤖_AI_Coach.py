@@ -15,6 +15,7 @@ import streamlit as st
 
 from layout import page_setup, page_title, empty_state
 from services import (
+    get_current_user_id,
     load_today_plan,
     load_today_tasks,
     load_recent_plans,
@@ -31,13 +32,15 @@ from services import (
 page_setup(title="AI Coach", icon="🤖")
 page_title("🤖", "AI Coach", "Personalised coaching, generated from your schedule and history.")
 
+user_id = get_current_user_id()
+
 
 # ─────────────────────────────────────────────────────────────
 # Target Plan Selector (Today vs. a Past Plan)
 # ─────────────────────────────────────────────────────────────
 
-today_plan = load_today_plan()
-recent_plans = load_recent_plans(days=30)
+today_plan = load_today_plan(user_id=user_id)
+recent_plans = load_recent_plans(user_id=user_id, days=30)
 
 tab_today, tab_past = st.tabs(["📅 Today's Plan", "🗂️ A Past Plan"])
 
@@ -54,7 +57,7 @@ with tab_today:
             cta="Go to 📅 Today's Schedule →",
         )
     else:
-        tasks_today = load_today_tasks()
+        tasks_today = load_today_tasks(user_id=user_id)
         if not tasks_today:
             empty_state(
                 icon="🗒️",
@@ -107,7 +110,7 @@ if target_plan_id is not None:
         st.write("Asking the AI coach for personalised feedback...")
         try:
             if use_today_shortcut:
-                result = load_recommendations_today()
+                result = load_recommendations_today(user_id=user_id)
             else:
                 result = load_recommendations_for_plan(target_plan_id)
             st.session_state.last_recommendation = result
@@ -151,7 +154,7 @@ if result is None:
 else:
     st.markdown("<div style='height:0.5rem;'></div>", unsafe_allow_html=True)
 
-    user_name = st.session_state.get("user_display_name") or load_user().get("display_name", "there")
+    user_name = st.session_state.get("user_display_name") or load_user(user_id=user_id).get("display_name", "there")
     st.markdown(
         f"""
         <div class="hero-gradient animate-in">

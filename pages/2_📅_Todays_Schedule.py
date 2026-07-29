@@ -25,6 +25,7 @@ from helpers import (
     status_badge_html,
 )
 from services import (
+    get_current_user_id,
     load_today_plan,
     load_today_tasks,
     load_categories,
@@ -45,7 +46,9 @@ from charts import create_timeline, create_donut
 page_setup(title="Today's Schedule", icon="📅")
 page_title("📅", "Today's Schedule", "Your plan for today, scheduled and tracked in real time.")
 
-plan = load_today_plan()
+user_id = get_current_user_id()
+
+plan = load_today_plan(user_id=user_id)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -83,7 +86,7 @@ if plan is None:
             else:
                 with st.spinner("The AI Planner is splitting your day into tasks..."):
                     try:
-                        result = generate_today_plan(raw_input=ai_raw_input)
+                        result = generate_today_plan(raw_input=ai_raw_input, user_id=user_id)
                         st.session_state.last_planner_result = result
                         st.toast(
                             f"Plan created with {len(result['tasks'])} task(s)! 🎉",
@@ -106,7 +109,7 @@ if plan is None:
                             st.exception(e)
 
     with tab_manual:
-        manual_categories = load_categories()
+        manual_categories = load_categories(user_id=user_id)
         with st.form("create_plan_form"):
             st.markdown("#### ✍️ Add Your First Task")
             st.caption(
@@ -136,7 +139,7 @@ if plan is None:
                 if not m_title.strip():
                     st.error("Please give the task a title.")
                 else:
-                    plan_id = create_today_plan(raw_input=m_title.strip())
+                    plan_id = create_today_plan(raw_input=m_title.strip(), user_id=user_id)
                     if plan_id:
                         new_id = add_task_to_plan(
                             plan_id=plan_id,
@@ -183,8 +186,8 @@ if _planner_result is not None:
 # Load Tasks
 # ─────────────────────────────────────────────────────────────
 
-tasks = load_today_tasks()
-categories = load_categories()
+tasks = load_today_tasks(user_id=user_id)
+categories = load_categories(user_id=user_id)
 category_lookup = {c["category_id"]: c for c in categories}
 is_scheduled = any(t.get("scheduled_start") for t in tasks)
 
@@ -276,7 +279,7 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
 
     if st.button("▶️ Run Scheduler", type="primary"):
         with st.spinner("Assigning time slots..."):
-            scheduled = run_scheduler_for_today(work_day_start=work_start, breaks=breaks)
+            scheduled = run_scheduler_for_today(work_day_start=work_start, breaks=breaks, user_id=user_id)
         if scheduled:
             st.toast("Schedule updated!", icon="✅")
             st.rerun()
@@ -421,7 +424,7 @@ with st.expander("➕ Add Tasks to Today's Plan"):
             else:
                 with st.spinner("The AI Planner is splitting this into tasks..."):
                     try:
-                        more_result = generate_today_plan(raw_input=more_raw_input)
+                        more_result = generate_today_plan(raw_input=more_raw_input, user_id=user_id)
                         st.session_state.last_planner_result = more_result
                         st.toast(
                             f"Added {len(more_result['tasks'])} task(s)! 🎉", icon="✅"
