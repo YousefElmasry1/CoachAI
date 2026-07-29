@@ -76,7 +76,7 @@ def render_dashboard() -> None:
             window_days=st.session_state.analytics_window,
         )
 
-    user_name = user.get("display_name", "Yousef")
+    user_name = st.session_state.get("user_display_name") or user.get("display_name", "there")
 
     # ── Hero Header ──────────────────────────────────────
     st.markdown(

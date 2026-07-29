@@ -35,7 +35,7 @@ def init_session_state() -> None:
         "debug_mode": False,
         "last_recommendation": None,
         "last_recommendation_plan_id": None,
-        "user_display_name": "Yousef",
+        "user_display_name": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -45,6 +45,58 @@ def init_session_state() -> None:
 def apply_theme() -> None:
     """Inject the CSS theme for the current dark/light mode setting."""
     inject_styles(dark_mode=st.session_state.get("dark_mode", True))
+
+
+# ─────────────────────────────────────────────────────────────
+# Name Gate (cosmetic personalization only — no real auth)
+# ─────────────────────────────────────────────────────────────
+
+def ensure_user_name() -> None:
+    """
+    Ask whoever opened the app what to call them, once per browser
+    session, then stop rendering the rest of the current page until
+    they answer.
+
+    This is purely cosmetic: everyone still reads/writes the same
+    single-user backend (DEFAULT_USER_ID). It only changes what name
+    is shown in greetings — it is not a login system.
+    """
+    if st.session_state.get("user_display_name"):
+        return
+
+    st.markdown(
+        """
+        <div style="max-width:420px; margin: 4rem auto 0 auto; text-align:center;">
+            <div style="font-size:2.6rem;">🧠</div>
+            <h2 style="margin-bottom:0.2rem; color:var(--text-primary);">Welcome to CoachAI</h2>
+            <p style="color:var(--text-secondary); margin-bottom:1.4rem;">
+                What should we call you?
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    _, center_col, _ = st.columns([1, 2, 1])
+    with center_col:
+        with st.form("name_gate_form"):
+            name = st.text_input(
+                "Your name",
+                placeholder="e.g. Yousef",
+                label_visibility="collapsed",
+            )
+            submitted = st.form_submit_button(
+                "Continue →", type="primary", use_container_width=True
+            )
+        if submitted:
+            cleaned = name.strip()
+            if cleaned:
+                st.session_state.user_display_name = cleaned
+                st.rerun()
+            else:
+                st.error("Please enter a name to continue.")
+
+    st.stop()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -141,6 +193,7 @@ def page_setup(title: str, icon: str) -> None:
     maybe_close_out_stale_tasks()
     apply_theme()
     render_sidebar()
+    ensure_user_name()
 
 
 def page_title(icon: str, title: str, subtitle: str = "") -> None:

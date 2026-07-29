@@ -151,7 +151,7 @@ if result is None:
 else:
     st.markdown("<div style='height:0.5rem;'></div>", unsafe_allow_html=True)
 
-    user_name = load_user().get("display_name", "there")
+    user_name = st.session_state.get("user_display_name") or load_user().get("display_name", "there")
     st.markdown(
         f"""
         <div class="hero-gradient animate-in">
