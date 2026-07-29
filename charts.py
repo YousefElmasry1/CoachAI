@@ -10,15 +10,39 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from config import CHART_COLORS, PLOTLY_LAYOUT_DEFAULTS, WEEKDAY_SHORT
+from config import CHART_COLORS, DARK_COLORS, LIGHT_COLORS, PLOTLY_LAYOUT_DEFAULTS, WEEKDAY_SHORT
+
+
+def _theme() -> dict[str, str]:
+    """
+    Read the app's current dark/light mode from session_state and return
+    the matching color palette. Chart text/number colors must follow this
+    — the old hardcoded dark-theme hex values (e.g. near-white "#f0f0f5")
+    become invisible once the app is switched to light mode.
+    """
+    try:
+        dark_mode = st.session_state.get("dark_mode", True)
+    except Exception:
+        dark_mode = True
+    return DARK_COLORS if dark_mode else LIGHT_COLORS
+
+
+def _grid_color(alpha: float = 0.05) -> str:
+    """Gridline color that stays faint-but-visible in both themes."""
+    theme = _theme()
+    is_dark = theme is DARK_COLORS
+    return f"rgba(255,255,255,{alpha})" if is_dark else f"rgba(0,0,0,{alpha})"
 
 
 def _base_layout(**overrides) -> dict:
-    """Merge default layout with overrides."""
+    """Merge default layout (with theme-correct font color) with overrides."""
+    theme = _theme()
     layout = {**PLOTLY_LAYOUT_DEFAULTS}
+    layout["font"] = {**layout.get("font", {}), "color": theme["text_secondary"]}
     layout.update(overrides)
     return layout
 
@@ -84,12 +108,13 @@ def create_gauge(
         ]
 
     steps = [{"range": r["range"], "color": r["color"]} for r in ranges]
+    theme = _theme()
 
     fig = go.Figure(go.Indicator(
         mode="gauge+number",
         value=value,
-        number={"suffix": suffix, "font": {"size": 36, "family": "Inter", "color": "#f0f0f5"}},
-        title={"text": title, "font": {"size": 14, "color": "#8888a0", "family": "Inter"}},
+        number={"suffix": suffix, "font": {"size": 36, "family": "Inter", "color": theme["text_primary"]}},
+        title={"text": title, "font": {"size": 14, "color": theme["text_secondary"], "family": "Inter"}},
         gauge={
             "axis": {"range": [0, max_val], "tickwidth": 0, "tickcolor": "rgba(0,0,0,0)", "dtick": max_val},
             "bar": {"color": "#6c63ff", "thickness": 0.7},
@@ -124,6 +149,7 @@ def create_radar(
     height: int = 350,
 ) -> go.Figure:
     """Create a radar/spider chart."""
+    theme = _theme()
     # Close the polygon
     cats = list(categories) + [categories[0]]
     vals = list(values) + [values[0]]
@@ -149,14 +175,14 @@ def create_radar(
                 "range": [0, 1],
                 "tickvals": [0.25, 0.5, 0.75, 1.0],
                 "ticktext": ["25%", "50%", "75%", "100%"],
-                "gridcolor": "rgba(255,255,255,0.05)",
+                "gridcolor": _grid_color(0.08),
                 "linecolor": "rgba(0,0,0,0)",
-                "tickfont": {"color": "#55556a", "size": 10},
+                "tickfont": {"color": theme["text_muted"], "size": 10},
             },
             "angularaxis": {
-                "gridcolor": "rgba(255,255,255,0.05)",
+                "gridcolor": _grid_color(0.08),
                 "linecolor": "rgba(0,0,0,0)",
-                "tickfont": {"color": "#8888a0", "size": 11},
+                "tickfont": {"color": theme["text_secondary"], "size": 11},
             },
         },
     )
@@ -176,6 +202,7 @@ def create_donut(
     hole: float = 0.65,
 ) -> go.Figure:
     """Create a donut chart."""
+    theme = _theme()
     if colors is None:
         colors = CHART_COLORS[:len(labels)]
 
@@ -186,7 +213,7 @@ def create_donut(
         marker={"colors": colors, "line": {"width": 0}},
         textinfo="label+percent",
         textposition="outside",
-        textfont={"size": 11, "color": "#8888a0", "family": "Inter"},
+        textfont={"size": 11, "color": theme["text_secondary"], "family": "Inter"},
         hoverinfo="label+value+percent",
         pull=[0.02] * len(labels),
     ))
@@ -214,6 +241,7 @@ def create_bar(
     y_title: str = "",
 ) -> go.Figure:
     """Create a vertical or horizontal bar chart."""
+    theme = _theme()
     if colors is None:
         colors = CHART_COLORS[:len(x)]
 
@@ -240,8 +268,8 @@ def create_bar(
         **_base_layout(),
         height=height,
         title={"text": title, "font": {"size": 14}},
-        xaxis={"title": x_title, "gridcolor": "rgba(255,255,255,0.03)", "tickfont": {"color": "#8888a0"}},
-        yaxis={"title": y_title, "gridcolor": "rgba(255,255,255,0.03)", "tickfont": {"color": "#8888a0"}},
+        xaxis={"title": x_title, "gridcolor": _grid_color(0.06), "tickfont": {"color": theme["text_secondary"]}},
+        yaxis={"title": y_title, "gridcolor": _grid_color(0.06), "tickfont": {"color": theme["text_secondary"]}},
     )
     return fig
 
@@ -257,6 +285,7 @@ def create_grouped_bar(
 
     datasets: list of {"name": str, "values": list[float], "color": str}
     """
+    theme = _theme()
     fig = go.Figure()
     for ds in datasets:
         fig.add_trace(go.Bar(
@@ -271,9 +300,9 @@ def create_grouped_bar(
         height=height,
         title={"text": title, "font": {"size": 14}},
         barmode="group",
-        legend={"font": {"color": "#8888a0", "size": 11}},
-        xaxis={"gridcolor": "rgba(255,255,255,0.03)", "tickfont": {"color": "#8888a0"}},
-        yaxis={"gridcolor": "rgba(255,255,255,0.03)", "tickfont": {"color": "#8888a0"}},
+        legend={"font": {"color": theme["text_secondary"], "size": 11}},
+        xaxis={"gridcolor": _grid_color(0.06), "tickfont": {"color": theme["text_secondary"]}},
+        yaxis={"gridcolor": _grid_color(0.06), "tickfont": {"color": theme["text_secondary"]}},
     )
     return fig
 
@@ -293,6 +322,7 @@ def create_area_chart(
     y_title: str = "",
 ) -> go.Figure:
     """Create an area or line chart."""
+    theme = _theme()
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=x,
@@ -308,8 +338,8 @@ def create_area_chart(
         **_base_layout(),
         height=height,
         title={"text": title, "font": {"size": 14}},
-        xaxis={"title": x_title, "gridcolor": "rgba(255,255,255,0.03)", "tickfont": {"color": "#8888a0"}},
-        yaxis={"title": y_title, "gridcolor": "rgba(255,255,255,0.03)", "tickfont": {"color": "#8888a0"}, "rangemode": "tozero"},
+        xaxis={"title": x_title, "gridcolor": _grid_color(0.06), "tickfont": {"color": theme["text_secondary"]}},
+        yaxis={"title": y_title, "gridcolor": _grid_color(0.06), "tickfont": {"color": theme["text_secondary"]}, "rangemode": "tozero"},
     )
     return fig
 
@@ -327,6 +357,7 @@ def create_heatmap(
     height: int = 350,
 ) -> go.Figure:
     """Create a heatmap chart."""
+    theme = _theme()
     if colorscale is None:
         colorscale = [
             [0.0, "rgba(108,99,255,0.05)"],
@@ -342,7 +373,7 @@ def create_heatmap(
         y=y_labels,
         colorscale=colorscale,
         showscale=True,
-        colorbar={"thickness": 12, "outlinewidth": 0, "tickfont": {"color": "#8888a0"}},
+        colorbar={"thickness": 12, "outlinewidth": 0, "tickfont": {"color": theme["text_secondary"]}},
         hoverongaps=False,
         xgap=2,
         ygap=2,
@@ -352,8 +383,8 @@ def create_heatmap(
         **_base_layout(),
         height=height,
         title={"text": title, "font": {"size": 14}},
-        xaxis={"tickfont": {"color": "#8888a0", "size": 10}, "side": "bottom"},
-        yaxis={"tickfont": {"color": "#8888a0", "size": 10}, "autorange": "reversed"},
+        xaxis={"tickfont": {"color": theme["text_secondary"], "size": 10}, "side": "bottom"},
+        yaxis={"tickfont": {"color": theme["text_secondary"], "size": 10}, "autorange": "reversed"},
     )
     return fig
 
@@ -375,6 +406,7 @@ def create_timeline(
     from config import PRIORITY_COLORS, STATUS_COLORS
     from datetime import datetime as dt
 
+    theme = _theme()
     fig = go.Figure()
 
     if not tasks:
@@ -441,11 +473,11 @@ def create_timeline(
         xaxis={
             "type": "date",
             "tickformat": "%H:%M",
-            "gridcolor": "rgba(255,255,255,0.03)",
-            "tickfont": {"color": "#8888a0"},
+            "gridcolor": _grid_color(0.06),
+            "tickfont": {"color": theme["text_secondary"]},
         },
         yaxis={
-            "tickfont": {"color": "#8888a0", "size": 11},
+            "tickfont": {"color": theme["text_secondary"], "size": 11},
             "autorange": "reversed",
         },
         barmode="overlay",
@@ -497,24 +529,25 @@ def create_waterfall(
     height: int = 300,
 ) -> go.Figure:
     """Create a waterfall chart."""
+    theme = _theme()
     measures = ["relative"] * (len(y) - 1) + ["total"]
     fig = go.Figure(go.Waterfall(
         x=x,
         y=y,
         measure=measures,
-        connector={"line": {"color": "rgba(255,255,255,0.1)"}},
+        connector={"line": {"color": _grid_color(0.15)}},
         increasing={"marker": {"color": "#10b981", "cornerradius": 4}},
         decreasing={"marker": {"color": "#ef4444", "cornerradius": 4}},
         totals={"marker": {"color": "#6c63ff", "cornerradius": 4}},
         textposition="outside",
-        textfont={"color": "#8888a0", "size": 11, "family": "Inter"},
+        textfont={"color": theme["text_secondary"], "size": 11, "family": "Inter"},
     ))
 
     fig.update_layout(
         **_base_layout(),
         height=height,
         title={"text": title, "font": {"size": 14}},
-        xaxis={"tickfont": {"color": "#8888a0"}},
-        yaxis={"gridcolor": "rgba(255,255,255,0.03)", "tickfont": {"color": "#8888a0"}},
+        xaxis={"tickfont": {"color": theme["text_secondary"]}},
+        yaxis={"gridcolor": _grid_color(0.06), "tickfont": {"color": theme["text_secondary"]}},
     )
     return fig
