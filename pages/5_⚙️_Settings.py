@@ -63,10 +63,15 @@ with tabs[1]:
     )
 
     st.markdown("#### Debug Mode")
+
+    def _sync_debug_mode() -> None:
+        st.session_state.debug_mode = st.session_state["_debug_mode_toggle"]
+
     st.toggle(
         "🐞 Show raw errors and tracebacks",
         value=st.session_state.get("debug_mode", False),
-        key="debug_mode",
+        key="_debug_mode_toggle",
+        on_change=_sync_debug_mode,
         help="Useful when presenting or debugging — shows full exception details on the AI Coach page.",
     )
 
