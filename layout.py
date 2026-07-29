@@ -99,10 +99,14 @@ def render_sidebar() -> None:
 
         st.markdown("---")
 
+        def _sync_dark_mode() -> None:
+            st.session_state.dark_mode = st.session_state["_dark_mode_sidebar_toggle"]
+
         st.toggle(
             "🌙 Dark Mode",
             value=st.session_state.get("dark_mode", True),
-            key="dark_mode",
+            key="_dark_mode_sidebar_toggle",
+            on_change=_sync_dark_mode,
             help="Switch between dark and light themes.",
         )
 
