@@ -83,6 +83,19 @@ DURATION_BUCKETS: list[tuple[int, int]] = [
 # Habit score decay — how many days of inactivity before habit decays
 HABIT_DECAY_DAYS: int = 3
 
+# --- Realistic Capacity ---
+# A day counts as "successful" (used to derive the recommended capacity)
+# when its completion rate is at least this fraction.
+CAPACITY_SUCCESS_DAY_THRESHOLD: float = 0.7
+
+# Minimum distinct days of history required before the capacity estimate
+# is considered trustworthy enough to base a recommendation on real data.
+CAPACITY_MIN_OBSERVATION_DAYS: int = 5
+
+# Generic fallback used only when there isn't enough history yet.
+# Roughly a comfortable half-day of focused work.
+CAPACITY_FALLBACK_MINUTES: float = 240.0
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # TASK SNAPSHOT — Normalised immutable task record
@@ -1155,6 +1168,69 @@ class BestHourResult(BaseModel):
     """Best productivity hour with confidence."""
     best_hour: Optional[int] = None
     completion_rate_at_best: float = 0.0
+    confidence: MetricConfidence = Field(default_factory=MetricConfidence)
+
+
+class CapacityResult(BaseModel):
+    """
+    Realistic daily capacity — how much a user can actually plan in a
+    single day and still finish most of it, derived from their own
+    history rather than from what they merely intend.
+
+    This is deliberately distinct from ``BurnoutAnalysis.schedule_density``
+    (a plain average of planned minutes/day, regardless of outcome).
+    Capacity instead looks at *which* days actually went well and asks
+    "how much did I plan on those days?" — so a user who habitually
+    over-plans and under-delivers doesn't get their bad habit reflected
+    back as their "capacity".
+    """
+    recommended_daily_minutes: float = Field(
+        default=CAPACITY_FALLBACK_MINUTES,
+        description=(
+            "Recommended total planned minutes for a single day, based "
+            "on the days this user historically completed most of what "
+            "they planned. Falls back to a generic default when there "
+            "isn't enough history yet (see basis)."
+        ),
+    )
+    light_day_completion_rate: float = Field(
+        default=0.0,
+        description=(
+            "Average completion rate on days planned at or below the "
+            "recommended capacity."
+        ),
+    )
+    heavy_day_completion_rate: float = Field(
+        default=0.0,
+        description=(
+            "Average completion rate on days planned above the "
+            "recommended capacity. Meaningfully lower than "
+            "light_day_completion_rate is the evidence that overloading "
+            "actually hurts this specific user."
+        ),
+    )
+    successful_day_count: int = Field(
+        default=0,
+        description=(
+            "Number of observed days with completion_rate >= "
+            "CAPACITY_SUCCESS_DAY_THRESHOLD, used to derive the "
+            "recommendation when basis='historical_success_days'."
+        ),
+    )
+    sample_days: int = Field(
+        default=0,
+        description="Total distinct days observed in the window.",
+    )
+    basis: str = Field(
+        default="insufficient_data",
+        description=(
+            "How recommended_daily_minutes was derived: "
+            "'historical_success_days' (enough clearly-successful days "
+            "to trust), 'overall_median' (some history, but not enough "
+            "clearly-successful days — median of all observed days "
+            "used instead), or 'insufficient_data' (fallback default)."
+        ),
+    )
     confidence: MetricConfidence = Field(default_factory=MetricConfidence)
 
 
@@ -3073,6 +3149,104 @@ class BestHourCalculator:
 # ANALYTICS PROFILE — Full output model
 # ═══════════════════════════════════════════════════════════════════════════
 
+class CapacityCalculator:
+    """
+    Computes a user's Realistic Daily Capacity.
+
+    Definition:
+        The typical total planned-minutes load, on days this user
+        historically finished most of what they planned, plus evidence
+        (completion rate on heavier-than-recommended days vs
+        lighter-than-recommended days) showing whether overloading
+        actually correlates with worse outcomes for this specific user.
+
+    Formula:
+        1. Group all tasks by plan_date (already available via
+           IntermediateStats.tasks_by_date).
+        2. For each day: planned_minutes = sum(estimated_minutes),
+           completion_rate = completed / total.
+        3. "Successful" days = completion_rate >= CAPACITY_SUCCESS_DAY_THRESHOLD.
+        4. recommended_daily_minutes = median(planned_minutes) over
+           successful days (falls back to median over all days if too
+           few clearly-successful days exist, or to a generic constant
+           if there's not enough history at all).
+        5. Evidence: split ALL observed days at the recommended value
+           and compare their average completion rates.
+
+    Input Fields:
+        stats — IntermediateStats (reads tasks_by_date only).
+
+    Output:
+        CapacityResult.
+
+    Edge Cases:
+        - Fewer than CAPACITY_MIN_OBSERVATION_DAYS distinct days →
+          basis='insufficient_data', generic fallback minutes.
+        - Some history but fewer than 3 successful days → basis
+          ='overall_median', still a real (if less specific) estimate.
+    """
+
+    def compute(self, stats: IntermediateStats) -> CapacityResult:
+        day_rows: list[tuple[str, float, float]] = []  # (date, planned_minutes, completion_rate)
+        for plan_date, tasks in stats.tasks_by_date.items():
+            total = len(tasks)
+            if total == 0:
+                continue
+            planned = float(sum(t.estimated_minutes for t in tasks))
+            done = sum(1 for t in tasks if t.status == "completed")
+            day_rows.append((plan_date, planned, done / total))
+
+        sample_days = len(day_rows)
+        confidence = compute_confidence(stats.total_tasks, sample_days)
+
+        if sample_days < CAPACITY_MIN_OBSERVATION_DAYS:
+            return CapacityResult(
+                recommended_daily_minutes=CAPACITY_FALLBACK_MINUTES,
+                light_day_completion_rate=0.0,
+                heavy_day_completion_rate=0.0,
+                successful_day_count=0,
+                sample_days=sample_days,
+                basis="insufficient_data",
+                confidence=confidence,
+            )
+
+        successful_days = [
+            row for row in day_rows
+            if row[2] >= CAPACITY_SUCCESS_DAY_THRESHOLD
+        ]
+
+        if len(successful_days) >= 3:
+            planned_values = [row[1] for row in successful_days]
+            recommended = statistics.median(planned_values)
+            basis = "historical_success_days"
+        else:
+            planned_values = [row[1] for row in day_rows]
+            recommended = statistics.median(planned_values)
+            basis = "overall_median"
+
+        heavy_days = [row for row in day_rows if row[1] > recommended]
+        light_days = [row for row in day_rows if row[1] <= recommended]
+
+        heavy_rate = (
+            sum(row[2] for row in heavy_days) / len(heavy_days)
+            if heavy_days else 0.0
+        )
+        light_rate = (
+            sum(row[2] for row in light_days) / len(light_days)
+            if light_days else 0.0
+        )
+
+        return CapacityResult(
+            recommended_daily_minutes=round(recommended, 1),
+            light_day_completion_rate=round(light_rate, 4),
+            heavy_day_completion_rate=round(heavy_rate, 4),
+            successful_day_count=len(successful_days),
+            sample_days=sample_days,
+            basis=basis,
+            confidence=confidence,
+        )
+
+
 class AnalyticsProfile(BaseModel):
     """
     Complete analytics output for a user.
@@ -3147,6 +3321,7 @@ class AnalyticsProfile(BaseModel):
     habits: HabitScores = Field(default_factory=HabitScores)
     burnout: BurnoutAnalysis = Field(default_factory=BurnoutAnalysis)
     best_hour: BestHourResult = Field(default_factory=BestHourResult)
+    capacity: CapacityResult = Field(default_factory=CapacityResult)
 
     class Config:
         """Pydantic configuration."""
@@ -3336,6 +3511,23 @@ class AnalyticsFormatter:
             f"context_switching: {profile.burnout.context_switching_score:.1f} switches/day"
         )
 
+        # Realistic Capacity
+        sections.append("\n--- Realistic Daily Capacity ---")
+        sections.append(
+            f"recommended_daily_minutes: "
+            f"{profile.capacity.recommended_daily_minutes:.0f} "
+            f"(basis: {profile.capacity.basis})"
+        )
+        if profile.capacity.basis != "insufficient_data":
+            sections.append(
+                f"completion_rate_on_lighter_days: "
+                f"{profile.capacity.light_day_completion_rate:.0%}"
+            )
+            sections.append(
+                f"completion_rate_on_heavier_days: "
+                f"{profile.capacity.heavy_day_completion_rate:.0%}"
+            )
+
         # Patterns
         if profile.patterns.patterns:
             sections.append("\n--- Detected Patterns ---")
@@ -3517,6 +3709,7 @@ class AnalyticsEngine:
         habits = HabitCalculator().compute(stats)
         burnout = BurnoutCalculator().compute(stats)
         best_hour_result = BestHourCalculator().compute(stats)
+        capacity = CapacityCalculator().compute(stats)
 
         # Step 4: Assemble profile
         overall_confidence = compute_confidence(
@@ -3550,4 +3743,5 @@ class AnalyticsEngine:
             habits=habits,
             burnout=burnout,
             best_hour=best_hour_result,
+            capacity=capacity,
         )

@@ -199,25 +199,31 @@ class PlannerService:
     # Public API
     # ------------------------------------------------------------------
 
-    def generate_and_save_plan(
+    def draft_plan(
         self,
         raw_input: str,
         user_id: int,
-    ) -> dict[str, Any]:
+        calendar_events: Optional[list[dict]] = None,
+    ) -> DayPlanOutput:
         """
-        Turn free-form text into structured tasks and persist them.
+        Ask the AI Planner to split free-form text into structured tasks
+        WITHOUT persisting anything to the database.
+
+        This is the first half of what ``generate_and_save_plan`` used to
+        do in one shot. Splitting it out lets a caller inspect the draft
+        (e.g. total estimated minutes, for a realistic-capacity check)
+        and decide whether to save it, discard it, or let the user
+        revise their input and draft again — before anything touches
+        the database.
 
         Args:
             raw_input: The user's free-form description of their day.
-            user_id: The plan's owner.
+            user_id: The plan's owner (used only to look up existing
+                categories so the AI can reuse them).
 
         Returns:
-            A dict with:
-                - plan_id: int
-                - planning_notes: str (the AI's brief interpretation note)
-                - tasks: list of dicts, each with task_id, title,
-                  category_name, is_new_category, needs_review,
-                  review_reason, is_fixed_time.
+            The raw DayPlanOutput from the Planner engine — not yet
+            saved anywhere.
 
         Raises:
             ValueError: If raw_input is empty.
@@ -227,25 +233,55 @@ class PlannerService:
         if not cleaned_input:
             raise ValueError("raw_input cannot be empty.")
 
-        # 1. Load existing categories for this user (case-insensitive lookup)
         category_lookup = self._load_existing_categories(user_id)
 
-        # 2. Ask the Planner to split the input into structured tasks
         engine = self._get_engine()
-        plan_output: DayPlanOutput = engine.plan_day(
+        return engine.plan_day(
             raw_input=cleaned_input,
             existing_categories=[
                 name.title() for name in category_lookup.keys()
             ] if category_lookup else [],
+            calendar_events=calendar_events,
         )
 
-        # 3. Get (or create) today's plan container
+    def save_plan(
+        self,
+        plan_output: DayPlanOutput,
+        raw_input: str,
+        user_id: int,
+    ) -> dict[str, Any]:
+        """
+        Persist an already-drafted DayPlanOutput (see ``draft_plan``) to
+        the database: create/reuse today's plan container, resolve or
+        create each task's category, and insert every task.
+
+        Args:
+            plan_output: A DayPlanOutput previously returned by
+                ``draft_plan`` (or ``PlannerEngine.plan_day`` directly).
+            raw_input: The original free-form text, used only when a new
+                plan container needs to be created for today.
+            user_id: The plan's owner.
+
+        Returns:
+            A dict with:
+                - plan_id: int
+                - planning_notes: str (the AI's brief interpretation note)
+                - tasks: list of dicts, each with task_id, title,
+                  category_name, is_new_category, needs_review,
+                  review_reason, is_fixed_time.
+        """
+        cleaned_input = raw_input.strip()
+
+        # 1. Load existing categories for this user (case-insensitive lookup)
+        category_lookup = self._load_existing_categories(user_id)
+
+        # 2. Get (or create) today's plan container
         plan_id = self._get_or_create_today_plan(user_id, cleaned_input)
 
-        # 4. Figure out where new tasks should start in display order
+        # 3. Figure out where new tasks should start in display order
         existing_task_count = len(self.db.get_tasks_by_plan(plan_id))
 
-        # 5. Persist each task, resolving/creating categories as we go
+        # 4. Persist each task, resolving/creating categories as we go
         saved_tasks: list[dict[str, Any]] = []
         for offset, task in enumerate(plan_output.tasks):
             category_id = self._resolve_category_id(task, category_lookup, user_id)
@@ -285,3 +321,32 @@ class PlannerService:
             "planning_notes": plan_output.planning_notes,
             "tasks": saved_tasks,
         }
+
+    def generate_and_save_plan(
+        self,
+        raw_input: str,
+        user_id: int,
+    ) -> dict[str, Any]:
+        """
+        Turn free-form text into structured tasks and persist them in
+        one call — convenience wrapper for callers that don't need to
+        inspect the draft first (e.g. don't need a capacity check).
+
+        Equivalent to ``save_plan(draft_plan(raw_input, user_id),
+        raw_input, user_id)``.
+
+        Args:
+            raw_input: The user's free-form description of their day.
+            user_id: The plan's owner.
+
+        Returns:
+            Same shape as ``save_plan``.
+
+        Raises:
+            ValueError: If raw_input is empty.
+            RuntimeError: If the Planner engine fails.
+        """
+        plan_output = self.draft_plan(raw_input=raw_input, user_id=user_id)
+        return self.save_plan(
+            plan_output=plan_output, raw_input=raw_input, user_id=user_id,
+        )

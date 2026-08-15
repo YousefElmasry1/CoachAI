@@ -207,6 +207,7 @@ class SchedulerService:
         self,
         plan_id: int,
         preferences: SchedulingPreferences,
+        blocked_slots: Optional[list[tuple]] = None,
     ) -> list[ScheduledTask]:
         
         # ------------------------------------------------------------------
@@ -234,6 +235,8 @@ class SchedulerService:
         # Step 4: Run the scheduling algorithm, anchored to plan_date and
         #         the user's own preferences
         # ------------------------------------------------------------------
+        if blocked_slots:
+            preferences.blocked_slots = blocked_slots
         scheduler = self._resolve_scheduler(preferences)
         scheduled: list[ScheduledTask] = scheduler.schedule(tasks, plan_date=plan_date)
 
@@ -248,6 +251,7 @@ class SchedulerService:
         self,
         user_id: int,
         preferences: SchedulingPreferences,
+        blocked_slots: Optional[list[tuple]] = None,
     ) -> list[ScheduledTask]:
 
         plan = self.db.get_today_plan(user_id)
@@ -255,4 +259,4 @@ class SchedulerService:
             raise ValueError(f"No plan found for user {user_id} today.")
 
         plan_id: int = int(plan["plan_id"])
-        return self.schedule_plan(plan_id, preferences=preferences)
+        return self.schedule_plan(plan_id, preferences=preferences, blocked_slots=blocked_slots)

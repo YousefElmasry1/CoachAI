@@ -13,12 +13,22 @@ import streamlit as st
 from config import DEFAULT_ANALYTICS_WINDOW
 from layout import page_setup, page_title
 from services import (
+    get_current_user_id,
     get_database_status,
     get_system_info,
     load_categories,
     create_category,
     load_all_badges,
     clear_all_caches,
+    is_google_calendar_connected,
+    get_google_auth_url,
+    connect_google_calendar,
+    disconnect_google_calendar,
+    fetch_google_calendars,
+    save_selected_calendars,
+    get_selected_calendars,
+    sync_google_calendar,
+    get_last_sync_time,
 )
 
 
@@ -29,7 +39,9 @@ from services import (
 page_setup(title="Settings", icon="⚙️")
 page_title("⚙️", "Settings", "Preferences, backend status, and workspace management.")
 
-tabs = st.tabs(["🎨 Appearance", "⚡ Data & Performance", "🩺 System Status", "🏷️ Categories", "🏆 Badges"])
+user_id = get_current_user_id()
+
+tabs = st.tabs(["🎨 Appearance", "⚡ Data & Performance", "🩺 System Status", "🏷️ Categories", "🏆 Badges", "📅 Google Calendar"])
 
 
 # ═════════════════════════════════════════════════════════════
@@ -188,3 +200,225 @@ with tabs[4]:
                     """,
                     unsafe_allow_html=True,
                 )
+
+
+# ═════════════════════════════════════════════════════════════
+# GOOGLE CALENDAR
+# ═════════════════════════════════════════════════════════════
+with tabs[5]:
+    # Handle OAuth callback (code in query params)
+    query_params = st.query_params
+    auth_code = query_params.get("code")
+    if auth_code and not is_google_calendar_connected(user_id):
+        with st.spinner("Connecting to Google Calendar..."):
+            if connect_google_calendar(auth_code, user_id):
+                st.query_params.clear()
+                st.toast("Google Calendar connected!", icon="✅")
+                st.rerun()
+            else:
+                st.error(
+                    "Failed to connect. Please try again."
+                )
+                st.query_params.clear()
+
+    connected = is_google_calendar_connected(user_id)
+
+    if not connected:
+        # ── State A: Not Connected ──
+        st.markdown("#### 📅 Google Calendar")
+        st.markdown(
+            "Connect your Google Calendar to see your events as "
+            "fixed time blocks in your daily plan."
+        )
+        st.caption(
+            "Only events from calendars you select will be synced. "
+            "All-day events are ignored."
+        )
+        st.markdown("<div style='height:0.5rem;'></div>", unsafe_allow_html=True)
+        try:
+            auth_url = get_google_auth_url()
+            st.link_button(
+                "🔗 Connect Google Calendar",
+                url=auth_url,
+                type="primary",
+                use_container_width=True,
+            )
+        except Exception as e:
+            st.error(
+                "Could not generate Google sign-in link. "
+                "Make sure GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET "
+                "are set in your .env file."
+            )
+            if st.session_state.get("debug_mode"):
+                st.exception(e)
+    else:
+        selected = get_selected_calendars(user_id)
+        picking = st.session_state.get("_gcal_picking", not selected)
+
+        if picking:
+            # ── State B: Calendar Picker ──
+            st.markdown("#### 📅 Select Calendars")
+            st.caption(
+                "Choose which Google Calendars CoachAI should use for planning. "
+                "Only selected calendars will be synced and treated as fixed time blocks."
+            )
+            st.markdown("<div style='height:0.5rem;'></div>", unsafe_allow_html=True)
+
+            available = fetch_google_calendars(user_id)
+            if not available:
+                st.warning(
+                    "Could not load your calendars from Google. "
+                    "Try again later.",
+                    icon="⚠️",
+                )
+            else:
+                # Pre-select: previously selected or just primary on first run
+                prev_ids = {c["calendar_id"] for c in selected}
+                selections = {}
+                for cal in available:
+                    default = (
+                        cal["calendar_id"] in prev_ids
+                        if prev_ids
+                        else cal.get("is_primary", False)
+                    )
+                    label = cal["name"]
+                    if cal.get("is_primary"):
+                        label += " (Primary)"
+                    selections[cal["calendar_id"]] = st.checkbox(
+                        label,
+                        value=default,
+                        key=f"_gcal_sel_{cal['calendar_id']}",
+                    )
+
+                st.markdown("<div style='height:0.5rem;'></div>", unsafe_allow_html=True)
+                sc1, sc2 = st.columns(2)
+                with sc1:
+                    if st.button(
+                        "💾 Save Selection",
+                        type="primary",
+                        use_container_width=True,
+                    ):
+                        chosen = [
+                            {
+                                "calendar_id": cal["calendar_id"],
+                                "calendar_name": cal["name"],
+                                "color": cal.get("color", "#4285F4"),
+                                "is_primary": cal.get("is_primary", False),
+                            }
+                            for cal in available
+                            if selections.get(cal["calendar_id"])
+                        ]
+                        if not chosen:
+                            st.error("Please select at least one calendar.")
+                        else:
+                            save_selected_calendars(user_id, chosen)
+                            st.session_state["_gcal_picking"] = False
+                            st.toast(
+                                f"{len(chosen)} calendar(s) selected!",
+                                icon="✅",
+                            )
+                            st.rerun()
+                with sc2:
+                    if selected and st.button(
+                        "✖️ Cancel",
+                        use_container_width=True,
+                    ):
+                        st.session_state["_gcal_picking"] = False
+                        st.rerun()
+        else:
+            # ── State C: Connected with Calendars Selected ──
+            st.markdown("#### ✅ Google Calendar Connected")
+
+            last_sync = get_last_sync_time(user_id)
+            if last_sync:
+                from datetime import datetime
+                try:
+                    sync_dt = datetime.fromisoformat(last_sync)
+                    diff = datetime.now() - sync_dt
+                    mins_ago = int(diff.total_seconds() / 60)
+                    if mins_ago < 1:
+                        sync_label = "just now"
+                    elif mins_ago < 60:
+                        sync_label = f"{mins_ago} minute{'s' if mins_ago != 1 else ''} ago"
+                    else:
+                        sync_label = sync_dt.strftime("%I:%M %p")
+                    st.caption(f"Last synced: {sync_label}")
+                except (ValueError, TypeError):
+                    st.caption(f"Last synced: {last_sync}")
+            else:
+                st.caption("Not yet synced.")
+
+            st.markdown("**Selected calendars:**")
+            for cal in selected:
+                color = cal.get("color", "#4285F4")
+                name = cal.get("calendar_name", cal["calendar_id"])
+                st.markdown(
+                    f"<div style='display:flex; align-items:center; gap:8px; margin-bottom:4px;'>"
+                    f"<span style='width:12px; height:12px; border-radius:50%; "
+                    f"background:{color}; display:inline-block;'></span>"
+                    f"<span>✅ {name}</span></div>",
+                    unsafe_allow_html=True,
+                )
+
+            st.markdown("<div style='height:0.8rem;'></div>", unsafe_allow_html=True)
+            gc1, gc2, gc3 = st.columns(3)
+            with gc1:
+                if st.button(
+                    "✏️ Change Calendars",
+                    use_container_width=True,
+                ):
+                    st.session_state["_gcal_picking"] = True
+                    st.rerun()
+            with gc2:
+                if st.button(
+                    "🔄 Sync Now",
+                    use_container_width=True,
+                ):
+                    with st.spinner("Syncing..."):
+                        result = sync_google_calendar(user_id)
+                    if result.get("error"):
+                        st.warning(
+                            f"Sync issue: {result['error']}",
+                            icon="⚠️",
+                        )
+                    else:
+                        st.toast(
+                            f"Synced {result.get('synced_count', 0)} event(s) "
+                            f"from {result.get('calendars_synced', 0)} calendar(s)!",
+                            icon="🔄",
+                        )
+                        st.rerun()
+            with gc3:
+                if st.button(
+                    "❌ Disconnect",
+                    type="secondary",
+                    use_container_width=True,
+                ):
+                    st.session_state["_gcal_confirm_disconnect"] = True
+                    st.rerun()
+
+            if st.session_state.get("_gcal_confirm_disconnect"):
+                st.warning(
+                    "This will remove your Google Calendar connection, "
+                    "all selected calendars, and all synced events from CoachAI.",
+                    icon="⚠️",
+                )
+                cd1, cd2 = st.columns(2)
+                with cd1:
+                    if st.button(
+                        "Yes, Disconnect",
+                        type="primary",
+                        use_container_width=True,
+                    ):
+                        disconnect_google_calendar(user_id)
+                        st.session_state.pop("_gcal_confirm_disconnect", None)
+                        st.session_state.pop("_gcal_picking", None)
+                        st.toast("Google Calendar disconnected.", icon="✅")
+                        st.rerun()
+                with cd2:
+                    if st.button(
+                        "Cancel",
+                        use_container_width=True,
+                    ):
+                        st.session_state.pop("_gcal_confirm_disconnect", None)
+                        st.rerun()

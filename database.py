@@ -87,6 +87,8 @@ class Database:
         if cursor.fetchone() is not None:
             self._maybe_migrate_started_at()
             self._maybe_migrate_failure_reason_check()
+            self._maybe_create_google_tables()
+            self._maybe_migrate_task_google_event_id()
             return  # Schema already applied
 
         schema_path = Path(__file__).with_name(SCHEMA_FILE)
@@ -198,6 +200,63 @@ class Database:
                 self.connection.execute("CREATE INDEX idx_tasks_plan_status ON tasks(plan_id, status)")
         finally:
             self.connection.execute("PRAGMA foreign_keys = ON")
+
+    def _maybe_create_google_tables(self) -> None:
+        """Create Google Calendar tables if they don't exist (idempotent)."""
+        self.connection.executescript("""
+            CREATE TABLE IF NOT EXISTS google_oauth_tokens (
+                token_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id       INTEGER NOT NULL UNIQUE,
+                access_token  TEXT NOT NULL,
+                refresh_token TEXT NOT NULL,
+                token_expiry  DATETIME NOT NULL,
+                scopes        TEXT NOT NULL DEFAULT '',
+                created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS google_selected_calendars (
+                selection_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id       INTEGER NOT NULL,
+                calendar_id   TEXT NOT NULL,
+                calendar_name TEXT NOT NULL DEFAULT '',
+                color         TEXT NOT NULL DEFAULT '#4285F4',
+                is_primary    INTEGER NOT NULL DEFAULT 0,
+                created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+                UNIQUE(user_id, calendar_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS google_calendar_events (
+                event_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id         INTEGER NOT NULL,
+                google_event_id TEXT NOT NULL,
+                title           TEXT NOT NULL DEFAULT '',
+                start_time      TIME NOT NULL,
+                end_time        TIME NOT NULL,
+                event_date      DATE NOT NULL,
+                calendar_id     TEXT NOT NULL,
+                last_synced_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+                UNIQUE(user_id, google_event_id, event_date)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_gcal_events_user_date
+                ON google_calendar_events(user_id, event_date);
+            CREATE INDEX IF NOT EXISTS idx_gcal_selected_user
+                ON google_selected_calendars(user_id);
+        """)
+
+    def _maybe_migrate_task_google_event_id(self) -> None:
+        """Add google_event_id column to tasks if missing."""
+        cursor = self.connection.execute("PRAGMA table_info(tasks)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        if "google_event_id" not in existing_columns:
+            self.connection.execute(
+                "ALTER TABLE tasks ADD COLUMN google_event_id TEXT"
+            )
+            self.connection.commit()
 
     # ------------------------------------------------------------------
     # Low-level query helpers
@@ -574,7 +633,9 @@ class Database:
                       Allowed keys:
                       ``title``, ``description``, ``priority``,
                       ``estimated_minutes``, ``scheduled_start``,
-                      ``scheduled_end``, ``order_index``, ``category_id``.
+                      ``scheduled_end``, ``order_index``, ``category_id``,
+                      ``plan_id`` (used to move a task to a different
+                      day's plan, e.g. deferring it to tomorrow).
         """
         allowed = {
             "title",
@@ -585,6 +646,7 @@ class Database:
             "scheduled_end",
             "order_index",
             "category_id",
+            "plan_id",
         }
         updates = {k: v for k, v in kwargs.items() if k in allowed}
         if not updates:
@@ -1086,4 +1148,257 @@ class Database:
         return self.fetch_all(
             "SELECT * FROM categories WHERE user_id = ? ORDER BY name",
             (user_id,),
+        )
+
+    # ------------------------------------------------------------------
+    # Google OAuth Tokens
+    # ------------------------------------------------------------------
+
+    def save_google_tokens(
+        self,
+        user_id: int,
+        access_token: str,
+        refresh_token: str,
+        token_expiry: str,
+        scopes: str = "",
+    ) -> int:
+        """Insert or replace Google OAuth tokens for a user."""
+        cursor = self.execute(
+            """
+            INSERT INTO google_oauth_tokens
+                (user_id, access_token, refresh_token, token_expiry, scopes)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                access_token = excluded.access_token,
+                refresh_token = excluded.refresh_token,
+                token_expiry = excluded.token_expiry,
+                scopes = excluded.scopes,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (user_id, access_token, refresh_token, token_expiry, scopes),
+        )
+        self.commit()
+        return cursor.lastrowid
+
+    def get_google_tokens(self, user_id: int) -> Optional[sqlite3.Row]:
+        """Fetch stored Google OAuth tokens for a user."""
+        return self.fetch_one(
+            "SELECT * FROM google_oauth_tokens WHERE user_id = ?",
+            (user_id,),
+        )
+
+    def update_google_tokens(
+        self,
+        user_id: int,
+        access_token: str,
+        token_expiry: str,
+    ) -> None:
+        """Update access token and expiry after a refresh."""
+        self.execute(
+            """
+            UPDATE google_oauth_tokens
+            SET access_token = ?, token_expiry = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE user_id = ?
+            """,
+            (access_token, token_expiry, user_id),
+        )
+        self.commit()
+
+    def delete_google_tokens(self, user_id: int) -> None:
+        """Remove Google OAuth tokens (disconnect)."""
+        self.execute(
+            "DELETE FROM google_oauth_tokens WHERE user_id = ?",
+            (user_id,),
+        )
+        self.commit()
+
+    # ------------------------------------------------------------------
+    # Google Selected Calendars
+    # ------------------------------------------------------------------
+
+    def save_selected_calendars(
+        self,
+        user_id: int,
+        calendars: list[dict],
+    ) -> None:
+        """
+        Replace all selected calendars for a user.
+
+        Args:
+            calendars: List of dicts with keys:
+                calendar_id, calendar_name, color, is_primary
+        """
+        with self.transaction():
+            self.execute(
+                "DELETE FROM google_selected_calendars WHERE user_id = ?",
+                (user_id,),
+            )
+            for cal in calendars:
+                self.execute(
+                    """
+                    INSERT INTO google_selected_calendars
+                        (user_id, calendar_id, calendar_name, color, is_primary)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        user_id,
+                        cal["calendar_id"],
+                        cal.get("calendar_name", ""),
+                        cal.get("color", "#4285F4"),
+                        1 if cal.get("is_primary", False) else 0,
+                    ),
+                )
+
+    def get_selected_calendars(self, user_id: int) -> list[sqlite3.Row]:
+        """Fetch the user's selected Google Calendars."""
+        return self.fetch_all(
+            "SELECT * FROM google_selected_calendars WHERE user_id = ? ORDER BY is_primary DESC, calendar_name",
+            (user_id,),
+        )
+
+    def get_selected_calendar_ids(self, user_id: int) -> list[str]:
+        """Return just the calendar_id strings for the user's selections."""
+        rows = self.fetch_all(
+            "SELECT calendar_id FROM google_selected_calendars WHERE user_id = ?",
+            (user_id,),
+        )
+        return [row["calendar_id"] for row in rows]
+
+    def delete_selected_calendars(self, user_id: int) -> None:
+        """Remove all selected calendars for a user."""
+        self.execute(
+            "DELETE FROM google_selected_calendars WHERE user_id = ?",
+            (user_id,),
+        )
+        self.commit()
+
+    # ------------------------------------------------------------------
+    # Google Calendar Events
+    # ------------------------------------------------------------------
+
+    def upsert_google_calendar_event(
+        self,
+        user_id: int,
+        google_event_id: str,
+        title: str,
+        start_time: str,
+        end_time: str,
+        event_date: str,
+        calendar_id: str,
+    ) -> int:
+        """Insert or update a synced Google Calendar event."""
+        cursor = self.execute(
+            """
+            INSERT INTO google_calendar_events
+                (user_id, google_event_id, title, start_time, end_time,
+                 event_date, calendar_id, last_synced_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id, google_event_id, event_date) DO UPDATE SET
+                title = excluded.title,
+                start_time = excluded.start_time,
+                end_time = excluded.end_time,
+                calendar_id = excluded.calendar_id,
+                last_synced_at = CURRENT_TIMESTAMP
+            """,
+            (user_id, google_event_id, title, start_time, end_time,
+             event_date, calendar_id),
+        )
+        self.commit()
+        return cursor.lastrowid
+
+    def get_google_calendar_events(
+        self,
+        user_id: int,
+        event_date: str,
+    ) -> list[sqlite3.Row]:
+        """Fetch synced Google Calendar events for a given date."""
+        return self.fetch_all(
+            """
+            SELECT * FROM google_calendar_events
+            WHERE user_id = ? AND event_date = ?
+            ORDER BY start_time ASC
+            """,
+            (user_id, event_date),
+        )
+
+    def delete_google_events_not_in(
+        self,
+        user_id: int,
+        event_date: str,
+        calendar_id: str,
+        keep_ids: list[str],
+    ) -> None:
+        """Remove events deleted from Google for a specific calendar+date."""
+        if not keep_ids:
+            self.execute(
+                """
+                DELETE FROM google_calendar_events
+                WHERE user_id = ? AND event_date = ? AND calendar_id = ?
+                """,
+                (user_id, event_date, calendar_id),
+            )
+        else:
+            placeholders = ", ".join("?" for _ in keep_ids)
+            self.execute(
+                f"""
+                DELETE FROM google_calendar_events
+                WHERE user_id = ? AND event_date = ? AND calendar_id = ?
+                  AND google_event_id NOT IN ({placeholders})
+                """,
+                (user_id, event_date, calendar_id, *keep_ids),
+            )
+        self.commit()
+
+    def delete_all_google_calendar_events(self, user_id: int) -> None:
+        """Remove all synced events for a user (disconnect cleanup)."""
+        self.execute(
+            "DELETE FROM google_calendar_events WHERE user_id = ?",
+            (user_id,),
+        )
+        self.commit()
+
+    def delete_google_events_by_calendar(
+        self,
+        user_id: int,
+        calendar_id: str,
+    ) -> None:
+        """Remove all events from a specific calendar (deselection)."""
+        self.execute(
+            "DELETE FROM google_calendar_events WHERE user_id = ? AND calendar_id = ?",
+            (user_id, calendar_id),
+        )
+        self.commit()
+
+    # ------------------------------------------------------------------
+    # Task Export Tracking
+    # ------------------------------------------------------------------
+
+    def update_task_google_event_id(
+        self,
+        task_id: int,
+        google_event_id: Optional[str],
+    ) -> None:
+        """Set the Google Calendar event ID for an exported task."""
+        self.execute(
+            """
+            UPDATE tasks
+            SET google_event_id = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE task_id = ?
+            """,
+            (google_event_id, task_id),
+        )
+        self.commit()
+
+    def get_tasks_with_google_event_id(
+        self,
+        plan_id: int,
+    ) -> list[sqlite3.Row]:
+        """Fetch tasks that have been exported to Google Calendar."""
+        return self.fetch_all(
+            """
+            SELECT * FROM tasks
+            WHERE plan_id = ? AND google_event_id IS NOT NULL
+            ORDER BY order_index ASC
+            """,
+            (plan_id,),
         )

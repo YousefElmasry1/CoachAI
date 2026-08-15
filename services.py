@@ -207,6 +207,35 @@ def get_planner_service():
 
 
 # ─────────────────────────────────────────────────────────────
+# Voice Input (Speech-to-Text via Gemini)
+# ─────────────────────────────────────────────────────────────
+
+def transcribe_voice_note(audio_bytes: bytes, mime_type: str = "audio/wav") -> str:
+    """
+    Transcribe a recorded voice note into plain text via Gemini.
+
+    Thin wrapper only — all transcription logic lives in
+    voice_service.py. The returned text is meant to be passed straight
+    into generate_today_plan() exactly like typed free-form input.
+
+    Args:
+        audio_bytes: Raw audio bytes from st.audio_input().
+        mime_type: MIME type of the audio (defaults to "audio/wav").
+
+    Returns:
+        The transcribed text.
+
+    Raises:
+        ValueError: If audio_bytes is empty.
+        voice_service.VoiceTranscriptionError: If Gemini fails to
+            transcribe the recording.
+    """
+    from voice_service import transcribe_audio
+    return transcribe_audio(audio_bytes, mime_type=mime_type)
+
+
+
+# ─────────────────────────────────────────────────────────────
 # Cached Data Loaders
 # ─────────────────────────────────────────────────────────────
 
@@ -523,6 +552,118 @@ def generate_today_plan(
     return service.generate_and_save_plan(raw_input=raw_input, user_id=user_id)
 
 
+def draft_today_plan(raw_input: str, user_id: int = DEFAULT_USER_ID) -> Any:
+    """
+    Ask the AI Planner to draft structured tasks WITHOUT saving them.
+
+    Use this (instead of generate_today_plan) whenever the caller needs
+    to inspect the draft first — e.g. to run a realistic-capacity check
+    via check_capacity_for_today() — before deciding whether to save it.
+
+    Returns the raw DayPlanOutput (see planner.py).
+
+    Raises:
+        ValueError: If raw_input is empty.
+        RuntimeError: If the Planner engine fails.
+    """
+    service = get_planner_service()
+    cal_events = get_google_calendar_events_today(user_id)
+    return service.draft_plan(
+        raw_input=raw_input, user_id=user_id, calendar_events=cal_events,
+    )
+
+
+def save_planner_draft(
+    plan_output: Any,
+    raw_input: str,
+    user_id: int = DEFAULT_USER_ID,
+) -> dict[str, Any]:
+    """
+    Persist a DayPlanOutput previously returned by draft_today_plan().
+
+    Returns the same shape as generate_today_plan().
+    """
+    service = get_planner_service()
+    result = service.save_plan(
+        plan_output=plan_output, raw_input=raw_input, user_id=user_id,
+    )
+    load_analytics_profile.clear()
+    return result
+
+
+# ─────────────────────────────────────────────────────────────
+# Realistic Capacity — Pre-Plan Warning
+# ─────────────────────────────────────────────────────────────
+
+def draft_plan_total_minutes(plan_output: Any) -> int:
+    """Sum estimated_minutes across every task in a (not-yet-saved) draft."""
+    return sum(int(t.estimated_minutes) for t in (plan_output.tasks or []))
+
+
+def check_capacity_for_today(
+    additional_minutes: int,
+    user_id: int = DEFAULT_USER_ID,
+) -> dict[str, Any]:
+    """
+    Check whether adding `additional_minutes` of newly planned/drafted
+    work to today would push the day's total planned load meaningfully
+    past this user's historical Realistic Capacity.
+
+    This looks at the FULL day (today's existing tasks, if any, plus the
+    new load being considered) — not just the new tasks in isolation —
+    since what matters is whether the day as a whole is overloaded.
+
+    Args:
+        additional_minutes: Total estimated minutes of the new tasks
+            being considered (from a draft plan, or a single manually
+            added task).
+        user_id: Whose capacity/today to check.
+
+    Returns:
+        A dict:
+            triggered: bool — True if a warning should be shown.
+            planned_minutes: int — today's existing + additional minutes.
+            existing_minutes: int — today's already-saved planned minutes.
+            recommended_minutes: float — the user's Realistic Capacity.
+            overload_fraction: float — how far over capacity (0.20 = 20% over).
+            basis: str — how recommended_minutes was derived.
+            confidence: str — confidence level behind the recommendation.
+            light_day_completion_rate: float
+            heavy_day_completion_rate: float
+    """
+    from config import CAPACITY_OVERLOAD_MARGIN, CAPACITY_MIN_CONFIDENCE_TO_WARN
+
+    profile = load_analytics_profile(user_id, DEFAULT_ANALYTICS_WINDOW)
+    capacity = profile.capacity
+
+    existing_minutes = sum(
+        int(t.get("estimated_minutes") or 0) for t in load_today_tasks(user_id)
+    )
+    planned_minutes = existing_minutes + max(0, int(additional_minutes))
+    recommended = capacity.recommended_daily_minutes
+
+    overload_fraction = (
+        (planned_minutes - recommended) / recommended if recommended > 0 else 0.0
+    )
+
+    triggered = (
+        capacity.confidence.level in CAPACITY_MIN_CONFIDENCE_TO_WARN
+        and overload_fraction >= CAPACITY_OVERLOAD_MARGIN
+    )
+
+    return {
+        "triggered": triggered,
+        "planned_minutes": planned_minutes,
+        "existing_minutes": existing_minutes,
+        "recommended_minutes": recommended,
+        "overload_fraction": overload_fraction,
+        "basis": capacity.basis,
+        "confidence": capacity.confidence.level,
+        "light_day_completion_rate": capacity.light_day_completion_rate,
+        "heavy_day_completion_rate": capacity.heavy_day_completion_rate,
+    }
+
+
 def add_task_to_plan(
     plan_id: int,
     title: str,
@@ -558,6 +699,45 @@ def delete_task(task_id: int) -> bool:
         return False
 
 
+def defer_task_to_tomorrow(task_id: int, user_id: int = DEFAULT_USER_ID) -> bool:
+    """
+    Move a task from its current plan to the user's plan for tomorrow,
+    creating tomorrow's plan container if it doesn't exist yet.
+
+    Used by the Realistic Capacity warning on the Manual tab, to let a
+    user free up room in today's plan without leaving the warning.
+    Clears any scheduled_start/scheduled_end, since a time slot computed
+    for today's schedule doesn't carry over to tomorrow's.
+
+    Returns True on success, False on error.
+    """
+    db = get_database()
+    try:
+        tomorrow = date.today() + timedelta(days=1)
+        target_plan = db.get_plan_by_date(user_id=user_id, plan_date=tomorrow)
+        if target_plan is None:
+            plan_id = db.create_plan(
+                user_id=user_id,
+                plan_date=tomorrow,
+                raw_input="Tasks deferred from a previous day.",
+            )
+        else:
+            plan_id = int(target_plan["plan_id"])
+
+        next_order_index = len(db.get_tasks_by_plan(plan_id))
+        db.update_task(
+            task_id,
+            plan_id=plan_id,
+            order_index=next_order_index,
+            scheduled_start=None,
+            scheduled_end=None,
+        )
+        load_analytics_profile.clear()
+        return True
+    except Exception:
+        return False
+
+
 def create_category(
     user_id: int,
     name: str,
@@ -582,6 +762,7 @@ def run_scheduler_for_plan(
     plan_id: int,
     work_day_start,
     breaks: Optional[list[tuple]] = None,
+    blocked_slots: Optional[list[tuple]] = None,
 ) -> list:
     """
     Run the deterministic Scheduler against an existing plan and persist
@@ -591,6 +772,8 @@ def run_scheduler_for_plan(
         plan_id: The plan whose tasks should be scheduled.
         work_day_start: A ``datetime.time`` marking the start of the day.
         breaks: Optional list of ``(start_time, duration_minutes)`` tuples.
+        blocked_slots: Optional list of ``(start_time, end_time)`` tuples
+            from Google Calendar events.
 
     Returns:
         The list of ScheduledTask objects, or [] on failure.
@@ -607,10 +790,14 @@ def run_scheduler_for_plan(
         user_breaks=user_breaks,
     )
     try:
-        return service.schedule_plan(plan_id=plan_id, preferences=preferences)
+        return service.schedule_plan(
+            plan_id=plan_id,
+            preferences=preferences,
+            blocked_slots=blocked_slots,
+        )
     except Exception:
         import traceback
-        traceback.print_exc()  # prints the real error to the terminal running `streamlit run`
+        traceback.print_exc()
         return []
 
 
@@ -623,11 +810,347 @@ def run_scheduler_for_today(
     plan = load_today_plan(user_id)
     if plan is None:
         return []
+    blocked = get_google_calendar_blocked_slots(user_id)
     return run_scheduler_for_plan(
         plan_id=plan["plan_id"],
         work_day_start=work_day_start,
         breaks=breaks,
+        blocked_slots=blocked,
     )
+
+
+# ─────────────────────────────────────────────────────────────
+# Google Calendar Integration
+# ─────────────────────────────────────────────────────────────
+
+
+def _get_google_client(user_id: int):
+    """
+    Build a GoogleCalendarClient for the given user, refreshing
+    the access token if expired.  Returns None if the user has
+    not connected Google Calendar.
+    """
+    from google_calendar import GoogleCalendarClient, GoogleCalendarError
+
+    db = get_database()
+    tokens = db.get_google_tokens(user_id)
+    if tokens is None:
+        return None
+
+    client = GoogleCalendarClient(
+        access_token=tokens["access_token"],
+        refresh_token=tokens["refresh_token"],
+        token_expiry=tokens["token_expiry"],
+    )
+
+    try:
+        refreshed = client.refresh_if_expired()
+        if refreshed:
+            db.update_google_tokens(
+                user_id=user_id,
+                access_token=refreshed["access_token"],
+                token_expiry=(
+                    refreshed["token_expiry"].isoformat()
+                    if hasattr(refreshed["token_expiry"], "isoformat")
+                    else str(refreshed["token_expiry"])
+                ),
+            )
+    except GoogleCalendarError:
+        pass  # Use existing token, may still work
+
+    return client
+
+
+def is_google_calendar_connected(user_id: int = DEFAULT_USER_ID) -> bool:
+    """Check if the user has stored Google Calendar OAuth tokens."""
+    db = get_database()
+    return db.get_google_tokens(user_id) is not None
+
+
+def get_google_auth_url() -> str:
+    """Generate Google OAuth2 consent URL."""
+    from google_calendar import GoogleCalendarClient
+
+    client_id = os.getenv("GOOGLE_CLIENT_ID", "")
+    redirect_uri = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8501")
+    return GoogleCalendarClient.build_auth_url(client_id, redirect_uri)
+
+
+def connect_google_calendar(
+    auth_code: str,
+    user_id: int = DEFAULT_USER_ID,
+) -> bool:
+    """Exchange OAuth code for tokens and store them."""
+    from google_calendar import GoogleCalendarClient, GoogleCalendarError
+
+    client_id = os.getenv("GOOGLE_CLIENT_ID", "")
+    client_secret = os.getenv("GOOGLE_CLIENT_SECRET", "")
+    redirect_uri = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8501")
+
+    try:
+        token_data = GoogleCalendarClient.exchange_code(
+            code=auth_code,
+            client_id=client_id,
+            client_secret=client_secret,
+            redirect_uri=redirect_uri,
+        )
+        db = get_database()
+        db.save_google_tokens(
+            user_id=user_id,
+            access_token=token_data["access_token"],
+            refresh_token=token_data["refresh_token"],
+            token_expiry=(
+                token_data["token_expiry"].isoformat()
+                if hasattr(token_data["token_expiry"], "isoformat")
+                else str(token_data["token_expiry"])
+            ),
+            scopes="calendar.readonly,calendar.events",
+        )
+        return True
+    except GoogleCalendarError as e:
+        import traceback
+        print(f"[CoachAI] Google Calendar connection failed: {e}")
+        traceback.print_exc()
+        return False
+
+
+def disconnect_google_calendar(user_id: int = DEFAULT_USER_ID) -> None:
+    """Remove tokens, selected calendars, and all synced events."""
+    db = get_database()
+    db.delete_all_google_calendar_events(user_id)
+    db.delete_selected_calendars(user_id)
+    db.delete_google_tokens(user_id)
+
+
+def fetch_google_calendars(
+    user_id: int = DEFAULT_USER_ID,
+) -> list[dict]:
+    """Fetch available calendars from Google API."""
+    from google_calendar import GoogleCalendarError
+
+    client = _get_google_client(user_id)
+    if client is None:
+        return []
+    try:
+        return client.list_calendars()
+    except GoogleCalendarError:
+        return []
+
+
+def save_selected_calendars(
+    user_id: int,
+    selections: list[dict],
+) -> None:
+    """
+    Persist the user's calendar choices and clean up events
+    from any deselected calendars.
+    """
+    db = get_database()
+    old_ids = set(db.get_selected_calendar_ids(user_id))
+    new_ids = {cal["calendar_id"] for cal in selections}
+
+    # Remove events from deselected calendars
+    for removed_id in old_ids - new_ids:
+        db.delete_google_events_by_calendar(user_id, removed_id)
+
+    db.save_selected_calendars(user_id, selections)
+
+
+def get_selected_calendars(
+    user_id: int = DEFAULT_USER_ID,
+) -> list[dict]:
+    """Load persisted calendar selections."""
+    db = get_database()
+    rows = db.get_selected_calendars(user_id)
+    return [
+        {
+            "calendar_id": row["calendar_id"],
+            "calendar_name": row["calendar_name"],
+            "color": row["color"],
+            "is_primary": bool(row["is_primary"]),
+        }
+        for row in rows
+    ]
+
+
+def sync_google_calendar(
+    user_id: int = DEFAULT_USER_ID,
+) -> dict:
+    """
+    Fetch events from selected calendars for today, upsert into DB,
+    remove stale events.  Returns a sync summary dict.
+    """
+    from google_calendar import GoogleCalendarError
+
+    client = _get_google_client(user_id)
+    if client is None:
+        return {"synced_count": 0, "error": "Not connected"}
+
+    db = get_database()
+    selected_ids = db.get_selected_calendar_ids(user_id)
+    if not selected_ids:
+        return {"synced_count": 0, "error": "No calendars selected"}
+
+    today = date.today()
+    today_str = today.isoformat()
+    total_synced = 0
+
+    try:
+        for cal_id in selected_ids:
+            events = client.fetch_events(cal_id, today)
+            synced_ids = []
+            for ev in events:
+                db.upsert_google_calendar_event(
+                    user_id=user_id,
+                    google_event_id=ev["google_event_id"],
+                    title=ev["title"],
+                    start_time=ev["start_time"],
+                    end_time=ev["end_time"],
+                    event_date=today_str,
+                    calendar_id=ev["calendar_id"],
+                )
+                synced_ids.append(ev["google_event_id"])
+                total_synced += 1
+
+            # Remove events that no longer exist in Google
+            db.delete_google_events_not_in(
+                user_id, today_str, cal_id, synced_ids
+            )
+
+        return {
+            "synced_count": total_synced,
+            "calendars_synced": len(selected_ids),
+        }
+    except GoogleCalendarError as exc:
+        return {"synced_count": total_synced, "error": str(exc)}
+
+
+def get_google_calendar_events_today(
+    user_id: int = DEFAULT_USER_ID,
+) -> list[dict]:
+    """Load today's synced Google Calendar events from DB."""
+    db = get_database()
+    today_str = date.today().isoformat()
+    rows = db.get_google_calendar_events(user_id, today_str)
+    return [
+        {
+            "title": row["title"],
+            "start_time": row["start_time"],
+            "end_time": row["end_time"],
+            "calendar_id": row["calendar_id"],
+            "google_event_id": row["google_event_id"],
+        }
+        for row in rows
+    ]
+
+
+def get_google_calendar_blocked_slots(
+    user_id: int = DEFAULT_USER_ID,
+) -> list[tuple]:
+    """
+    Convert today's Google Calendar events into (start_time, end_time)
+    tuples for the Scheduler's blocked_slots parameter.
+    """
+    from datetime import time as dt_time
+
+    events = get_google_calendar_events_today(user_id)
+    slots = []
+    for ev in events:
+        try:
+            start = dt_time.fromisoformat(ev["start_time"])
+            end = dt_time.fromisoformat(ev["end_time"])
+            slots.append((start, end))
+        except (ValueError, TypeError):
+            continue
+    return slots
+
+
+def get_last_sync_time(
+    user_id: int = DEFAULT_USER_ID,
+) -> Optional[str]:
+    """Return the most recent last_synced_at from google_calendar_events."""
+    db = get_database()
+    row = db.fetch_one(
+        """
+        SELECT MAX(last_synced_at) AS last_sync
+        FROM google_calendar_events
+        WHERE user_id = ?
+        """,
+        (user_id,),
+    )
+    return row["last_sync"] if row and row["last_sync"] else None
+
+
+def export_task_to_google_calendar(
+    task_id: int,
+    user_id: int = DEFAULT_USER_ID,
+) -> bool:
+    """Create or update a Google Calendar event for a scheduled task."""
+    from google_calendar import GoogleCalendarError
+
+    client = _get_google_client(user_id)
+    if client is None:
+        return False
+
+    db = get_database()
+    task = db.get_task(task_id)
+    if task is None or not task["scheduled_start"] or not task["scheduled_end"]:
+        return False
+
+    plan = db.get_plan_by_id(task["plan_id"])
+    if plan is None:
+        return False
+
+    plan_date = date.fromisoformat(str(plan["plan_date"]))
+
+    try:
+        existing_event_id = task["google_event_id"] if "google_event_id" in task.keys() else None
+
+        if existing_event_id:
+            client.update_event(
+                calendar_id="primary",
+                google_event_id=existing_event_id,
+                title=task["title"],
+                start_time=task["scheduled_start"],
+                end_time=task["scheduled_end"],
+                event_date=plan_date,
+            )
+        else:
+            new_event_id = client.create_event(
+                calendar_id="primary",
+                title=task["title"],
+                start_time=task["scheduled_start"],
+                end_time=task["scheduled_end"],
+                event_date=plan_date,
+            )
+            db.update_task_google_event_id(task_id, new_event_id)
+
+        return True
+    except GoogleCalendarError:
+        return False
+
+
+def export_all_scheduled_tasks(
+    user_id: int = DEFAULT_USER_ID,
+) -> dict:
+    """Export all scheduled tasks from today's plan to Google Calendar."""
+    plan = load_today_plan(user_id)
+    if plan is None:
+        return {"exported": 0, "error": "No plan for today"}
+
+    db = get_database()
+    tasks = db.get_tasks_by_plan(plan["plan_id"])
+    exported = 0
+    errors = 0
+
+    for task in tasks:
+        if task["scheduled_start"] and task["scheduled_end"]:
+            if export_task_to_google_calendar(task["task_id"], user_id):
+                exported += 1
+            else:
+                errors += 1
+
+    return {"exported": exported, "errors": errors}
 
 
 # ─────────────────────────────────────────────────────────────

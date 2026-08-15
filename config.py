@@ -211,6 +211,20 @@ MOTIVATIONAL_QUOTES: list[dict[str, str]] = [
 ]
 
 # ─────────────────────────────────────────────────────────────
+# Realistic Capacity — Pre-Plan Warning
+# ─────────────────────────────────────────────────────────────
+# When a freshly-generated (not yet saved) plan's total planned minutes
+# for the day exceeds the user's historical recommended_daily_minutes
+# by at least this fraction, the Today's Schedule page shows a
+# capacity warning instead of silently saving the plan.
+CAPACITY_OVERLOAD_MARGIN: float = 0.15  # 15% over recommended triggers it
+
+# Below this confidence level there isn't enough history to trust the
+# recommendation, so the warning is skipped entirely rather than
+# nagging a brand-new user with a guess.
+CAPACITY_MIN_CONFIDENCE_TO_WARN: set[str] = {"low", "medium", "high"}
+
+# ─────────────────────────────────────────────────────────────
 # Burnout Thresholds
 # ─────────────────────────────────────────────────────────────
 
@@ -245,3 +259,14 @@ WEEKDAY_NAMES: list[str] = [
 ]
 
 WEEKDAY_SHORT: list[str] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+# ─────────────────────────────────────────────────────────────
+# Google Calendar Integration
+# ─────────────────────────────────────────────────────────────
+
+GOOGLE_CALENDAR_SCOPES: list[str] = [
+    "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/calendar.events",
+]
+GOOGLE_CALENDAR_SYNC_INTERVAL_MINUTES: int = 15
+GOOGLE_CALENDAR_EVENT_COLOR: str = "#4285F4"  # Google Blue (fallback)

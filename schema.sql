@@ -1,6 +1,6 @@
 -- ==========================================================
 -- CoachAI – Graduation Project Database Schema
--- 7 Tables | Clean | Professional | Future-Ready
+-- 10 Tables | Clean | Professional | Future-Ready
 -- ==========================================================
 
 PRAGMA foreign_keys = ON;
@@ -147,6 +147,53 @@ CREATE TABLE user_badges (
 );
 
 -- ==========================================================
+-- 8. GOOGLE OAUTH TOKENS
+-- ==========================================================
+CREATE TABLE IF NOT EXISTS google_oauth_tokens (
+    token_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id       INTEGER NOT NULL UNIQUE,
+    access_token  TEXT NOT NULL,
+    refresh_token TEXT NOT NULL,
+    token_expiry  DATETIME NOT NULL,
+    scopes        TEXT NOT NULL DEFAULT '',
+    created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+);
+
+-- ==========================================================
+-- 9. GOOGLE SELECTED CALENDARS
+-- ==========================================================
+CREATE TABLE IF NOT EXISTS google_selected_calendars (
+    selection_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id       INTEGER NOT NULL,
+    calendar_id   TEXT NOT NULL,
+    calendar_name TEXT NOT NULL DEFAULT '',
+    color         TEXT NOT NULL DEFAULT '#4285F4',
+    is_primary    INTEGER NOT NULL DEFAULT 0,
+    created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+    UNIQUE(user_id, calendar_id)
+);
+
+-- ==========================================================
+-- 10. GOOGLE CALENDAR EVENTS (synced fixed-time blocks)
+-- ==========================================================
+CREATE TABLE IF NOT EXISTS google_calendar_events (
+    event_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         INTEGER NOT NULL,
+    google_event_id TEXT NOT NULL,
+    title           TEXT NOT NULL DEFAULT '',
+    start_time      TIME NOT NULL,
+    end_time        TIME NOT NULL,
+    event_date      DATE NOT NULL,
+    calendar_id     TEXT NOT NULL,
+    last_synced_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+    UNIQUE(user_id, google_event_id, event_date)
+);
+
+-- ==========================================================
 -- INDEXES
 -- ==========================================================
 
@@ -172,3 +219,7 @@ CREATE INDEX idx_profiles_user_id ON user_profiles(user_id);
 
 -- User Badges
 CREATE INDEX idx_user_badges_user_id ON user_badges(user_id);
+
+-- Google Calendar
+CREATE INDEX IF NOT EXISTS idx_gcal_events_user_date ON google_calendar_events(user_id, event_date);
+CREATE INDEX IF NOT EXISTS idx_gcal_selected_user ON google_selected_calendars(user_id);

@@ -30,12 +30,24 @@ from services import (
     load_today_tasks,
     load_categories,
     create_today_plan,
-    generate_today_plan,
+    draft_today_plan,
+    save_planner_draft,
+    draft_plan_total_minutes,
+    check_capacity_for_today,
     add_task_to_plan,
     delete_task,
+    defer_task_to_tomorrow,
     update_task_status,
     run_scheduler_for_today,
+    transcribe_voice_note,
+    is_google_calendar_connected,
+    sync_google_calendar,
+    get_last_sync_time,
+    get_google_calendar_events_today,
+    get_selected_calendars,
+    export_all_scheduled_tasks,
 )
+from voice_service import VoiceTranscriptionError
 from charts import create_timeline, create_donut
 
 
@@ -48,7 +60,454 @@ page_title("📅", "Today's Schedule", "Your plan for today, scheduled and track
 
 user_id = get_current_user_id()
 
+# ─────────────────────────────────────────────────────────────
+# Google Calendar Auto-Sync (silent, on page load)
+# ─────────────────────────────────────────────────────────────
+
+try:
+    if is_google_calendar_connected(user_id):
+        from datetime import datetime
+        _last_sync = get_last_sync_time(user_id)
+        _should_sync = True
+        if _last_sync:
+            try:
+                _sync_dt = datetime.fromisoformat(_last_sync)
+                _should_sync = (datetime.now() - _sync_dt).total_seconds() > 900
+            except (ValueError, TypeError):
+                pass
+        if _should_sync:
+            sync_google_calendar(user_id)
+except Exception:
+    pass  # Never block the page for a sync failure
+
 plan = load_today_plan(user_id=user_id)
+
+
+# ─────────────────────────────────────────────────────────────
+# Realistic Capacity Warning
+#
+# Before a freshly-drafted (AI Planner / Voice) or manually-entered
+# task is actually saved, check it against this user's historical
+# Realistic Capacity (analytics.py::CapacityCalculator). If today's
+# total planned load would land meaningfully above what this specific
+# user has historically been able to finish, pause and show a warning
+# instead of silently saving — with evidence, and a choice: create it
+# anyway, try a lighter-plan suggestion, or cancel.
+#
+# One pending-warning "slot" per context (identified by key_prefix), so
+# the AI tab, Voice tab, and Manual tab in both the onboarding section
+# and the "Add More Tasks" section below can each have their own
+# independent pending warning without clashing.
+# ─────────────────────────────────────────────────────────────
+
+def _capacity_state_key(key_prefix: str) -> str:
+    return f"_capacity_warning_{key_prefix}"
+
+
+def _get_capacity_warning(key_prefix: str) -> dict | None:
+    return st.session_state.get(_capacity_state_key(key_prefix))
+
+
+def _set_capacity_warning(key_prefix: str, **kwargs) -> None:
+    st.session_state[_capacity_state_key(key_prefix)] = kwargs
+
+
+def _clear_capacity_warning(key_prefix: str) -> None:
+    st.session_state.pop(_capacity_state_key(key_prefix), None)
+
+
+def _capacity_evidence_caption(info: dict) -> None:
+    """Shared 'why we're saying this' line, shown when we have real history."""
+    if info["basis"] == "insufficient_data":
+        return
+    st.caption(
+        f"📊 On days you planned around this much before, you completed "
+        f"only **{info['heavy_day_completion_rate']:.0%}** of your tasks "
+        f"on average — versus **{info['light_day_completion_rate']:.0%}** "
+        f"on lighter days."
+    )
+
+
+def _capacity_suggestions(plan_output, raw_input: str, info: dict) -> list[dict]:
+    """
+    Build capacity-aware rewrites of the drafted plan, using the actual
+    priorities the AI already assigned to each task — not a generic
+    hint. Clicking one prefills the text box with it; the user still
+    reviews, edits, and presses Generate themselves.
+
+    Primary suggestion: keep the highest-priority tasks first (greedy,
+    in priority order) until the recommended budget is used up, defer
+    the rest. Fixed-time tasks (e.g. "gym at 6pm") are never deferred —
+    the user committed to a clock time for those — but their minutes
+    still count against the budget.
+
+    Always offers a second, non-destructive option: keep every task but
+    ask the planner to compress durations instead of dropping anything.
+    """
+    recommended = int(info["recommended_minutes"])
+    tasks = list(plan_output.tasks or [])
+
+    fixed = [t for t in tasks if t.is_fixed_time]
+    flexible = sorted(
+        [t for t in tasks if not t.is_fixed_time],
+        key=lambda t: t.priority,  # 1 = highest importance first
+    )
+
+    fixed_minutes = sum(t.estimated_minutes for t in fixed)
+    budget = max(0, recommended - fixed_minutes)
+
+    keep: list = []
+    defer: list = []
+    running = 0
+    for t in flexible:
+        if running + t.estimated_minutes <= budget:
+            keep.append(t)
+            running += t.estimated_minutes
+        else:
+            defer.append(t)
+
+    suggestions: list[dict] = []
+
+    if defer:
+        keep_all = fixed + keep
+        keep_desc = "; ".join(
+            f"{t.title} (at {t.fixed_start}, {t.estimated_minutes} minutes)"
+            if t.is_fixed_time
+            else f"{t.title} ({t.estimated_minutes} minutes)"
+            for t in keep_all
+        )
+        defer_desc = "; ".join(
+            f"{t.title} ({t.estimated_minutes} minutes)" for t in defer
+        )
+        suggestions.append({
+            "label": "✂️ Keep top priorities, defer the rest",
+            "text": (
+                f"{keep_desc}.\n\n"
+                f"(Note to planner: preserve the exact durations stated "
+                f"above for each task — do not re-estimate them. "
+                f"Deferring these lower-priority items "
+                f"to another day to stay close to {recommended} minutes "
+                f"today: {defer_desc}.)"
+            ),
+        })
+
+    suggestions.append({
+        "label": "🪶 Shorten instead of dropping",
+        "text": (
+            f"{raw_input.strip()}\n\n"
+            f"(Note to planner: keep every item but compress the "
+            f"durations so today's total stays close to {recommended} "
+            f"minutes.)"
+        ),
+    })
+
+    return suggestions
+
+
+def _render_ai_capacity_warning(key_prefix: str) -> bool:
+    """
+    If a capacity warning is pending for this AI/Voice context, render
+    it (message, evidence, suggestions, actions) and return True so the
+    caller skips rendering its normal form this run. Returns False if
+    there's nothing pending.
+    """
+    pending = _get_capacity_warning(key_prefix)
+    if pending is None or pending.get("kind") != "ai":
+        return False
+
+    info = pending["capacity_info"]
+    raw_input = pending["raw_input"]
+
+    st.markdown("#### 🛡️ Realistic Capacity Check")
+    st.warning(
+        f"**Today's plan looks heavier than usual for you.** You'd be "
+        f"planning about **{format_duration(info['planned_minutes'])}** "
+        f"today, but your historical Realistic Capacity is closer to "
+        f"**{format_duration(int(info['recommended_minutes']))}** — "
+        f"about **{info['overload_fraction'] * 100:.0f}% over**.",
+        icon="⚠️",
+    )
+    _capacity_evidence_caption(info)
+
+    st.markdown("<div style='height:0.4rem;'></div>", unsafe_allow_html=True)
+    st.caption("Create it anyway, try a lighter version below, or cancel.")
+
+    suggestions = _capacity_suggestions(pending["plan_output"], raw_input, info)
+    sug_cols = st.columns(len(suggestions))
+    for i, sug in enumerate(suggestions):
+        with sug_cols[i]:
+            if st.button(sug["label"], key=f"{key_prefix}_sugg_{i}", use_container_width=True):
+                for text_key in pending["text_session_keys"]:
+                    st.session_state[text_key] = sug["text"]
+                _clear_capacity_warning(key_prefix)
+                st.rerun()
+
+    action_cols = st.columns(2)
+    with action_cols[0]:
+        if st.button(
+            "✅ Create It Anyway", key=f"{key_prefix}_ai_proceed",
+            type="primary", use_container_width=True,
+        ):
+            result = save_planner_draft(
+                pending["plan_output"], raw_input=raw_input, user_id=user_id,
+            )
+            st.session_state.last_planner_result = result
+            for k in pending.get("also_pop_keys", []):
+                st.session_state.pop(k, None)
+            _clear_capacity_warning(key_prefix)
+            st.toast(f"Plan created with {len(result['tasks'])} task(s)! 🎉", icon="✅")
+            st.rerun()
+    with action_cols[1]:
+        if st.button("✖️ Cancel", key=f"{key_prefix}_ai_cancel", use_container_width=True):
+            _clear_capacity_warning(key_prefix)
+            st.rerun()
+
+    return True
+
+
+def _handle_ai_generation(
+    raw_input: str,
+    key_prefix: str,
+    text_session_keys: list[str],
+    also_pop_keys: list[str] | None = None,
+) -> None:
+    """
+    Shared draft -> Realistic Capacity check -> (save | warn) flow, used
+    by the AI Planner text tab and the Voice tab, in both the onboarding
+    section and "Add More Tasks" below.
+
+    Drafts via the AI Planner WITHOUT saving (draft_today_plan), checks
+    the draft's total planned minutes against this user's capacity, and
+    either saves it immediately (no issue found) or stores a pending
+    warning + reruns so _render_ai_capacity_warning can take over.
+    """
+    with st.spinner("The AI Planner is splitting your day into tasks..."):
+        try:
+            draft = draft_today_plan(raw_input=raw_input, user_id=user_id)
+        except ValueError as e:
+            st.warning(f"**Nothing to plan yet.** {e}")
+            return
+        except RuntimeError as e:
+            st.error(
+                "**The AI Planner couldn't reach the model right now.** "
+                "This usually means the Gemini API key is missing, invalid, "
+                "or rate-limited."
+            )
+            if st.session_state.get("debug_mode"):
+                st.exception(e)
+            return
+        except Exception as e:
+            st.error("**Something went wrong while generating your plan.**")
+            if st.session_state.get("debug_mode"):
+                st.exception(e)
+            return
+
+    draft_minutes = draft_plan_total_minutes(draft)
+    capacity_info = check_capacity_for_today(draft_minutes, user_id=user_id)
+
+    if capacity_info["triggered"]:
+        _set_capacity_warning(
+            key_prefix,
+            kind="ai",
+            plan_output=draft,
+            raw_input=raw_input,
+            capacity_info=capacity_info,
+            text_session_keys=text_session_keys,
+            also_pop_keys=also_pop_keys or [],
+        )
+        st.rerun()
+    else:
+        result = save_planner_draft(draft, raw_input=raw_input, user_id=user_id)
+        st.session_state.last_planner_result = result
+        for k in (also_pop_keys or []):
+            st.session_state.pop(k, None)
+        st.toast(f"Plan created with {len(result['tasks'])} task(s)! 🎉", icon="✅")
+        st.rerun()
+
+
+def _render_manual_capacity_warning(key_prefix: str) -> bool:
+    """
+    Same idea as _render_ai_capacity_warning, for the Manual tab — but
+    since there's no free text to rewrite here, capacity is recomputed
+    live on every render instead of frozen at trigger time. That way,
+    deferring or deleting one of today's existing lower-priority tasks
+    (via the quick actions below) immediately reflects in the numbers,
+    and once the day fits again the pending task is added automatically.
+    """
+    pending = _get_capacity_warning(key_prefix)
+    if pending is None or pending.get("kind") != "manual":
+        return False
+
+    kwargs = pending["task_kwargs"]
+    info = check_capacity_for_today(kwargs["estimated_minutes"], user_id=user_id)
+
+    if not info["triggered"]:
+        # Enough room was freed up (a task got deferred/deleted below) —
+        # the original intent was to add this task, so just add it now.
+        _commit_manual_task(pending)
+        _clear_capacity_warning(key_prefix)
+        st.rerun()
+
+    st.markdown("#### 🛡️ Realistic Capacity Check")
+    st.warning(
+        f"**Adding '{kwargs['title']}' would push today over your usual "
+        f"capacity.** Today would total about "
+        f"**{format_duration(info['planned_minutes'])}**, versus your "
+        f"historical Realistic Capacity of about "
+        f"**{format_duration(int(info['recommended_minutes']))}** — "
+        f"about **{info['overload_fraction'] * 100:.0f}% over**.",
+        icon="⚠️",
+    )
+    _capacity_evidence_caption(info)
+
+    st.markdown("<div style='height:0.3rem;'></div>", unsafe_allow_html=True)
+
+    low_priority_today = [
+        t for t in load_today_tasks(user_id=user_id)
+        if t.get("status") == "pending" and int(t.get("priority", 3)) >= 4
+    ]
+    if low_priority_today:
+        st.caption(
+            "Free up room by deferring or dropping a lower-priority task "
+            "already in today's plan:"
+        )
+        for t in low_priority_today:
+            row = st.columns([3, 1, 1])
+            with row[0]:
+                st.markdown(
+                    f"**{t.get('title', 'Untitled')}** · "
+                    f"{PRIORITY_LABELS.get(int(t.get('priority', 3)), '')} · "
+                    f"{format_duration(t.get('estimated_minutes'))}"
+                )
+            with row[1]:
+                if st.button(
+                    "📆 Defer", key=f"{key_prefix}_defer_{t['task_id']}",
+                    use_container_width=True,
+                ):
+                    if defer_task_to_tomorrow(t["task_id"], user_id=user_id):
+                        st.toast("Moved to tomorrow.", icon="📆")
+                        st.rerun()
+            with row[2]:
+                if st.button(
+                    "🗑️", key=f"{key_prefix}_dropit_{t['task_id']}",
+                    use_container_width=True,
+                ):
+                    if delete_task(t["task_id"]):
+                        st.toast("Removed.", icon="🗑️")
+                        st.rerun()
+        st.markdown("<div style='height:0.3rem;'></div>", unsafe_allow_html=True)
+    else:
+        st.caption("No lower-priority tasks in today's plan to defer.")
+
+    st.caption("...or just add it anyway, or skip it for today.")
+    cols = st.columns(2)
+    with cols[0]:
+        if st.button(
+            "✅ Add It Anyway", key=f"{key_prefix}_manual_proceed",
+            type="primary", use_container_width=True,
+        ):
+            _commit_manual_task(pending)
+            _clear_capacity_warning(key_prefix)
+            st.rerun()
+    with cols[1]:
+        if st.button("✖️ Skip / Cancel", key=f"{key_prefix}_manual_cancel", use_container_width=True):
+            _clear_capacity_warning(key_prefix)
+            st.rerun()
+
+    return True
+
+
+def _commit_manual_task(pending: dict) -> None:
+    """Actually persist a manually-entered task, after any capacity gate has cleared."""
+    kwargs = pending["task_kwargs"]
+    if pending["mode"] == "create_plan":
+        new_plan_id = create_today_plan(raw_input=kwargs["title"], user_id=user_id)
+        if new_plan_id:
+            new_id = add_task_to_plan(
+                plan_id=new_plan_id,
+                title=kwargs["title"],
+                category_id=kwargs["category_id"],
+                description=kwargs["description"],
+                priority=kwargs["priority"],
+                estimated_minutes=kwargs["estimated_minutes"],
+                order_index=0,
+            )
+            if new_id:
+                st.toast("Plan and first task created! 🎉", icon="✅")
+            else:
+                st.warning("Plan created, but the task couldn't be saved. Add it below.")
+        else:
+            st.error("Couldn't create a plan — one may already exist for today.")
+    else:  # mode == "add_task"
+        new_id = add_task_to_plan(**kwargs)
+        if new_id:
+            st.toast("Task added!", icon="➕")
+        else:
+            st.error("Couldn't add the task. Please try again.")
+
+
+# ─────────────────────────────────────────────────────────────
+# Shared Voice Tab (record -> transcribe -> review -> generate)
+#
+# Used by both the onboarding tabs and the "Add More Tasks" section
+# below, so there's only one implementation to maintain. Runs the same
+# draft -> capacity-check -> save flow as the AI Planner tab — the only
+# extra step is turning audio into text via transcribe_voice_note().
+# ─────────────────────────────────────────────────────────────
+
+def _render_voice_tab(key_prefix: str) -> None:
+    if _render_ai_capacity_warning(key_prefix):
+        return
+
+    st.markdown("#### 🎤 Say Your Day Out Loud")
+    st.caption(
+        "Record yourself describing your day in your own words, "
+        "review the transcript below, then generate your plan."
+    )
+
+    transcript_key = f"{key_prefix}_transcript"
+    audio_value = st.audio_input("Tap to record", key=f"{key_prefix}_audio")
+
+    if audio_value is not None:
+        if st.button(
+            "📝 Transcribe", key=f"{key_prefix}_transcribe_btn", use_container_width=True
+        ):
+            with st.spinner("Transcribing your recording..."):
+                try:
+                    st.session_state[transcript_key] = transcribe_voice_note(
+                        audio_value.getvalue(),
+                        mime_type=getattr(audio_value, "type", None) or "audio/wav",
+                    )
+                except VoiceTranscriptionError as e:
+                    st.error(f"**Couldn't transcribe that recording.** {e}")
+                except Exception as e:
+                    st.error("**Something went wrong while transcribing.**")
+                    if st.session_state.get("debug_mode"):
+                        st.exception(e)
+
+    transcript = st.session_state.get(transcript_key)
+    if transcript:
+        edited_transcript = st.text_area(
+            "Transcript (edit if anything came out wrong before generating)",
+            value=transcript,
+            height=90,
+            key=f"{key_prefix}_transcript_edit",
+        )
+        if st.button(
+            "✨ Generate My Plan",
+            type="primary",
+            use_container_width=True,
+            key=f"{key_prefix}_voice_generate",
+        ):
+            if not edited_transcript.strip():
+                st.error("Please make sure the transcript isn't empty.")
+            else:
+                _handle_ai_generation(
+                    raw_input=edited_transcript,
+                    key_prefix=key_prefix,
+                    text_session_keys=[transcript_key, f"{key_prefix}_transcript_edit"],
+                    also_pop_keys=[transcript_key, f"{key_prefix}_transcript_edit"],
+                )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -64,100 +523,91 @@ if plan is None:
     )
     st.markdown("<div style='height:1rem;'></div>", unsafe_allow_html=True)
 
-    tab_ai, tab_manual = st.tabs(["✨ AI Planner", "✍️ Manual"])
+    tab_ai, tab_voice, tab_manual = st.tabs(["✨ AI Planner", "🎤 Voice", "✍️ Manual"])
 
     with tab_ai:
-        with st.form("ai_plan_form"):
-            st.markdown("#### ✨ Describe Your Day")
-            ai_raw_input = st.text_area(
-                "What's on your mind for today?",
-                placeholder="e.g. Study for the database exam for 2 hours, gym at 6pm, "
-                            "finish the CoachAI report...",
-                height=90,
-                key="ai_raw_input",
-            )
-            ai_submitted = st.form_submit_button(
-                "✨ Generate My Plan", type="primary", use_container_width=True
-            )
+        if not _render_ai_capacity_warning("onboard_ai"):
+            with st.form("ai_plan_form"):
+                st.markdown("#### ✨ Describe Your Day")
+                ai_raw_input = st.text_area(
+                    "What's on your mind for today?",
+                    placeholder="e.g. Study for the database exam for 2 hours, gym at 6pm, "
+                                "finish the CoachAI report...",
+                    height=90,
+                    key="ai_raw_input",
+                )
+                ai_submitted = st.form_submit_button(
+                    "✨ Generate My Plan", type="primary", use_container_width=True
+                )
 
-        if ai_submitted:
-            if not ai_raw_input or not ai_raw_input.strip():
-                st.error("Please describe your day first.")
-            else:
-                with st.spinner("The AI Planner is splitting your day into tasks..."):
-                    try:
-                        result = generate_today_plan(raw_input=ai_raw_input, user_id=user_id)
-                        st.session_state.last_planner_result = result
-                        st.toast(
-                            f"Plan created with {len(result['tasks'])} task(s)! 🎉",
-                            icon="✅",
-                        )
-                        st.rerun()
-                    except ValueError as e:
-                        st.warning(f"**Nothing to plan yet.** {e}")
-                    except RuntimeError as e:
-                        st.error(
-                            "**The AI Planner couldn't reach the model right now.** "
-                            "This usually means the Gemini API key is missing, invalid, "
-                            "or rate-limited."
-                        )
-                        if st.session_state.get("debug_mode"):
-                            st.exception(e)
-                    except Exception as e:
-                        st.error("**Something went wrong while generating your plan.**")
-                        if st.session_state.get("debug_mode"):
-                            st.exception(e)
+            if ai_submitted:
+                if not ai_raw_input or not ai_raw_input.strip():
+                    st.error("Please describe your day first.")
+                else:
+                    _handle_ai_generation(
+                        raw_input=ai_raw_input,
+                        key_prefix="onboard_ai",
+                        text_session_keys=["ai_raw_input"],
+                    )
+
+    with tab_voice:
+        _render_voice_tab(key_prefix="onboard_voice")
 
     with tab_manual:
-        manual_categories = load_categories(user_id=user_id)
-        with st.form("create_plan_form"):
-            st.markdown("#### ✍️ Add Your First Task")
-            st.caption(
-                "This creates today's plan and your first task in one step. "
-                "You can add more tasks below afterward."
-            )
-            c1, c2 = st.columns(2)
-            with c1:
-                m_title = st.text_input("Task title *")
-                m_minutes = st.number_input(
-                    "Estimated minutes", min_value=5, max_value=480, value=30, step=5
+        if not _render_manual_capacity_warning("onboard_manual"):
+            manual_categories = load_categories(user_id=user_id)
+            with st.form("create_plan_form"):
+                st.markdown("#### ✍️ Add Your First Task")
+                st.caption(
+                    "This creates today's plan and your first task in one step. "
+                    "You can add more tasks below afterward."
                 )
-            with c2:
-                m_priority = st.select_slider(
-                    "Priority", options=[1, 2, 3, 4, 5],
-                    value=3, format_func=lambda p: f"{get_priority_icon(p)} {PRIORITY_LABELS[p]}",
-                )
-                m_cat_options = {
-                    "— None —": None,
-                    **{c["name"]: c["category_id"] for c in manual_categories},
-                }
-                m_cat_choice = st.selectbox("Category", list(m_cat_options.keys()))
-            m_description = st.text_area("Notes (optional)", height=70)
+                c1, c2 = st.columns(2)
+                with c1:
+                    m_title = st.text_input("Task title *")
+                    m_minutes = st.number_input(
+                        "Estimated minutes", min_value=5, max_value=480, value=30, step=5
+                    )
+                with c2:
+                    m_priority = st.select_slider(
+                        "Priority", options=[1, 2, 3, 4, 5],
+                        value=3, format_func=lambda p: f"{get_priority_icon(p)} {PRIORITY_LABELS[p]}",
+                    )
+                    m_cat_options = {
+                        "— None —": None,
+                        **{c["name"]: c["category_id"] for c in manual_categories},
+                    }
+                    m_cat_choice = st.selectbox("Category", list(m_cat_options.keys()))
+                m_description = st.text_area("Notes (optional)", height=70)
 
-            submitted = st.form_submit_button("Create Plan", use_container_width=True)
-            if submitted:
-                if not m_title.strip():
-                    st.error("Please give the task a title.")
-                else:
-                    plan_id = create_today_plan(raw_input=m_title.strip(), user_id=user_id)
-                    if plan_id:
-                        new_id = add_task_to_plan(
-                            plan_id=plan_id,
-                            title=m_title.strip(),
-                            category_id=m_cat_options[m_cat_choice],
-                            description=m_description.strip(),
-                            priority=m_priority,
-                            estimated_minutes=int(m_minutes),
-                            order_index=0,
-                        )
-                        if new_id:
-                            st.toast("Plan and first task created! 🎉", icon="✅")
-                            st.rerun()
-                        else:
-                            st.warning("Plan created, but the task couldn't be saved. Add it below.")
-                            st.rerun()
+                submitted = st.form_submit_button("Create Plan", use_container_width=True)
+                if submitted:
+                    if not m_title.strip():
+                        st.error("Please give the task a title.")
                     else:
-                        st.error("Couldn't create a plan — one may already exist for today.")
+                        task_kwargs = {
+                            "title": m_title.strip(),
+                            "category_id": m_cat_options[m_cat_choice],
+                            "description": m_description.strip(),
+                            "priority": m_priority,
+                            "estimated_minutes": int(m_minutes),
+                        }
+                        capacity_info = check_capacity_for_today(
+                            int(m_minutes), user_id=user_id,
+                        )
+                        if capacity_info["triggered"]:
+                            _set_capacity_warning(
+                                "onboard_manual",
+                                kind="manual",
+                                mode="create_plan",
+                                task_kwargs=task_kwargs,
+                                capacity_info=capacity_info,
+                            )
+                        else:
+                            _commit_manual_task({
+                                "mode": "create_plan", "task_kwargs": task_kwargs,
+                            })
+                        st.rerun()
 
     st.stop()
 
@@ -286,6 +736,32 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
         else:
             st.error("Scheduling failed. Make sure today's plan has at least one task.")
 
+    # ── Export to Google Calendar ──
+    if is_google_calendar_connected(user_id) and is_scheduled:
+        st.markdown("<div style='height:0.6rem;'></div>", unsafe_allow_html=True)
+        st.markdown("**📤 Export to Google Calendar**")
+        st.caption(
+            "Create events in your Primary Google Calendar for each "
+            "scheduled task."
+        )
+        if st.button(
+            "📤 Export Scheduled Tasks",
+            use_container_width=True,
+        ):
+            with st.spinner("Exporting..."):
+                export_result = export_all_scheduled_tasks(user_id)
+            if export_result.get("errors"):
+                st.warning(
+                    f"Exported {export_result.get('exported', 0)} task(s) "
+                    f"with {export_result['errors']} error(s).",
+                    icon="⚠️",
+                )
+            else:
+                st.toast(
+                    f"Exported {export_result.get('exported', 0)} task(s) to Google Calendar!",
+                    icon="📤",
+                )
+
 
 # ─────────────────────────────────────────────────────────────
 # Timeline + Distribution
@@ -306,6 +782,31 @@ else:
             st.plotly_chart(fig, use_container_width=True, key="schedule_timeline")
         else:
             st.info("Run the Scheduler above to see your tasks on a timeline.", icon="⏱️")
+
+        # ── Google Calendar Events ──
+        if is_google_calendar_connected(user_id):
+            _gcal_events = get_google_calendar_events_today(user_id)
+            if _gcal_events:
+                _selected_cals = get_selected_calendars(user_id)
+                _cal_colors = {c["calendar_id"]: c.get("color", "#4285F4") for c in _selected_cals}
+                _cal_names = {c["calendar_id"]: c.get("calendar_name", "") for c in _selected_cals}
+
+                with st.expander(f"📅 Google Calendar ({len(_gcal_events)} event{'s' if len(_gcal_events) != 1 else ''})", expanded=False):
+                    for ev in _gcal_events:
+                        _ev_color = _cal_colors.get(ev.get("calendar_id"), "#4285F4")
+                        _ev_cal_name = _cal_names.get(ev.get("calendar_id"), "")
+                        st.markdown(
+                            f"<div style='display:flex; align-items:center; gap:10px; "
+                            f"padding:6px 10px; margin-bottom:4px; "
+                            f"border-left:3px solid {_ev_color}; "
+                            f"background:var(--bg-card); border-radius:4px;'>"
+                            f"<span style='font-weight:600; color:var(--text-primary);'>"
+                            f"{ev.get('start_time', '?')} – {ev.get('end_time', '?')}</span>"
+                            f"<span style='color:var(--text-secondary);'>{ev.get('title', '(No title)')}</span>"
+                            f"<span style='font-size:0.75rem; color:var(--text-muted); margin-left:auto;'>{_ev_cal_name}</span>"
+                            f"</div>",
+                            unsafe_allow_html=True,
+                        )
 
     with dist_col:
         st.markdown("#### 🥯 Task Distribution")
@@ -402,79 +903,79 @@ for task in tasks:
 
 st.markdown("<div style='height:1rem;'></div>", unsafe_allow_html=True)
 with st.expander("➕ Add Tasks to Today's Plan"):
-    add_tab_ai, add_tab_manual = st.tabs(["✨ AI Planner", "✍️ Manual"])
+    add_tab_ai, add_tab_voice, add_tab_manual = st.tabs(["✨ AI Planner", "🎤 Voice", "✍️ Manual"])
 
     with add_tab_ai:
-        with st.form("ai_add_tasks_form", clear_on_submit=True):
-            st.markdown("#### ✨ Describe Your Day")
-            more_raw_input = st.text_area(
-                "What's on your mind for today?",
-                placeholder="e.g. Study for the database exam for 2 hours, gym at 6pm, "
-                            "finish the CoachAI report...",
-                height=90,
-                key="more_raw_input",
-            )
-            more_submitted = st.form_submit_button(
-                "✨ Generate My Plan", type="primary", use_container_width=True
-            )
+        if not _render_ai_capacity_warning("more_ai"):
+            with st.form("ai_add_tasks_form", clear_on_submit=False):
+                st.markdown("#### ✨ Describe Your Day")
+                more_raw_input = st.text_area(
+                    "What's on your mind for today?",
+                    placeholder="e.g. Study for the database exam for 2 hours, gym at 6pm, "
+                                "finish the CoachAI report...",
+                    height=90,
+                    key="more_raw_input",
+                )
+                more_submitted = st.form_submit_button(
+                    "✨ Generate My Plan", type="primary", use_container_width=True
+                )
 
-        if more_submitted:
-            if not more_raw_input or not more_raw_input.strip():
-                st.error("Please describe what you need to add first.")
-            else:
-                with st.spinner("The AI Planner is splitting this into tasks..."):
-                    try:
-                        more_result = generate_today_plan(raw_input=more_raw_input, user_id=user_id)
-                        st.session_state.last_planner_result = more_result
-                        st.toast(
-                            f"Added {len(more_result['tasks'])} task(s)! 🎉", icon="✅"
-                        )
-                        st.rerun()
-                    except ValueError as e:
-                        st.warning(f"**Nothing to add yet.** {e}")
-                    except RuntimeError as e:
-                        st.error(
-                            "**The AI Planner couldn't reach the model right now.** "
-                            "This usually means the Gemini API key is missing, invalid, "
-                            "or rate-limited."
-                        )
-                        if st.session_state.get("debug_mode"):
-                            st.exception(e)
-                    except Exception as e:
-                        st.error("**Something went wrong while adding these tasks.**")
-                        if st.session_state.get("debug_mode"):
-                            st.exception(e)
+            if more_submitted:
+                if not more_raw_input or not more_raw_input.strip():
+                    st.error("Please describe what you need to add first.")
+                else:
+                    _handle_ai_generation(
+                        raw_input=more_raw_input,
+                        key_prefix="more_ai",
+                        text_session_keys=["more_raw_input"],
+                        also_pop_keys=["more_raw_input"],
+                    )
+
+    with add_tab_voice:
+        _render_voice_tab(key_prefix="more_voice")
 
     with add_tab_manual:
-        with st.form("add_task_form", clear_on_submit=True):
-            c1, c2 = st.columns(2)
-            with c1:
-                title = st.text_input("Task title *")
-                minutes = st.number_input("Estimated minutes", min_value=5, max_value=480, value=30, step=5)
-            with c2:
-                priority = st.select_slider(
-                    "Priority", options=[1, 2, 3, 4, 5],
-                    value=3, format_func=lambda p: f"{get_priority_icon(p)} {PRIORITY_LABELS[p]}",
-                )
-                cat_options = {"— None —": None, **{c["name"]: c["category_id"] for c in categories}}
-                cat_choice = st.selectbox("Category", list(cat_options.keys()))
-            description = st.text_area("Notes (optional)", height=70)
-
-            if st.form_submit_button("Add Task", type="primary", use_container_width=True):
-                if not title.strip():
-                    st.error("Please give the task a title.")
-                else:
-                    new_id = add_task_to_plan(
-                        plan_id=plan["plan_id"],
-                        title=title.strip(),
-                        category_id=cat_options[cat_choice],
-                        description=description.strip(),
-                        priority=priority,
-                        estimated_minutes=int(minutes),
-                        order_index=len(tasks),
+        if not _render_manual_capacity_warning("more_manual"):
+            with st.form("add_task_form", clear_on_submit=True):
+                c1, c2 = st.columns(2)
+                with c1:
+                    title = st.text_input("Task title *")
+                    minutes = st.number_input("Estimated minutes", min_value=5, max_value=480, value=30, step=5)
+                with c2:
+                    priority = st.select_slider(
+                        "Priority", options=[1, 2, 3, 4, 5],
+                        value=3, format_func=lambda p: f"{get_priority_icon(p)} {PRIORITY_LABELS[p]}",
                     )
-                    if new_id:
-                        st.toast("Task added!", icon="➕")
-                        st.rerun()
+                    cat_options = {"— None —": None, **{c["name"]: c["category_id"] for c in categories}}
+                    cat_choice = st.selectbox("Category", list(cat_options.keys()))
+                description = st.text_area("Notes (optional)", height=70)
+
+                if st.form_submit_button("Add Task", type="primary", use_container_width=True):
+                    if not title.strip():
+                        st.error("Please give the task a title.")
                     else:
-                        st.error("Couldn't add the task. Please try again.")
+                        task_kwargs = {
+                            "plan_id": plan["plan_id"],
+                            "title": title.strip(),
+                            "category_id": cat_options[cat_choice],
+                            "description": description.strip(),
+                            "priority": priority,
+                            "estimated_minutes": int(minutes),
+                            "order_index": len(tasks),
+                        }
+                        capacity_info = check_capacity_for_today(
+                            int(minutes), user_id=user_id,
+                        )
+                        if capacity_info["triggered"]:
+                            _set_capacity_warning(
+                                "more_manual",
+                                kind="manual",
+                                mode="add_task",
+                                task_kwargs=task_kwargs,
+                                capacity_info=capacity_info,
+                            )
+                        else:
+                            _commit_manual_task({
+                                "mode": "add_task", "task_kwargs": task_kwargs,
+                            })
+                        st.rerun()

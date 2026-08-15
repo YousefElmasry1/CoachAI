@@ -17,6 +17,7 @@ from config import APP_NAME, APP_TAGLINE, APP_VERSION, DEFAULT_ANALYTICS_WINDOW
 from styles import inject_styles
 from services import (
     close_out_stale_tasks,
+    connect_google_calendar,
     create_guest_user,
     get_current_user_id,
     get_database_status,
@@ -233,11 +234,62 @@ def maybe_close_out_stale_tasks() -> None:
     st.session_state["_stale_tasks_closed_date"] = today_str
 
 
+def _handle_google_oauth_callback() -> None:
+    """
+    Check for a Google OAuth authorization code in the URL query
+    parameters and, if found, exchange it for tokens and store them.
+
+    Google redirects to ``http://localhost:8501/?code=...`` after the
+    user approves access.  Because Streamlit always loads the main
+    page on a bare-URL visit, the callback code must be handled here
+    (in the shared layout) rather than in Settings alone.
+    """
+    query_params = st.query_params
+    auth_code = query_params.get("code")
+    oauth_error = query_params.get("error")
+
+    if oauth_error:
+        st.query_params.clear()
+        st.error(
+            f"Google Calendar connection was denied or failed: {oauth_error}"
+        )
+        return
+
+    if not auth_code:
+        return  # No OAuth callback in progress
+
+    user_id = st.session_state.get("user_id")
+    if not user_id:
+        # User is not logged in — clear params so the code isn't reused
+        st.query_params.clear()
+        return
+
+    # Avoid processing the same code twice on Streamlit reruns
+    if st.session_state.get("_gcal_code_processed") == auth_code:
+        st.query_params.clear()
+        return
+
+    with st.spinner("Connecting to Google Calendar..."):
+        success = connect_google_calendar(auth_code, user_id)
+
+    st.session_state["_gcal_code_processed"] = auth_code
+    st.query_params.clear()
+
+    if success:
+        st.toast("Google Calendar connected! Go to Settings → 📅 Google Calendar to select your calendars.", icon="✅")
+    else:
+        st.error(
+            "Failed to connect Google Calendar. Please try again from "
+            "Settings → 📅 Google Calendar."
+        )
+    st.rerun()
+
+
 def page_setup(title: str, icon: str) -> None:
     """
     Standard boilerplate every page needs, in the right order:
-    set_page_config → session defaults → theme → name gate → stale
-    task cleanup → sidebar.
+    set_page_config → session defaults → theme → name gate →
+    Google OAuth callback → stale task cleanup → sidebar.
 
     Must be the first Streamlit-related call on the page.
     """
@@ -250,6 +302,7 @@ def page_setup(title: str, icon: str) -> None:
     init_session_state()
     apply_theme()
     ensure_authenticated()
+    _handle_google_oauth_callback()
     maybe_close_out_stale_tasks()
     render_sidebar()
 

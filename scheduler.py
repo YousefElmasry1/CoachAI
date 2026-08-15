@@ -61,6 +61,7 @@ class UserBreak:
 class SchedulingPreferences:
     work_day_start: time
     user_breaks: Optional[list[UserBreak]] = field(default_factory=list)
+    blocked_slots: Optional[list[tuple]] = field(default_factory=list)
 
 
 # Backward-compatible alias. Older callers (e.g. scheduler_service.py) may
@@ -123,6 +124,29 @@ class Scheduler:
 
         return current, remaining_breaks
 
+    def _skip_blocked_slots(
+        self,
+        current: datetime,
+        duration_minutes: int,
+        blocked: list[tuple[datetime, datetime]],
+    ) -> datetime:
+        """
+        If the proposed task window [current, current+duration] overlaps
+        any blocked slot, push current past the end of the overlapping
+        slot. Repeat until no overlaps remain (handles consecutive or
+        overlapping blocks).
+        """
+        task_end = current + timedelta(minutes=duration_minutes)
+        changed = True
+        while changed:
+            changed = False
+            for block_start, block_end in blocked:
+                if current < block_end and task_end > block_start:
+                    current = block_end
+                    task_end = current + timedelta(minutes=duration_minutes)
+                    changed = True
+        return current
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -152,6 +176,16 @@ class Scheduler:
         remaining_breaks = self._sorted_user_breaks()
         scheduled: list[ScheduledTask] = []
 
+        # Pre-compute blocked slots as datetime pairs
+        blocked_datetimes: list[tuple[datetime, datetime]] = []
+        for slot in (self.preferences.blocked_slots or []):
+            if len(slot) >= 2:
+                blocked_datetimes.append((
+                    self._time_to_datetime(slot[0], base_date),
+                    self._time_to_datetime(slot[1], base_date),
+                ))
+        blocked_datetimes.sort(key=lambda pair: pair[0])
+
         for order_index, task in enumerate(tasks):
             # Convert incoming task to our internal representation
             st = ScheduledTask.from_task(task, order_index=order_index)
@@ -169,6 +203,20 @@ class Scheduler:
             current, remaining_breaks = self._due_user_breaks(
                 current, remaining_breaks, base_date
             )
+
+            # ----------------------------------------------------------
+            # Skip past any Google Calendar blocked slots
+            # ----------------------------------------------------------
+            if blocked_datetimes:
+                new_current = self._skip_blocked_slots(
+                    current, st.estimated_minutes, blocked_datetimes
+                )
+                if new_current != current:
+                    current = new_current
+                    # Re-check breaks after jumping past a blocked slot
+                    current, remaining_breaks = self._due_user_breaks(
+                        current, remaining_breaks, base_date
+                    )
 
             # ------------------------------------------------------------------
             # Assign time slot to the task

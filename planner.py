@@ -175,12 +175,19 @@ _PLANNER_SYSTEM_PROMPT: str = (
     "task ORDER you return: right after a long or demanding task, or "
     "roughly midway through the day if the load is heavy. Use "
     "category_name 'Break' and a realistic duration (10-20 minutes for a "
-    "short break, 30-60 for a meal)."
+    "short break, 30-60 for a meal).\n"
+    "11. If CALENDAR COMMITMENTS are provided below, treat them as fixed, "
+    "unavailable time blocks that the user has already committed to. Do "
+    "NOT create tasks for calendar events — they are not tasks. Plan the "
+    "user's requested tasks around these commitments using the available "
+    "windows. If available time is limited by calendar commitments, note "
+    "it in planning_notes."
 )
 
 _PLANNER_USER_PROMPT: str = (
     "The user's existing categories are:\n\n"
     "{existing_categories}\n\n"
+    "{calendar_context}"
     "The user's free-form description of their day:\n\n"
     "{raw_input}\n\n"
     "{format_instructions}"
@@ -233,6 +240,34 @@ class PlannerEngine:
             return "None yet — this is the user's first plan."
         return ", ".join(existing_categories)
 
+    @staticmethod
+    def _format_calendar_context(
+        calendar_events: Optional[list[dict]] = None,
+    ) -> str:
+        """
+        Build a structured calendar context string for the planner prompt.
+        Returns empty string if no events are provided.
+
+        Each event dict is expected to have:
+            title, start_time (HH:MM), end_time (HH:MM), calendar_id
+        """
+        if not calendar_events:
+            return ""
+
+        lines = ["Fixed calendar commitments today:"]
+        for ev in sorted(calendar_events, key=lambda e: e.get("start_time", "")):
+            title = ev.get("title", "(No title)")
+            start = ev.get("start_time", "?")
+            end = ev.get("end_time", "?")
+            lines.append(f"- {start}–{end} — {title}")
+
+        lines.append("")
+        lines.append(
+            "Plan the user's tasks around these commitments. "
+            "Do NOT create tasks for the calendar events above.\n\n"
+        )
+        return "\n".join(lines)
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -241,6 +276,7 @@ class PlannerEngine:
         self,
         raw_input: str,
         existing_categories: Optional[list[str]] = None,
+        calendar_events: Optional[list[dict]] = None,
     ) -> DayPlanOutput:
         cleaned_input = raw_input.strip()
         if not cleaned_input:
@@ -253,6 +289,9 @@ class PlannerEngine:
                 "raw_input": cleaned_input,
                 "existing_categories": self._format_existing_categories(
                     existing_categories or []
+                ),
+                "calendar_context": self._format_calendar_context(
+                    calendar_events
                 ),
                 "format_instructions": self._parser.get_format_instructions(),
             })
