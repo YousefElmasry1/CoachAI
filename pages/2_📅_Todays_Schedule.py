@@ -833,7 +833,15 @@ st.markdown("<div style='height:1.2rem;'></div>", unsafe_allow_html=True)
 
 st.markdown("#### 📋 Tasks")
 
-for task in tasks:
+# Display in chronological order — scheduled tasks by their start time
+# first, then anything not yet scheduled (no scheduled_start) at the end
+# in its existing order_index order, instead of raw insertion order.
+tasks_display = sorted(
+    tasks,
+    key=lambda t: (t.get("scheduled_start") is None, t.get("scheduled_start") or ""),
+)
+
+for task in tasks_display:
     priority = task.get("priority", 3)
     status = task.get("status", "pending")
     p_color = PRIORITY_COLORS.get(priority, "#6b7280")

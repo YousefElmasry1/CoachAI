@@ -997,7 +997,7 @@ def sync_google_calendar(
 
     try:
         for cal_id in selected_ids:
-            events = client.fetch_events(cal_id, today)
+            events = client.fetch_events(cal_id, today_str)
             synced_ids = []
             for ev in events:
                 db.upsert_google_calendar_event(
@@ -1017,12 +1017,57 @@ def sync_google_calendar(
                 user_id, today_str, cal_id, synced_ids
             )
 
+        # Don't silently move anything — just tell the caller which
+        # already-scheduled tasks now collide with a freshly-synced
+        # event, so the UI can warn the user and let them decide
+        # (reschedule manually, edit the task, etc).
+        conflicts = find_task_conflicts_with_google_events(user_id)
+
         return {
             "synced_count": total_synced,
             "calendars_synced": len(selected_ids),
+            "conflicts": conflicts,
         }
     except GoogleCalendarError as exc:
         return {"synced_count": total_synced, "error": str(exc)}
+
+
+def find_task_conflicts_with_google_events(
+    user_id: int = DEFAULT_USER_ID,
+) -> list[dict]:
+    """
+    Find already-scheduled tasks in today's plan whose time overlaps a
+    synced Google Calendar event, WITHOUT changing anything. Used to
+    surface a warning after sync so the user can decide how to resolve
+    it themselves.
+    """
+    from datetime import time as dt_time
+
+    db = get_database()
+    plan = db.get_today_plan(user_id)
+    if plan is None:
+        return []
+
+    blocked = get_google_calendar_blocked_slots(user_id)
+    if not blocked:
+        return []
+
+    conflicts = []
+    for task in db.get_tasks_by_plan(plan["plan_id"]):
+        if not task["scheduled_start"] or not task["scheduled_end"]:
+            continue
+        t_start = dt_time.fromisoformat(task["scheduled_start"])
+        t_end = dt_time.fromisoformat(task["scheduled_end"])
+        for block_start, block_end in blocked:
+            if t_start < block_end and t_end > block_start:
+                conflicts.append({
+                    "task_id": task["task_id"],
+                    "title": task["title"],
+                    "scheduled_start": task["scheduled_start"],
+                    "scheduled_end": task["scheduled_end"],
+                })
+                break
+    return conflicts
 
 
 def get_google_calendar_events_today(
@@ -1050,12 +1095,29 @@ def get_google_calendar_blocked_slots(
     """
     Convert today's Google Calendar events into (start_time, end_time)
     tuples for the Scheduler's blocked_slots parameter.
+
+    Excludes events that the app itself created by exporting a task.
+    Without this, an exported task's own event gets synced back in and
+    the scheduler treats it as an external obstacle blocking the very
+    slot the task already occupies — pushing that task (and everything
+    scheduled after it) later every time you export, then reschedule.
     """
     from datetime import time as dt_time
+
+    db = get_database()
+    own_event_ids = set()
+    plan = db.get_today_plan(user_id)
+    if plan is not None:
+        for t in db.get_tasks_by_plan(plan["plan_id"]):
+            eid = t["google_event_id"] if "google_event_id" in t.keys() else None
+            if eid:
+                own_event_ids.add(eid)
 
     events = get_google_calendar_events_today(user_id)
     slots = []
     for ev in events:
+        if ev.get("google_event_id") in own_event_ids:
+            continue
         try:
             start = dt_time.fromisoformat(ev["start_time"])
             end = dt_time.fromisoformat(ev["end_time"])
@@ -1101,7 +1163,7 @@ def export_task_to_google_calendar(
     if plan is None:
         return False
 
-    plan_date = date.fromisoformat(str(plan["plan_date"]))
+    plan_date = str(plan["plan_date"])
 
     try:
         existing_event_id = task["google_event_id"] if "google_event_id" in task.keys() else None

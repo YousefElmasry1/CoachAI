@@ -197,18 +197,20 @@ class GoogleCalendarClient:
             start_t = time.fromisoformat(start_time)
             end_t = time.fromisoformat(end_time)
             
-            start_dt = datetime.combine(date_obj, start_t)
-            end_dt = datetime.combine(date_obj, end_t)
+            # Attach the server's actual local timezone offset instead of
+            # mislabeling these naive local times as UTC — otherwise Google
+            # re-interprets them as UTC and shifts them forward again when
+            # displaying in the user's real timezone.
+            start_dt = datetime.combine(date_obj, start_t).astimezone()
+            end_dt = datetime.combine(date_obj, end_t).astimezone()
             
             event = {
                 'summary': title,
                 'start': {
                     'dateTime': start_dt.isoformat(),
-                    'timeZone': 'UTC',
                 },
                 'end': {
                     'dateTime': end_dt.isoformat(),
-                    'timeZone': 'UTC',
                 }
             }
             
@@ -225,18 +227,16 @@ class GoogleCalendarClient:
             start_t = time.fromisoformat(start_time)
             end_t = time.fromisoformat(end_time)
             
-            start_dt = datetime.combine(date_obj, start_t)
-            end_dt = datetime.combine(date_obj, end_t)
+            start_dt = datetime.combine(date_obj, start_t).astimezone()
+            end_dt = datetime.combine(date_obj, end_t).astimezone()
             
             event = service.events().get(calendarId=calendar_id, eventId=google_event_id).execute()
             event['summary'] = title
             event['start'] = {
                 'dateTime': start_dt.isoformat(),
-                'timeZone': 'UTC',
             }
             event['end'] = {
                 'dateTime': end_dt.isoformat(),
-                'timeZone': 'UTC',
             }
             
             service.events().update(calendarId=calendar_id, eventId=google_event_id, body=event).execute()

@@ -331,9 +331,15 @@ with tabs[5]:
 
             last_sync = get_last_sync_time(user_id)
             if last_sync:
-                from datetime import datetime
+                from datetime import datetime, timedelta
                 try:
-                    sync_dt = datetime.fromisoformat(last_sync)
+                    # last_sync is stored as SQLite CURRENT_TIMESTAMP, which
+                    # is always UTC — convert to local time before comparing
+                    # against datetime.now() or displaying it, or both the
+                    # "X minutes ago" math and the clock label come out
+                    # hours off (matches the local UTC+3 offset).
+                    sync_dt_utc = datetime.fromisoformat(last_sync)
+                    sync_dt = sync_dt_utc + timedelta(hours=3)
                     diff = datetime.now() - sync_dt
                     mins_ago = int(diff.total_seconds() / 60)
                     if mins_ago < 1:
