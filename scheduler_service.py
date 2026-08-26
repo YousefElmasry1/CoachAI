@@ -23,7 +23,7 @@ Usage:
     scheduled_tasks = service.schedule_today(user_id=1, preferences=preferences)
 """
 
-from datetime import date
+from datetime import date, time
 from typing import Optional
 
 from scheduler import Scheduler, ScheduledTask, SchedulingPreferences
@@ -60,6 +60,11 @@ class SchedulerService:
             db: An already-connected Database object.
         """
         self.db: Database = db
+        # SchedulingConflict objects (break vs. fixed-time task) found
+        # during the most recent schedule_plan()/schedule_today() call.
+        # Neither side can be auto-moved, so callers can surface this
+        # list to the user as a "couldn't auto-resolve" warning.
+        self.last_conflicts: list = []
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -140,10 +145,20 @@ class SchedulerService:
             rows: sqlite3.Row objects from get_tasks_by_plan().
 
         Returns:
-            List of ScheduledTask objects with scheduling fields unset.
+            List of ScheduledTask objects with scheduling fields unset,
+            EXCEPT for fixed-time tasks (is_fixed_time=1), whose existing
+            scheduled_start/scheduled_end are carried over as fixed_start/
+            fixed_end so the Scheduler treats them as immovable.
         """
         tasks: list[ScheduledTask] = []
         for row in rows:
+            is_fixed = bool(self._row_get(row, "is_fixed_time", 0))
+            fixed_start = None
+            fixed_end = None
+            if is_fixed:
+                fixed_start = self._parse_hhmm(self._row_get(row, "scheduled_start"))
+                fixed_end = self._parse_hhmm(self._row_get(row, "scheduled_end"))
+
             # sqlite3.Row supports both dict-style and attribute access
             st = ScheduledTask(
                 title=str(row["title"]),
@@ -152,9 +167,24 @@ class SchedulerService:
                 priority=int(row["priority"]),
                 description=str(self._row_get(row, "description", "") or ""),
                 order_index=int(self._row_get(row, "order_index", 0)),
+                is_fixed_time=is_fixed,
+                fixed_start=fixed_start,
+                fixed_end=fixed_end,
+                is_break=bool(self._row_get(row, "is_break", 0)),
             )
             tasks.append(st)
         return tasks
+
+    @staticmethod
+    def _parse_hhmm(value) -> Optional[time]:
+        """Parse an 'HH:MM' string from the database into a time object."""
+        if not value:
+            return None
+        try:
+            parts = str(value).split(":")
+            return time(int(parts[0]), int(parts[1]))
+        except (ValueError, IndexError):
+            return None
 
     def _save_schedule(
         self,
@@ -239,6 +269,7 @@ class SchedulerService:
             preferences.blocked_slots = blocked_slots
         scheduler = self._resolve_scheduler(preferences)
         scheduled: list[ScheduledTask] = scheduler.schedule(tasks, plan_date=plan_date)
+        self.last_conflicts = getattr(scheduler, "last_conflicts", [])
 
         # ------------------------------------------------------------------
         # Step 5: Persist time slots back to the database

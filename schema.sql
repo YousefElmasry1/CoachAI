@@ -63,10 +63,14 @@ CREATE TABLE tasks (
         CHECK (estimated_minutes >= 0),
     scheduled_start TIME,
     scheduled_end TIME,
+    is_fixed_time INTEGER NOT NULL DEFAULT 0
+        CHECK (is_fixed_time IN (0, 1)),
+    is_break INTEGER NOT NULL DEFAULT 0
+        CHECK (is_break IN (0, 1)),
     order_index INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'pending' 
-        CHECK (status IN ('pending', 'in_progress', 'completed', 'failed')),
-    failure_reason TEXT 
+        CHECK (status IN ('pending', 'in_progress', 'completed', 'failed')), 
+    failure_reason TEXT
         CHECK (failure_reason IN (
             'Harder than expected', 
             'Distracted', 

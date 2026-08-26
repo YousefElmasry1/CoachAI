@@ -304,6 +304,7 @@ class PlannerService:
                 scheduled_start=scheduled_start,
                 scheduled_end=scheduled_end,
                 order_index=existing_task_count + offset,
+                is_fixed_time=task.is_fixed_time,
             )
 
             saved_tasks.append({

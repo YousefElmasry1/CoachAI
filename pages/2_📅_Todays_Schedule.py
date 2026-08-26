@@ -10,9 +10,11 @@ completed/failed — all through existing Database methods only.
 
 from __future__ import annotations
 
-from datetime import time
+import random
+from datetime import date, datetime, time, timedelta, timezone
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 from config import FAILURE_REASONS, PRIORITY_COLORS, PRIORITY_LABELS
 from layout import page_setup, page_title, empty_state
@@ -39,6 +41,11 @@ from services import (
     defer_task_to_tomorrow,
     update_task_status,
     run_scheduler_for_today,
+    get_last_scheduling_conflicts,
+    add_break_to_plan,
+    reschedule_break,
+    start_break,
+    complete_break,
     transcribe_voice_note,
     is_google_calendar_connected,
     sync_google_calendar,
@@ -46,9 +53,136 @@ from services import (
     get_google_calendar_events_today,
     get_selected_calendars,
     export_all_scheduled_tasks,
+    get_stale_export_count,
 )
 from voice_service import VoiceTranscriptionError
 from charts import create_timeline, create_donut
+
+
+# ─────────────────────────────────────────────────────────────
+# Break "session's over" messages — one is picked at random each time
+# an in-progress break's countdown is rendered, so it doesn't say the
+# exact same line every single time.
+# ─────────────────────────────────────────────────────────────
+BREAK_OVER_MESSAGES = [
+    "Nicely paced — back to it.",
+    "Recharged and ready.",
+    "That's the reset you needed.",
+    "Good call taking that.",
+    "Alright, let's keep the momentum going.",
+    "Batteries topped up.",
+    "Short and sweet — on you go.",
+    "Clear head, full steam ahead.",
+]
+
+
+def render_break_countdown(task_id: int, remaining_seconds: int, key_suffix: str) -> None:
+    """
+    Render a live client-side countdown for an in-progress break.
+
+    ``remaining_seconds`` is computed server-side (from the task's real
+    ``started_at`` timestamp + its duration) on every render, so the
+    displayed time is always accurate even after a page reload — the
+    JS below only handles the *visual* per-second ticking between
+    reruns, it never owns the source of truth.
+    """
+    message = random.choice(BREAK_OVER_MESSAGES)
+    html_code = f"""
+    <div id="break-wrap-{key_suffix}" style="
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        text-align: center;
+        padding: 18px 12px;
+        border-radius: 12px;
+        background: linear-gradient(135deg, rgba(124,58,237,0.14), rgba(79,70,229,0.14));
+        border: 1px solid rgba(124,58,237,0.35);
+    ">
+        <div id="timer-display-{key_suffix}" style="font-size: 2.1rem; font-weight: 700; color: #a78bfa; letter-spacing: 1px;">
+            --:--
+        </div>
+        <div id="timer-label-{key_suffix}" style="color: #9ca3af; font-size: 0.85rem; margin-top: 2px;">
+            ☕ Break in progress
+        </div>
+        <div id="timer-alert-{key_suffix}" style="display:none; margin-top:12px; padding:10px 14px; border-radius:8px; background:rgba(16,185,129,0.14); color:#34d399; font-weight:600;">
+            ☕ Break's over! {message}
+            <div style="font-weight:400; font-size:0.82rem; color:#9ca3af; margin-top:2px;">
+                Continue your day →
+            </div>
+        </div>
+    </div>
+    <script>
+        (function() {{
+            let remaining = {remaining_seconds};
+            const display = document.getElementById("timer-display-{key_suffix}");
+            const label = document.getElementById("timer-label-{key_suffix}");
+            const alertBox = document.getElementById("timer-alert-{key_suffix}");
+
+            function tick() {{
+                if (remaining <= 0) {{
+                    display.textContent = "00:00";
+                    label.style.display = "none";
+                    alertBox.style.display = "block";
+                    clearInterval(interval);
+                    return;
+                }}
+                const m = Math.floor(remaining / 60);
+                const s = remaining % 60;
+                display.textContent = String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
+                remaining -= 1;
+            }}
+            tick();
+            const interval = setInterval(tick, 1000);
+        }})();
+    </script>
+    """
+    components.html(html_code, height=150)
+
+
+def render_break_card(b: dict) -> None:
+    """
+    Compact card for a break task: just its time window and one action
+    button (Start → live countdown → Done), instead of the full
+    complete/fail/category controls a real task gets.
+    """
+    status = b.get("status", "pending")
+    with st.container(border=True):
+        cols = st.columns([4, 1])
+        with cols[0]:
+            st.markdown(
+                f"☕ **{b.get('title', 'Break')}** · "
+                f"{format_time_12h(b.get('scheduled_start'))} – "
+                f"{format_time_12h(b.get('scheduled_end'))}"
+            )
+        with cols[1]:
+            if st.button("🗑️", key=f"break_card_del_{b['task_id']}", use_container_width=True):
+                if delete_task(b["task_id"]):
+                    st.toast("Break removed.", icon="🗑️")
+                    st.rerun()
+
+        if status == "pending":
+            if st.button("▶️ Start Break", key=f"break_start_{b['task_id']}", use_container_width=True):
+                if start_break(b["task_id"]):
+                    st.toast("Break started ☕", icon="▶️")
+                    st.rerun()
+        elif status == "in_progress":
+            duration_minutes = int(b.get("estimated_minutes") or 0)
+            remaining_seconds = duration_minutes * 60
+            started_at_raw = b.get("started_at")
+            if started_at_raw:
+                try:
+                    started_dt = datetime.fromisoformat(str(started_at_raw))
+                    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+                    elapsed = (now_utc - started_dt).total_seconds()
+                    remaining_seconds = max(0, int(duration_minutes * 60 - elapsed))
+                except (ValueError, TypeError):
+                    pass
+            render_break_countdown(b["task_id"], remaining_seconds, key_suffix=str(b["task_id"]))
+            if st.button("✅ Done — continue your day", key=f"break_done_{b['task_id']}", use_container_width=True):
+                if complete_break(b["task_id"]):
+                    st.toast("Break complete. Back at it! 💪", icon="✅")
+                    st.rerun()
+        else:
+            st.caption("✅ Break completed")
+
 
 
 # ─────────────────────────────────────────────────────────────
@@ -674,67 +808,133 @@ st.markdown("<div style='height:1rem;'></div>", unsafe_allow_html=True)
 
 with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled):
     st.caption(
-        "The Scheduler assigns start/end times to every task in order, "
-        "inserting any breaks you define below. It never reorders or resizes tasks."
+        "The Scheduler assigns start/end times to your tasks, routing "
+        "around any breaks below and filling small gaps with a shorter "
+        "task when one fits. It never resizes a task, and the list "
+        "above always stays in your original order."
     )
     work_start = st.time_input("Work day starts at", value=time(9, 0))
 
     st.markdown("<div style='height:0.4rem;'></div>", unsafe_allow_html=True)
     st.markdown("**☕ Breaks**")
+    st.caption(
+        "Breaks are saved with your plan — they'll still be here if you "
+        "leave and come back, and they show up in your Tasks list below "
+        "with their own Start button and countdown."
+    )
 
-    if "schedule_breaks" not in st.session_state:
-        st.session_state.schedule_breaks = []
-
-    # Existing break rows — each editable and individually removable
-    remove_idx = None
-    for i, brk in enumerate(st.session_state.schedule_breaks):
-        b_cols = st.columns([2, 2, 1])
-        with b_cols[0]:
-            new_start = st.time_input(
-                "Starts at", value=brk["start"], key=f"break_start_{brk['id']}"
-            )
-        with b_cols[1]:
-            new_minutes = st.number_input(
-                "Duration (min)", min_value=5, max_value=180,
-                value=brk["minutes"], step=5, key=f"break_minutes_{brk['id']}",
-            )
-        with b_cols[2]:
-            st.markdown("<div style='height:1.8rem;'></div>", unsafe_allow_html=True)
-            if st.button("🗑️", key=f"break_del_{brk['id']}", use_container_width=True):
-                remove_idx = i
-        brk["start"] = new_start
-        brk["minutes"] = int(new_minutes)
-
-    if remove_idx is not None:
-        st.session_state.schedule_breaks.pop(remove_idx)
-        st.rerun()
-
-    if st.button("➕ Add another break"):
-        next_id = (
-            max((b["id"] for b in st.session_state.schedule_breaks), default=0) + 1
-        )
-        st.session_state.schedule_breaks.append(
-            {"id": next_id, "start": time(12, 0), "minutes": 30}
-        )
-        st.rerun()
-
-    if not st.session_state.schedule_breaks:
+    existing_breaks = sorted(
+        (t for t in tasks if t.get("is_break")),
+        key=lambda t: t.get("scheduled_start") or "",
+    )
+    if existing_breaks:
+        for b in existing_breaks:
+            b_cols = st.columns([3, 1])
+            with b_cols[0]:
+                st.caption(
+                    f"☕ {format_time_12h(b.get('scheduled_start'))} – "
+                    f"{format_time_12h(b.get('scheduled_end'))} "
+                    f"({format_duration(b.get('estimated_minutes'))}) · {b.get('status', 'pending')}"
+                )
+            with b_cols[1]:
+                if st.button("🗑️", key=f"break_cfg_del_{b['task_id']}", use_container_width=True):
+                    if delete_task(b["task_id"]):
+                        st.rerun()
+    else:
         st.caption("No breaks added yet — the scheduler will run without one.")
+
+    add_cols = st.columns([2, 2, 1])
+    with add_cols[0]:
+        new_break_start = st.time_input("Starts at", value=time(12, 0), key="new_break_start")
+    with add_cols[1]:
+        new_break_minutes = st.number_input(
+            "Duration (min)", min_value=5, max_value=180, value=30, step=5, key="new_break_minutes"
+        )
+    with add_cols[2]:
+        st.markdown("<div style='height:1.8rem;'></div>", unsafe_allow_html=True)
+        if st.button("➕ Add", key="add_break_btn", use_container_width=True):
+            new_break_id = add_break_to_plan(plan["plan_id"], new_break_start, int(new_break_minutes))
+            if new_break_id:
+                st.toast("Break added — run the Scheduler to slot it in.", icon="☕")
+                st.rerun()
+            else:
+                st.error("Couldn't add the break. Try again.")
 
     st.markdown("<div style='height:0.6rem;'></div>", unsafe_allow_html=True)
 
-    breaks = [
-        (b["start"], b["minutes"]) for b in st.session_state.schedule_breaks
-    ]
+    # ── Conflict state (survives st.rerun, unlike a plain st.warning) ──
+    CONFLICTS_KEY = "_scheduling_conflicts"
+
+    def _shift_time(t: time, delta_minutes: int) -> time:
+        return (datetime.combine(date.today(), t) + timedelta(minutes=delta_minutes)).time()
+
+    def _run_and_track_conflicts() -> list:
+        with st.spinner("Assigning time slots..."):
+            scheduled = run_scheduler_for_today(work_day_start=work_start, user_id=user_id)
+        st.session_state[CONFLICTS_KEY] = get_last_scheduling_conflicts() if scheduled else []
+        return scheduled
+
+    def _find_break_task(break_start_t: time, duration_minutes: int) -> dict | None:
+        target = break_start_t.strftime("%H:%M")
+        for b in tasks:
+            if (
+                b.get("is_break")
+                and str(b.get("scheduled_start"))[:5] == target
+                and int(b.get("estimated_minutes") or 0) == duration_minutes
+            ):
+                return b
+        return None
 
     if st.button("▶️ Run Scheduler", type="primary"):
-        with st.spinner("Assigning time slots..."):
-            scheduled = run_scheduler_for_today(work_day_start=work_start, breaks=breaks, user_id=user_id)
+        scheduled = _run_and_track_conflicts()
         if scheduled:
-            st.toast("Schedule updated!", icon="✅")
+            if not st.session_state.get(CONFLICTS_KEY):
+                st.toast("Schedule updated!", icon="✅")
             st.rerun()
         else:
+            st.session_state[CONFLICTS_KEY] = []
             st.error("Scheduling failed. Make sure today's plan has at least one task.")
+
+    # ── Persistent conflict banner + resolution actions ──
+    # Shown on every render until resolved (unlike st.warning above the
+    # old st.rerun(), which vanished after ~1 frame).
+    for idx, c in enumerate(st.session_state.get(CONFLICTS_KEY) or []):
+        duration = int(
+            (datetime.combine(date.today(), c.break_end)
+             - datetime.combine(date.today(), c.break_start)).total_seconds() // 60
+        )
+        st.warning(
+            f"⚠️ Couldn't fit your break "
+            f"({format_time_12h(c.break_start.strftime('%H:%M'))} – "
+            f"{format_time_12h(c.break_end.strftime('%H:%M'))}): "
+            f"it overlaps your fixed task **'{c.fixed_task_title}'** "
+            f"({format_time_12h(c.fixed_task_start.strftime('%H:%M'))} – "
+            f"{format_time_12h(c.fixed_task_end.strftime('%H:%M'))}). "
+            f"Both were left at their original times."
+        )
+        res_cols = st.columns(3)
+        with res_cols[0]:
+            if st.button("⬅️ Move break before task", key=f"conflict_before_{idx}", use_container_width=True):
+                row = _find_break_task(c.break_start, duration)
+                if row is not None:
+                    new_time = _shift_time(c.fixed_task_start, -duration)
+                    if reschedule_break(row["task_id"], new_time):
+                        _run_and_track_conflicts()
+                        st.rerun()
+        with res_cols[1]:
+            if st.button("➡️ Move break after task", key=f"conflict_after_{idx}", use_container_width=True):
+                row = _find_break_task(c.break_start, duration)
+                if row is not None:
+                    new_time = c.fixed_task_end
+                    if reschedule_break(row["task_id"], new_time):
+                        _run_and_track_conflicts()
+                        st.rerun()
+        with res_cols[2]:
+            if st.button("🗑️ Remove this break", key=f"conflict_remove_{idx}", use_container_width=True):
+                row = _find_break_task(c.break_start, duration)
+                if row is not None and delete_task(row["task_id"]):
+                    _run_and_track_conflicts()
+                    st.rerun()
 
     # ── Export to Google Calendar ──
     if is_google_calendar_connected(user_id) and is_scheduled:
@@ -744,6 +944,14 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
             "Create events in your Primary Google Calendar for each "
             "scheduled task."
         )
+        stale_count = get_stale_export_count(user_id)
+        if stale_count:
+            st.warning(
+                f"⚠️ {stale_count} task(s) changed since your last export — "
+                "Google Calendar still shows the old time. Export again to "
+                "update it.",
+                icon="⚠️",
+            )
         if st.button(
             "📤 Export Scheduled Tasks",
             use_container_width=True,
@@ -842,6 +1050,10 @@ tasks_display = sorted(
 )
 
 for task in tasks_display:
+    if task.get("is_break"):
+        render_break_card(task)
+        continue
+
     priority = task.get("priority", 3)
     status = task.get("status", "pending")
     p_color = PRIORITY_COLORS.get(priority, "#6b7280")

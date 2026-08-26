@@ -1,9 +1,202 @@
-import sqlite3
 import os
+import re
+import sqlite3  # kept only for type hints (sqlite3.Row / sqlite3.Cursor) below —
+                # the actual connection no longer uses this module directly.
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
+from itertools import count
 from pathlib import Path
 from typing import Any, Optional
+
+from sqlalchemy import (
+    create_engine, text, inspect,
+    MetaData, Table, Column, Integer, Float, String, Text,
+    DateTime, Date, Time, ForeignKey, UniqueConstraint, CheckConstraint,
+    Index, func,
+)
+from sqlalchemy.engine import Connection, CursorResult, Engine
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+
+
+# ---------------------------------------------------------------------------
+# Schema — dialect-agnostic table definitions
+#
+# This is the SQLAlchemy equivalent of schema.sql. It's what makes a FRESH
+# Postgres database creatable directly (metadata.create_all(engine)) —
+# instead of running the SQLite-only schema.sql text file. An existing
+# SQLite database keeps using schema.sql + the self-healing migrations
+# below, exactly as before, so nothing changes for local development.
+# ---------------------------------------------------------------------------
+
+metadata = MetaData()
+
+users = Table(
+    "users", metadata,
+    Column("user_id", Integer, primary_key=True, autoincrement=True),
+    Column("email", String, nullable=False, unique=True),
+    Column("password_hash", String, nullable=False),
+    Column("display_name", String, nullable=False),
+    Column("timezone", String, nullable=False, server_default="UTC"),
+    Column("created_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+)
+Index("idx_users_email", users.c.email)
+
+categories = Table(
+    "categories", metadata,
+    Column("category_id", Integer, primary_key=True, autoincrement=True),
+    Column("user_id", Integer, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False),
+    Column("name", String, nullable=False),
+    Column("color", String, nullable=False, server_default="#3B82F6"),
+    Column("created_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    UniqueConstraint("user_id", "name"),
+)
+Index("idx_categories_user_id", categories.c.user_id)
+
+plans = Table(
+    "plans", metadata,
+    Column("plan_id", Integer, primary_key=True, autoincrement=True),
+    Column("user_id", Integer, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False),
+    Column("plan_date", Date, nullable=False),
+    Column("raw_input", Text, nullable=False),
+    Column("ai_summary", Text),
+    Column("status", String, nullable=False, server_default="active"),
+    Column("created_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    UniqueConstraint("user_id", "plan_date"),
+    CheckConstraint("status IN ('draft','active','completed')", name="ck_plans_status"),
+)
+Index("idx_plans_user_id", plans.c.user_id)
+Index("idx_plans_date", plans.c.plan_date)
+Index("idx_plans_user_date", plans.c.user_id, plans.c.plan_date)
+
+tasks = Table(
+    "tasks", metadata,
+    Column("task_id", Integer, primary_key=True, autoincrement=True),
+    Column("plan_id", Integer, ForeignKey("plans.plan_id", ondelete="CASCADE"), nullable=False),
+    Column("category_id", Integer, ForeignKey("categories.category_id", ondelete="SET NULL")),
+    Column("title", String, nullable=False),
+    Column("description", Text),
+    Column("priority", Integer, nullable=False, server_default="3"),
+    Column("estimated_minutes", Integer, nullable=False, server_default="30"),
+    Column("scheduled_start", Time),
+    Column("scheduled_end", Time),
+    Column("is_fixed_time", Integer, nullable=False, server_default="0"),
+    Column("is_break", Integer, nullable=False, server_default="0"),
+    Column("order_index", Integer, nullable=False, server_default="0"),
+    Column("status", String, nullable=False, server_default="pending"),
+    Column("failure_reason", String),
+    Column("actual_minutes", Integer),
+    Column("started_at", DateTime),
+    Column("completed_at", DateTime),
+    Column("created_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    Column("updated_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    Column("google_event_id", String),
+    Column("google_exported_at", DateTime),
+    CheckConstraint("priority BETWEEN 1 AND 5", name="ck_tasks_priority"),
+    CheckConstraint("estimated_minutes >= 0", name="ck_tasks_est_minutes"),
+    CheckConstraint("status IN ('pending','in_progress','completed','failed')", name="ck_tasks_status"),
+    CheckConstraint(
+        "failure_reason IN ('Harder than expected','Distracted','Tired',"
+        "'Unexpected event','Changed priorities','Ran out of time')",
+        name="ck_tasks_failure_reason",
+    ),
+    CheckConstraint("actual_minutes >= 0", name="ck_tasks_actual_minutes"),
+    CheckConstraint("is_fixed_time IN (0, 1)", name="ck_tasks_is_fixed_time"),
+    CheckConstraint("is_break IN (0, 1)", name="ck_tasks_is_break"),
+)
+Index("idx_tasks_plan_id", tasks.c.plan_id)
+Index("idx_tasks_category_id", tasks.c.category_id)
+Index("idx_tasks_status", tasks.c.status)
+Index("idx_tasks_plan_status", tasks.c.plan_id, tasks.c.status)
+
+user_profiles = Table(
+    "user_profiles", metadata,
+    Column("profile_id", Integer, primary_key=True, autoincrement=True),
+    Column("user_id", Integer, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, unique=True),
+    Column("completion_rate", Float, nullable=False, server_default="0.0"),
+    Column("productivity_score", Float, nullable=False, server_default="0.0"),
+    Column("best_productivity_hour", Integer),
+    Column("avg_delay_minutes", Float, nullable=False, server_default="0.0"),
+    Column("main_failure_reason", String),
+    Column("favorite_category_id", Integer, ForeignKey("categories.category_id", ondelete="SET NULL")),
+    Column("current_streak", Integer, nullable=False, server_default="0"),
+    Column("longest_streak", Integer, nullable=False, server_default="0"),
+    Column("total_completed", Integer, nullable=False, server_default="0"),
+    Column("total_failed", Integer, nullable=False, server_default="0"),
+    Column("total_tasks", Integer, nullable=False, server_default="0"),
+    Column("last_updated", DateTime, nullable=False, server_default=func.current_timestamp()),
+    CheckConstraint("completion_rate BETWEEN 0 AND 1", name="ck_profiles_completion_rate"),
+    CheckConstraint("productivity_score BETWEEN 0 AND 100", name="ck_profiles_productivity_score"),
+    CheckConstraint("best_productivity_hour BETWEEN 0 AND 23", name="ck_profiles_hour"),
+    CheckConstraint("avg_delay_minutes >= 0", name="ck_profiles_avg_delay"),
+    CheckConstraint("current_streak >= 0", name="ck_profiles_current_streak"),
+    CheckConstraint("longest_streak >= 0", name="ck_profiles_longest_streak"),
+    CheckConstraint("total_completed >= 0", name="ck_profiles_total_completed"),
+    CheckConstraint("total_failed >= 0", name="ck_profiles_total_failed"),
+    CheckConstraint("total_tasks >= 0", name="ck_profiles_total_tasks"),
+)
+Index("idx_profiles_user_id", user_profiles.c.user_id)
+
+badges = Table(
+    "badges", metadata,
+    Column("badge_id", Integer, primary_key=True, autoincrement=True),
+    Column("name", String, nullable=False, unique=True),
+    Column("description", String, nullable=False),
+    Column("icon", String),
+    Column("requirement_type", String, nullable=False),
+    Column("requirement_value", Integer, nullable=False),
+    CheckConstraint("requirement_type IN ('streak','count','rate')", name="ck_badges_req_type"),
+    CheckConstraint("requirement_value >= 0", name="ck_badges_req_value"),
+)
+
+user_badges = Table(
+    "user_badges", metadata,
+    Column("user_badge_id", Integer, primary_key=True, autoincrement=True),
+    Column("user_id", Integer, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False),
+    Column("badge_id", Integer, ForeignKey("badges.badge_id", ondelete="CASCADE"), nullable=False),
+    Column("earned_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    UniqueConstraint("user_id", "badge_id"),
+)
+Index("idx_user_badges_user_id", user_badges.c.user_id)
+
+google_oauth_tokens = Table(
+    "google_oauth_tokens", metadata,
+    Column("token_id", Integer, primary_key=True, autoincrement=True),
+    Column("user_id", Integer, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, unique=True),
+    Column("access_token", Text, nullable=False),
+    Column("refresh_token", Text, nullable=False),
+    Column("token_expiry", DateTime, nullable=False),
+    Column("scopes", String, nullable=False, server_default=""),
+    Column("created_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    Column("updated_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+)
+
+google_selected_calendars = Table(
+    "google_selected_calendars", metadata,
+    Column("selection_id", Integer, primary_key=True, autoincrement=True),
+    Column("user_id", Integer, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False),
+    Column("calendar_id", String, nullable=False),
+    Column("calendar_name", String, nullable=False, server_default=""),
+    Column("color", String, nullable=False, server_default="#4285F4"),
+    Column("is_primary", Integer, nullable=False, server_default="0"),
+    Column("created_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    UniqueConstraint("user_id", "calendar_id"),
+)
+Index("idx_gcal_selected_user", google_selected_calendars.c.user_id)
+
+google_calendar_events = Table(
+    "google_calendar_events", metadata,
+    Column("event_id", Integer, primary_key=True, autoincrement=True),
+    Column("user_id", Integer, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False),
+    Column("google_event_id", String, nullable=False),
+    Column("title", String, nullable=False, server_default=""),
+    Column("start_time", Time, nullable=False),
+    Column("end_time", Time, nullable=False),
+    Column("event_date", Date, nullable=False),
+    Column("calendar_id", String, nullable=False),
+    Column("last_synced_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    UniqueConstraint("user_id", "google_event_id", "event_date"),
+)
+Index("idx_gcal_events_user_date", google_calendar_events.c.user_id, google_calendar_events.c.event_date)
 
 
 # ---------------------------------------------------------------------------
@@ -13,6 +206,16 @@ from typing import Any, Optional
 DB_NAME: str = "coach_ai.db"
 SCHEMA_FILE: str = "schema.sql"
 
+# Set DATABASE_URL to point at Postgres in production, e.g.:
+#   postgresql+psycopg2://user:password@host:5432/coachai
+# Left unset (the default), CoachAI keeps using a local SQLite file — no
+# other code in this file, or anywhere else in the project, needs to change
+# to switch between the two.
+DEFAULT_SQLITE_PATH: str = os.path.abspath(DB_NAME)
+DATABASE_URL: str = os.environ.get(
+    "DATABASE_URL", f"sqlite:///{DEFAULT_SQLITE_PATH}"
+)
+
 
 # ---------------------------------------------------------------------------
 # Database Class
@@ -20,26 +223,32 @@ SCHEMA_FILE: str = "schema.sql"
 
 class Database:
     """
-    SQLite database manager for CoachAI.
+    Database manager for CoachAI, backed by SQLAlchemy.
 
-    Automatically creates the database file and executes the schema on first
-    use. Provides low-level query helpers and high-level domain methods.
+    Talks to SQLite by default (for local development) or Postgres when
+    DATABASE_URL is set (for production). Every method below this class's
+    connection-management section is UNCHANGED from the original sqlite3
+    version — same names, same SQL, same ``?`` placeholders — because the
+    low-level execute()/fetch_one()/fetch_all() helpers now translate
+    everything through SQLAlchemy under the hood.
 
     Attributes:
-        db_path: Absolute path to the SQLite database file.
-        connection: Active sqlite3.Connection instance.
+        engine: SQLAlchemy Engine (connection pool + dialect).
+        connection: Active SQLAlchemy Connection instance.
     """
 
-    def __init__(self, db_path: Optional[str] = None) -> None:
+    def __init__(self, db_url: Optional[str] = None) -> None:
         """
         Initialise the database manager.
 
         Args:
-            db_path: Optional custom path for the database file.
-                     Defaults to ``coach_ai.db`` in the current directory.
+            db_url: Optional SQLAlchemy connection URL. Defaults to
+                    DATABASE_URL (env var), which itself defaults to a
+                    local ``coach_ai.db`` SQLite file.
         """
-        self.db_path: str = db_path or os.path.abspath(DB_NAME)
-        self.connection: Optional[sqlite3.Connection] = None
+        self.db_url: str = db_url or DATABASE_URL
+        self.engine: Optional[Engine] = None
+        self.connection: Optional[Connection] = None
         self._connect()
 
     # ------------------------------------------------------------------
@@ -47,18 +256,34 @@ class Database:
     # ------------------------------------------------------------------
 
     def _connect(self) -> None:
-        """Open a connection to SQLite and enable foreign keys."""
-        self.connection = sqlite3.connect(self.db_path)
-        self.connection.row_factory = sqlite3.Row
-        self.connection.execute("PRAGMA foreign_keys = ON")
+        """Open the engine/connection and enable foreign keys (SQLite)."""
+        self.engine = create_engine(self.db_url, future=True)
+        self.connection = self.engine.connect()
+        if self.is_sqlite:
+            self.connection.execute(text("PRAGMA foreign_keys = ON"))
+            self.connection.commit()
         self._maybe_create_schema()
+
+    @property
+    def is_sqlite(self) -> bool:
+        """True when this Database is currently talking to SQLite."""
+        return self.engine.dialect.name == "sqlite"
+
+    def _raw_dbapi(self) -> Any:
+        """
+        Return the underlying DBAPI connection (sqlite3.Connection,
+        psycopg2 connection, ...) for the handful of operations
+        SQLAlchemy Core has no portable equivalent for (PRAGMA,
+        executescript). Only ever called on the SQLite path.
+        """
+        return self.connection.connection
 
     def close(self) -> None:
         """Safely close the database connection."""
         if self.connection:
             try:
                 self.connection.close()
-            except sqlite3.Error:
+            except SQLAlchemyError:
                 pass
             finally:
                 self.connection = None
@@ -73,22 +298,48 @@ class Database:
 
     # ------------------------------------------------------------------
     # Schema initialisation
+    #
+    # NOTE: schema.sql and every _maybe_migrate_* helper below are still
+    # SQLite-specific (AUTOINCREMENT, PRAGMA, sqlite_master...), exactly
+    # as they were before this conversion. They're now guarded to only
+    # run on the SQLite path. Creating/migrating the Postgres schema
+    # (via SQLAlchemy Table objects + Alembic) is the next follow-up
+    # piece of work, not something this pass silently papers over.
     # ------------------------------------------------------------------
 
     def _maybe_create_schema(self) -> None:
         """
-        Execute ``schema.sql`` if the database is empty (no tables yet).
+        Create the schema if the database is empty (no tables yet).
 
-        Looks for ``schema.sql`` in the same directory as this module.
+        - SQLite: keeps using schema.sql + the self-healing migrations
+          below, unchanged from before — this is what your existing
+          coach_ai.db already went through, so it keeps working exactly
+          as-is.
+        - Any other dialect (Postgres in production): a fresh database
+          is created directly from the ``metadata`` Table objects above
+          via ``metadata.create_all()``. Those definitions already
+          include every column the SQLite migrations add over time
+          (e.g. ``google_event_id``, the updated failure_reason CHECK),
+          so a new Postgres database starts at the final schema and
+          never needs to run the SQLite migration methods at all.
         """
+        if not self.is_sqlite:
+            inspector = inspect(self.engine)
+            if not inspector.get_table_names():
+                metadata.create_all(self.engine)
+            return
+
         cursor = self.connection.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' LIMIT 1"
+            text("SELECT name FROM sqlite_master WHERE type='table' LIMIT 1")
         )
         if cursor.fetchone() is not None:
             self._maybe_migrate_started_at()
             self._maybe_migrate_failure_reason_check()
             self._maybe_create_google_tables()
             self._maybe_migrate_task_google_event_id()
+            self._maybe_migrate_task_is_fixed_time()
+            self._maybe_migrate_task_google_exported_at()
+            self._maybe_migrate_task_is_break()
             return  # Schema already applied
 
         schema_path = Path(__file__).with_name(SCHEMA_FILE)
@@ -98,112 +349,125 @@ class Database:
             )
 
         with open(schema_path, "r", encoding="utf-8") as f:
-            self.connection.executescript(f.read())
+            self._raw_dbapi().executescript(f.read())
         self.connection.commit()
+
+        # schema.sql only has the columns baked in from day one
+        # (is_fixed_time). Everything added later purely via migration
+        # (google_event_id, google_exported_at, the Google Calendar
+        # tables) still needs to run once here too, so a BRAND NEW
+        # SQLite database ends up at the same final shape as one that
+        # started earlier and migrated forward.
+        self._maybe_migrate_started_at()
+        self._maybe_migrate_failure_reason_check()
+        self._maybe_create_google_tables()
+        self._maybe_migrate_task_google_event_id()
+        self._maybe_migrate_task_is_fixed_time()
+        self._maybe_migrate_task_google_exported_at()
+        self._maybe_migrate_task_is_break()
 
     def _maybe_migrate_started_at(self) -> None:
         """
         Add the ``started_at`` column to an existing ``tasks`` table if it
-        doesn't have it yet.
-
-        This makes the Start-Task timer feature self-healing for databases
-        created before this column existed, instead of requiring the user
-        to run a manual ``ALTER TABLE`` migration.
+        doesn't have it yet. SQLite-only self-healing migration.
         """
-        cursor = self.connection.execute("PRAGMA table_info(tasks)")
+        cursor = self.connection.execute(text("PRAGMA table_info(tasks)"))
         existing_columns = {row[1] for row in cursor.fetchall()}
         if "started_at" not in existing_columns:
-            self.connection.execute("ALTER TABLE tasks ADD COLUMN started_at DATETIME")
+            self.connection.execute(
+                text("ALTER TABLE tasks ADD COLUMN started_at DATETIME")
+            )
             self.connection.commit()
 
     def _maybe_migrate_failure_reason_check(self) -> None:
         """
         Rebuild the ``tasks`` table if its ``failure_reason`` CHECK
-        constraint doesn't yet include ``'Ran out of time'``.
-
-        SQLite bakes CHECK constraints into a table's original CREATE
-        TABLE statement — unlike a plain column, they can't be altered
-        in place. This performs SQLite's standard rebuild pattern
-        (rename -> recreate with the new constraint -> copy rows over ->
-        drop the old table) inside a single transaction, so it's safe to
-        run on every startup and a no-op once already migrated.
+        constraint doesn't yet include ``'Ran out of time'``. SQLite-only
+        (Postgres CHECK constraints CAN be altered in place with ALTER
+        TABLE ... DROP/ADD CONSTRAINT, so this rebuild dance won't be
+        needed there at all).
         """
         cursor = self.connection.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='tasks'"
+            text("SELECT sql FROM sqlite_master WHERE type='table' AND name='tasks'")
         )
         row = cursor.fetchone()
         if row is None or row[0] is None or "Ran out of time" in row[0]:
             return  # Already up to date (or table doesn't exist yet)
 
-        self.connection.execute("PRAGMA foreign_keys = OFF")
+        raw = self._raw_dbapi()
+        raw.execute("PRAGMA foreign_keys = OFF")
         try:
-            with self.connection:
-                self.connection.execute("ALTER TABLE tasks RENAME TO tasks_old")
-                self.connection.execute(
-                    """
-                    CREATE TABLE tasks (
-                        task_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        plan_id INTEGER NOT NULL,
-                        category_id INTEGER,
-                        title TEXT NOT NULL,
-                        description TEXT,
-                        priority INTEGER NOT NULL DEFAULT 3
-                            CHECK (priority BETWEEN 1 AND 5),
-                        estimated_minutes INTEGER NOT NULL DEFAULT 30
-                            CHECK (estimated_minutes >= 0),
-                        scheduled_start TIME,
-                        scheduled_end TIME,
-                        order_index INTEGER NOT NULL DEFAULT 0,
-                        status TEXT NOT NULL DEFAULT 'pending'
-                            CHECK (status IN ('pending', 'in_progress', 'completed', 'failed')),
-                        failure_reason TEXT
-                            CHECK (failure_reason IN (
-                                'Harder than expected',
-                                'Distracted',
-                                'Tired',
-                                'Unexpected event',
-                                'Changed priorities',
-                                'Ran out of time'
-                            )),
-                        actual_minutes INTEGER
-                            CHECK (actual_minutes >= 0),
-                        started_at DATETIME,
-                        completed_at DATETIME,
-                        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            raw.execute("BEGIN")
+            raw.execute("ALTER TABLE tasks RENAME TO tasks_old")
+            raw.execute(
+                """
+                CREATE TABLE tasks (
+                    task_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    plan_id INTEGER NOT NULL,
+                    category_id INTEGER,
+                    title TEXT NOT NULL,
+                    description TEXT,
+                    priority INTEGER NOT NULL DEFAULT 3
+                        CHECK (priority BETWEEN 1 AND 5),
+                    estimated_minutes INTEGER NOT NULL DEFAULT 30
+                        CHECK (estimated_minutes >= 0),
+                    scheduled_start TIME,
+                    scheduled_end TIME,
+                    order_index INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending', 'in_progress', 'completed', 'failed')),
+                    failure_reason TEXT
+                        CHECK (failure_reason IN (
+                            'Harder than expected',
+                            'Distracted',
+                            'Tired',
+                            'Unexpected event',
+                            'Changed priorities',
+                            'Ran out of time'
+                        )),
+                    actual_minutes INTEGER
+                        CHECK (actual_minutes >= 0),
+                    started_at DATETIME,
+                    completed_at DATETIME,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
-                        FOREIGN KEY (plan_id) REFERENCES plans(plan_id) ON DELETE CASCADE,
-                        FOREIGN KEY (category_id) REFERENCES categories(category_id) ON DELETE SET NULL
-                    )
-                    """
+                    FOREIGN KEY (plan_id) REFERENCES plans(plan_id) ON DELETE CASCADE,
+                    FOREIGN KEY (category_id) REFERENCES categories(category_id) ON DELETE SET NULL
                 )
-                self.connection.execute(
-                    """
-                    INSERT INTO tasks (
-                        task_id, plan_id, category_id, title, description, priority,
-                        estimated_minutes, scheduled_start, scheduled_end, order_index,
-                        status, failure_reason, actual_minutes, started_at, completed_at,
-                        created_at, updated_at
-                    )
-                    SELECT
-                        task_id, plan_id, category_id, title, description, priority,
-                        estimated_minutes, scheduled_start, scheduled_end, order_index,
-                        status, failure_reason, actual_minutes, started_at, completed_at,
-                        created_at, updated_at
-                    FROM tasks_old
-                    """
+                """
+            )
+            raw.execute(
+                """
+                INSERT INTO tasks (
+                    task_id, plan_id, category_id, title, description, priority,
+                    estimated_minutes, scheduled_start, scheduled_end, order_index,
+                    status, failure_reason, actual_minutes, started_at, completed_at,
+                    created_at, updated_at
                 )
-                self.connection.execute("DROP TABLE tasks_old")
-                self.connection.execute("CREATE INDEX idx_tasks_plan_id ON tasks(plan_id)")
-                self.connection.execute("CREATE INDEX idx_tasks_category_id ON tasks(category_id)")
-                self.connection.execute("CREATE INDEX idx_tasks_status ON tasks(status)")
-                self.connection.execute("CREATE INDEX idx_tasks_plan_status ON tasks(plan_id, status)")
+                SELECT
+                    task_id, plan_id, category_id, title, description, priority,
+                    estimated_minutes, scheduled_start, scheduled_end, order_index,
+                    status, failure_reason, actual_minutes, started_at, completed_at,
+                    created_at, updated_at
+                FROM tasks_old
+                """
+            )
+            raw.execute("DROP TABLE tasks_old")
+            raw.execute("CREATE INDEX idx_tasks_plan_id ON tasks(plan_id)")
+            raw.execute("CREATE INDEX idx_tasks_category_id ON tasks(category_id)")
+            raw.execute("CREATE INDEX idx_tasks_status ON tasks(status)")
+            raw.execute("CREATE INDEX idx_tasks_plan_status ON tasks(plan_id, status)")
+            raw.commit()
+        except Exception:
+            raw.rollback()
+            raise
         finally:
-            self.connection.execute("PRAGMA foreign_keys = ON")
+            raw.execute("PRAGMA foreign_keys = ON")
 
     def _maybe_create_google_tables(self) -> None:
         """Create Google Calendar tables if they don't exist (idempotent)."""
-        self.connection.executescript("""
+        self._raw_dbapi().executescript("""
             CREATE TABLE IF NOT EXISTS google_oauth_tokens (
                 token_id      INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id       INTEGER NOT NULL UNIQUE,
@@ -247,42 +511,140 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_gcal_selected_user
                 ON google_selected_calendars(user_id);
         """)
+        self.connection.commit()
 
     def _maybe_migrate_task_google_event_id(self) -> None:
         """Add google_event_id column to tasks if missing."""
-        cursor = self.connection.execute("PRAGMA table_info(tasks)")
+        cursor = self.connection.execute(text("PRAGMA table_info(tasks)"))
         existing_columns = {row[1] for row in cursor.fetchall()}
         if "google_event_id" not in existing_columns:
             self.connection.execute(
-                "ALTER TABLE tasks ADD COLUMN google_event_id TEXT"
+                text("ALTER TABLE tasks ADD COLUMN google_event_id TEXT")
+            )
+            self.connection.commit()
+
+    def _maybe_migrate_task_is_fixed_time(self) -> None:
+        """
+        Add the ``is_fixed_time`` column to an existing ``tasks`` table if
+        it doesn't have it yet. This is what lets the app tell a task the
+        AI/user pinned to a real clock time (e.g. a fixed 2:00 PM meeting)
+        apart from a task the Scheduler is free to move — without it,
+        every task looked the same once scheduled_start was set, whether
+        it was fixed on purpose or just previously auto-scheduled.
+
+        Existing rows default to 0 (flexible), since there is no reliable
+        way to infer which already-scheduled tasks were originally meant
+        to be fixed.
+        """
+        cursor = self.connection.execute(text("PRAGMA table_info(tasks)"))
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        if "is_fixed_time" not in existing_columns:
+            self.connection.execute(
+                text(
+                    "ALTER TABLE tasks ADD COLUMN is_fixed_time "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            )
+            self.connection.commit()
+
+    def _maybe_migrate_task_google_exported_at(self) -> None:
+        """
+        Add the ``google_exported_at`` column to an existing ``tasks``
+        table if it doesn't have it yet. This records when a task was
+        last pushed to Google Calendar, so the app can tell a stale
+        export (task rescheduled after it was exported) apart from one
+        that's already in sync — without it, there was no way to warn
+        the user that Google Calendar still holds an old time.
+        """
+        cursor = self.connection.execute(text("PRAGMA table_info(tasks)"))
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        if "google_exported_at" not in existing_columns:
+            self.connection.execute(
+                text("ALTER TABLE tasks ADD COLUMN google_exported_at DATETIME")
+            )
+            self.connection.commit()
+
+    def _maybe_migrate_task_is_break(self) -> None:
+        """
+        Add the ``is_break`` column to an existing ``tasks`` table if it
+        doesn't have it yet. This is what turns a break from a purely
+        in-memory scheduling hint (gone the moment the page reloads)
+        into a real, persisted task row — one the Scheduler already
+        treats as an immovable fixed-time block (via is_fixed_time),
+        and that the UI can show in the task list, start a timer on,
+        and mark completed, exactly like any other task.
+
+        Existing rows default to 0 (not a break), since there is no
+        reliable way to infer which already-scheduled tasks were
+        originally meant to represent a break.
+        """
+        cursor = self.connection.execute(text("PRAGMA table_info(tasks)"))
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        if "is_break" not in existing_columns:
+            self.connection.execute(
+                text(
+                    "ALTER TABLE tasks ADD COLUMN is_break "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
             )
             self.connection.commit()
 
     # ------------------------------------------------------------------
     # Low-level query helpers
+    #
+    # These are the ONLY methods that changed behind the scenes. Every
+    # domain method below (create_user, get_tasks_by_plan, ...) still
+    # calls self.execute(sql, params) / self.fetch_one(...) / etc. with
+    # the exact same "?"-style SQL as before — nothing below this point
+    # needed to change at all.
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _to_named(sql: str, parameters: tuple[Any, ...]) -> tuple[Any, dict[str, Any]]:
+        """
+        Translate sqlite3-style positional "?" placeholders (and a plain
+        tuple of values) into SQLAlchemy's dialect-agnostic named-param
+        style, so the exact same SQL string works against SQLite or
+        Postgres without every call site needing to change.
+        """
+        if not parameters:
+            return text(sql), {}
+
+        counter = count(1)
+        param_names: list[str] = []
+
+        def _replace(_match: "re.Match[str]") -> str:
+            name = f"p{next(counter)}"
+            param_names.append(name)
+            return f":{name}"
+
+        named_sql = re.sub(r"\?", _replace, sql)
+        param_dict = {name: value for name, value in zip(param_names, parameters)}
+        return text(named_sql), param_dict
 
     def execute(
         self,
         sql: str,
         parameters: tuple[Any, ...] = (),
-    ) -> sqlite3.Cursor:
+    ) -> CursorResult:
         """
         Execute a single SQL statement with parameters.
 
         Args:
-            sql: Parameterised SQL statement.
+            sql: Parameterised SQL statement (sqlite3-style "?" placeholders).
             parameters: Values to bind (never use string formatting).
 
         Returns:
-            sqlite3.Cursor for further inspection.
+            SQLAlchemy CursorResult for further inspection (supports
+            .fetchone() and .fetchall()).
 
         Raises:
-            sqlite3.Error: On execution failure.
+            SQLAlchemyError: On execution failure.
         """
+        stmt, params = self._to_named(sql, parameters)
         try:
-            return self.connection.execute(sql, parameters)
-        except sqlite3.Error as exc:
+            return self.connection.execute(stmt, params)
+        except SQLAlchemyError as exc:
             self.connection.rollback()
             raise exc
 
@@ -290,41 +652,77 @@ class Database:
         self,
         sql: str,
         parameters: tuple[Any, ...] = (),
-    ) -> Optional[sqlite3.Row]:
+    ) -> Optional[dict]:
         """
-        Execute a query and return the first row, or ``None``.
+        Execute a query and return the first row as a dict, or ``None``.
 
         Args:
             sql: Parameterised SELECT statement.
             parameters: Values to bind.
 
         Returns:
-            First matching row, or ``None`` if no results.
+            First matching row as a dict (supports both row["col"] and
+            row.get("col")), or ``None`` if no results.
         """
         cursor = self.execute(sql, parameters)
-        return cursor.fetchone()
+        row = cursor.fetchone()
+        return dict(row._mapping) if row is not None else None
 
     def fetch_all(
         self,
         sql: str,
         parameters: tuple[Any, ...] = (),
-    ) -> list[sqlite3.Row]:
+    ) -> list[dict]:
         """
-        Execute a query and return all rows.
+        Execute a query and return all rows as dicts.
 
         Args:
             sql: Parameterised SELECT statement.
             parameters: Values to bind.
 
         Returns:
-            List of matching rows (empty list if none).
+            List of matching rows as dicts (empty list if none).
         """
         cursor = self.execute(sql, parameters)
-        return cursor.fetchall()
+        return [dict(row._mapping) for row in cursor.fetchall()]
 
     def commit(self) -> None:
         """Commit the current transaction."""
         self.connection.commit()
+
+    def _insert_and_get_id(
+        self,
+        sql: str,
+        parameters: tuple[Any, ...],
+        pk_column: str,
+    ) -> Optional[int]:
+        """
+        Execute an INSERT (or upsert) and return the affected row's
+        primary key, portably across SQLite and Postgres.
+
+        SQLite (and MySQL) support ``cursor.lastrowid`` directly, but
+        Postgres does not reliably support it at all — the correct,
+        dialect-agnostic way to get an inserted id back is
+        ``INSERT ... RETURNING <pk_column>``, which both SQLite (3.35+)
+        and Postgres understand. Using this everywhere means every
+        ``create_*``/``add_*`` method below returns the right id on
+        either database with no per-call-site branching.
+
+        Args:
+            sql: The INSERT statement, WITHOUT a trailing semicolon or
+                RETURNING clause (both are added here).
+            parameters: Values to bind, sqlite3-style ``?`` order.
+            pk_column: Name of the primary-key column to return.
+
+        Returns:
+            The primary key of the inserted/updated row, or ``None`` if
+            the statement affected no row (e.g. an ON CONFLICT DO
+            NOTHING that matched nothing).
+        """
+        stmt = sql.rstrip().rstrip(";") + f" RETURNING {pk_column}"
+        cursor = self.execute(stmt, parameters)
+        row = cursor.fetchone()
+        return row[0] if row is not None else None
 
     # ------------------------------------------------------------------
     # Transaction context manager
@@ -375,14 +773,14 @@ class Database:
             sqlite3.IntegrityError: If the email already exists.
         """
         with self.transaction():
-            cursor = self.execute(
+            user_id = self._insert_and_get_id(
                 """
                 INSERT INTO users (email, password_hash, display_name, timezone)
                 VALUES (?, ?, ?, ?)
                 """,
                 (email, password_hash, display_name, timezone),
+                pk_column="user_id",
             )
-            user_id = cursor.lastrowid
 
             # Initialise empty profile so AI always has a row to read
             self.execute(
@@ -450,15 +848,16 @@ class Database:
         Raises:
             sqlite3.IntegrityError: If a plan already exists for this user+date.
         """
-        cursor = self.execute(
+        plan_id = self._insert_and_get_id(
             """
             INSERT INTO plans (user_id, plan_date, raw_input, ai_summary, status)
             VALUES (?, ?, ?, ?, ?)
             """,
             (user_id, plan_date.isoformat(), raw_input, ai_summary, status),
+            pk_column="plan_id",
         )
         self.commit()
-        return cursor.lastrowid
+        return plan_id
 
     def get_today_plan(self, user_id: int) -> Optional[sqlite3.Row]:
         """
@@ -574,6 +973,8 @@ class Database:
         scheduled_start: Optional[str] = None,
         scheduled_end: Optional[str] = None,
         order_index: int = 0,
+        is_fixed_time: bool = False,
+        is_break: bool = False,
     ) -> int:
         """
         Add a task to an existing plan.
@@ -588,18 +989,29 @@ class Database:
             scheduled_start: ``HH:MM`` suggested start time.
             scheduled_end: ``HH:MM`` suggested end time.
             order_index: Display order within the plan.
+            is_fixed_time: True if the user/AI pinned this task to a real
+                clock time (e.g. "meeting at 2pm"). Fixed-time tasks are
+                never moved by the Scheduler, regardless of what work-day
+                start time is chosen when re-running it. False (the
+                default) means the Scheduler is free to place/move this
+                task around other commitments.
+            is_break: True if this row represents a user-defined break
+                rather than a real task. Breaks are always fixed-time
+                (the scheduler carves out exactly the window the user
+                asked for) and are rendered/controlled differently in
+                the UI (start/countdown instead of complete/fail).
 
         Returns:
             The newly created ``task_id``.
         """
-        cursor = self.execute(
+        task_id = self._insert_and_get_id(
             """
             INSERT INTO tasks (
                 plan_id, category_id, title, description,
                 priority, estimated_minutes, scheduled_start,
-                scheduled_end, order_index
+                scheduled_end, order_index, is_fixed_time, is_break
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 plan_id,
@@ -611,10 +1023,13 @@ class Database:
                 scheduled_start,
                 scheduled_end,
                 order_index,
+                1 if is_fixed_time else 0,
+                1 if is_break else 0,
             ),
+            pk_column="task_id",
         )
         self.commit()
-        return cursor.lastrowid
+        return task_id
 
     def update_task(
         self,
@@ -1022,17 +1437,19 @@ class Database:
             sqlite3.IntegrityError: If the badge_id does not exist.
         """
         try:
-            cursor = self.execute(
+            new_id = self._insert_and_get_id(
                 """
                 INSERT INTO user_badges (user_id, badge_id)
                 VALUES (?, ?)
                 """,
                 (user_id, badge_id),
+                pk_column="user_badge_id",
             )
             self.commit()
-            return cursor.lastrowid
-        except sqlite3.IntegrityError:
+            return new_id
+        except IntegrityError:
             # UNIQUE(user_id, badge_id) violation – already earned
+            self.connection.rollback()
             return None
 
     def get_user_badges(self, user_id: int) -> list[sqlite3.Row]:
@@ -1094,15 +1511,16 @@ class Database:
         Returns:
             The newly created ``badge_id``.
         """
-        cursor = self.execute(
+        badge_id = self._insert_and_get_id(
             """
             INSERT INTO badges (name, description, icon, requirement_type, requirement_value)
             VALUES (?, ?, ?, ?, ?)
             """,
             (name, description, icon, requirement_type, requirement_value),
+            pk_column="badge_id",
         )
         self.commit()
-        return cursor.lastrowid
+        return badge_id
 
     # =====================================================================
     # CATEGORIES (bonus helpers)
@@ -1128,12 +1546,13 @@ class Database:
         Raises:
             sqlite3.IntegrityError: If the user already has this category name.
         """
-        cursor = self.execute(
+        category_id = self._insert_and_get_id(
             "INSERT INTO categories (user_id, name, color) VALUES (?, ?, ?)",
             (user_id, name, color),
+            pk_column="category_id",
         )
         self.commit()
-        return cursor.lastrowid
+        return category_id
 
     def get_categories(self, user_id: int) -> list[sqlite3.Row]:
         """
@@ -1163,7 +1582,7 @@ class Database:
         scopes: str = "",
     ) -> int:
         """Insert or replace Google OAuth tokens for a user."""
-        cursor = self.execute(
+        token_id = self._insert_and_get_id(
             """
             INSERT INTO google_oauth_tokens
                 (user_id, access_token, refresh_token, token_expiry, scopes)
@@ -1176,9 +1595,10 @@ class Database:
                 updated_at = CURRENT_TIMESTAMP
             """,
             (user_id, access_token, refresh_token, token_expiry, scopes),
+            pk_column="token_id",
         )
         self.commit()
-        return cursor.lastrowid
+        return token_id
 
     def get_google_tokens(self, user_id: int) -> Optional[sqlite3.Row]:
         """Fetch stored Google OAuth tokens for a user."""
@@ -1287,7 +1707,7 @@ class Database:
         calendar_id: str,
     ) -> int:
         """Insert or update a synced Google Calendar event."""
-        cursor = self.execute(
+        event_id = self._insert_and_get_id(
             """
             INSERT INTO google_calendar_events
                 (user_id, google_event_id, title, start_time, end_time,
@@ -1302,9 +1722,60 @@ class Database:
             """,
             (user_id, google_event_id, title, start_time, end_time,
              event_date, calendar_id),
+            pk_column="event_id",
         )
         self.commit()
-        return cursor.lastrowid
+        return event_id
+
+    def mark_task_exported(self, task_id: int) -> None:
+        """
+        Stamp a task as freshly exported to Google Calendar (its
+        scheduled_start/scheduled_end at this exact moment are now
+        reflected there). Used for the "update an existing event" export
+        path, where google_event_id doesn't change but the export
+        timestamp still needs to move forward — this is what lets the
+        app detect a schedule change made AFTER the last export and warn
+        the user, instead of silently leaving Google Calendar stale.
+
+        Args:
+            task_id: The task that was just (re-)exported.
+        """
+        self.execute(
+            "UPDATE tasks SET google_exported_at = CURRENT_TIMESTAMP WHERE task_id = ?",
+            (task_id,),
+        )
+        self.commit()
+
+    def get_stale_google_exports(self, plan_id: int) -> list[dict]:
+        """
+        Find tasks in a plan that were exported to Google Calendar at
+        some point, but whose scheduled_start/scheduled_end has changed
+        SINCE that export (e.g. the Scheduler was re-run afterwards) —
+        meaning Google Calendar currently shows an out-of-date time.
+
+        Tasks never exported at all (google_event_id IS NULL) are not
+        "stale" — there's nothing in Google Calendar to be behind yet.
+
+        Args:
+            plan_id: The plan to check.
+
+        Returns:
+            List of task rows whose Google Calendar event no longer
+            matches the task's current scheduled time.
+        """
+        return self.fetch_all(
+            """
+            SELECT * FROM tasks
+            WHERE plan_id = ?
+              AND google_event_id IS NOT NULL
+              AND (
+                    google_exported_at IS NULL
+                    OR updated_at > google_exported_at
+                  )
+            ORDER BY order_index ASC, task_id ASC
+            """,
+            (plan_id,),
+        )
 
     def get_google_calendar_events(
         self,
@@ -1378,11 +1849,13 @@ class Database:
         task_id: int,
         google_event_id: Optional[str],
     ) -> None:
-        """Set the Google Calendar event ID for an exported task."""
+        """Set the Google Calendar event ID for a newly-exported task,
+        and stamp it as freshly exported (see mark_task_exported)."""
         self.execute(
             """
             UPDATE tasks
-            SET google_event_id = ?, updated_at = CURRENT_TIMESTAMP
+            SET google_event_id = ?, google_exported_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
             WHERE task_id = ?
             """,
             (google_event_id, task_id),

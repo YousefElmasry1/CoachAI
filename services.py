@@ -21,7 +21,7 @@ from __future__ import annotations
 import os
 import threading
 import uuid
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Any, Optional
 
 import streamlit as st
@@ -440,12 +440,21 @@ def get_database_status() -> dict[str, Any]:
         db = get_database()
         # Quick connectivity test
         db.fetch_one("SELECT 1")
-        db_size = os.path.getsize(db.db_path) if os.path.exists(db.db_path) else 0
+
+        db_size = 0
+        db_path = db.db_url
+        if db.is_sqlite:
+            # sqlite:///absolute/path -> absolute/path
+            sqlite_path = db.db_url.split("sqlite:///", 1)[-1]
+            db_path = sqlite_path
+            if os.path.exists(sqlite_path):
+                db_size = os.path.getsize(sqlite_path)
+
         return {
             "connected": True,
-            "path": db.db_path,
+            "path": db_path,
             "size_bytes": db_size,
-            "size_display": _format_file_size(db_size),
+            "size_display": _format_file_size(db_size) if db.is_sqlite else "—",
         }
     except Exception as e:
         return {
@@ -699,6 +708,94 @@ def delete_task(task_id: int) -> bool:
         return False
 
 
+# ─────────────────────────────────────────────────────────────
+# Breaks (persisted as real tasks — see is_break on the tasks table)
+#
+# A break is stored as an ordinary task row with is_break=1 and
+# is_fixed_time=1. That's deliberate: it means a break automatically
+# gets everything a real task already has for free — it survives page
+# reloads, the Scheduler already treats any is_fixed_time task as an
+# immovable blocked slot (so other tasks route around it with no
+# scheduler changes needed), and it can reuse update_task_status for
+# its own start/complete timer instead of a parallel mechanism.
+# ─────────────────────────────────────────────────────────────
+
+def add_break_to_plan(
+    plan_id: int,
+    start_time: time,
+    duration_minutes: int,
+    title: str = "Break",
+) -> Optional[int]:
+    """
+    Add a break to a plan as a fixed-time task (is_break=1).
+
+    Args:
+        plan_id: The plan to add the break to.
+        start_time: When the break starts.
+        duration_minutes: How long the break lasts.
+        title: Display title (defaults to "Break").
+
+    Returns:
+        The new task_id, or None on error.
+    """
+    db = get_database()
+    try:
+        existing = db.get_tasks_by_plan(plan_id)
+        order_index = len(existing)
+        end_time = (
+            datetime.combine(date.today(), start_time) + timedelta(minutes=duration_minutes)
+        ).time()
+        return db.add_task(
+            plan_id=plan_id,
+            title=title,
+            priority=1,
+            estimated_minutes=duration_minutes,
+            scheduled_start=start_time.strftime("%H:%M"),
+            scheduled_end=end_time.strftime("%H:%M"),
+            order_index=order_index,
+            is_fixed_time=True,
+            is_break=True,
+        )
+    except Exception:
+        return None
+
+
+def reschedule_break(task_id: int, new_start_time: time) -> bool:
+    """
+    Shift a break to a new start time, keeping its original duration.
+    Used by the conflict-resolution actions ("move before/after task").
+
+    Returns True on success, False on error.
+    """
+    db = get_database()
+    try:
+        task = db.get_task(task_id)
+        if task is None:
+            return False
+        duration = int(task["estimated_minutes"])
+        new_end_time = (
+            datetime.combine(date.today(), new_start_time) + timedelta(minutes=duration)
+        ).time()
+        db.update_task(
+            task_id,
+            scheduled_start=new_start_time.strftime("%H:%M"),
+            scheduled_end=new_end_time.strftime("%H:%M"),
+        )
+        return True
+    except Exception:
+        return False
+
+
+def start_break(task_id: int) -> bool:
+    """Mark a break as started (stamps started_at, like any task timer)."""
+    return update_task_status(task_id, status="in_progress")
+
+
+def complete_break(task_id: int) -> bool:
+    """Mark a break as finished."""
+    return update_task_status(task_id, status="completed")
+
+
 def defer_task_to_tomorrow(task_id: int, user_id: int = DEFAULT_USER_ID) -> bool:
     """
     Move a task from its current plan to the user's plan for tomorrow,
@@ -799,6 +896,27 @@ def run_scheduler_for_plan(
         import traceback
         traceback.print_exc()
         return []
+
+
+def get_last_scheduling_conflicts() -> list:
+    """Return break-vs-fixed-task conflicts from the most recent
+    run_scheduler_for_plan() / run_scheduler_for_today() call.
+
+    Both a user break and a fixed-time task have an immovable time,
+    so when their windows overlap the scheduler cannot silently pick
+    a winner -- it leaves both times untouched and records the
+    conflict here instead. Call this right after running the
+    scheduler and show the result to the user if non-empty, e.g.:
+
+        "Could not fit your 11:30-12:00 break: it overlaps your
+         fixed task 'Team standup' at 11:15-12:00."
+
+    Returns:
+        A list of SchedulingConflict objects (empty if none, or if
+        the scheduler has not run yet this session).
+    """
+    service = get_scheduler_service()
+    return getattr(service, "last_conflicts", [])
 
 
 def run_scheduler_for_today(
@@ -1177,6 +1295,10 @@ def export_task_to_google_calendar(
                 end_time=task["scheduled_end"],
                 event_date=plan_date,
             )
+            # google_event_id doesn't change on this path, but the
+            # export timestamp still needs to move forward — this is
+            # what clears the "stale export" warning after a re-export.
+            db.mark_task_exported(task_id)
         else:
             new_event_id = client.create_event(
                 calendar_id="primary",
@@ -1213,6 +1335,24 @@ def export_all_scheduled_tasks(
                 errors += 1
 
     return {"exported": exported, "errors": errors}
+
+
+def get_stale_export_count(user_id: int = DEFAULT_USER_ID) -> int:
+    """
+    Count today's tasks whose Google Calendar event no longer matches
+    their current scheduled time — i.e. they were exported once, then
+    the schedule changed (Start Day, a new blocked slot, a manual
+    re-run) without a follow-up export.
+
+    Returns 0 if there's no plan today, or nothing has ever been
+    exported (nothing can be "stale" relative to an export that never
+    happened).
+    """
+    plan = load_today_plan(user_id)
+    if plan is None:
+        return 0
+    db = get_database()
+    return len(db.get_stale_google_exports(plan["plan_id"]))
 
 
 # ─────────────────────────────────────────────────────────────
