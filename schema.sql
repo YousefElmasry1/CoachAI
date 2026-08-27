@@ -67,6 +67,8 @@ CREATE TABLE tasks (
         CHECK (is_fixed_time IN (0, 1)),
     is_break INTEGER NOT NULL DEFAULT 0
         CHECK (is_break IN (0, 1)),
+    timer_accumulated_seconds INTEGER NOT NULL DEFAULT 0,
+    timer_segment_started_at DATETIME,
     order_index INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'pending' 
         CHECK (status IN ('pending', 'in_progress', 'completed', 'failed')), 

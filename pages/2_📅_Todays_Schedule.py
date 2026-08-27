@@ -39,9 +39,18 @@ from services import (
     add_task_to_plan,
     delete_task,
     defer_task_to_tomorrow,
+    save_draft_tasks_to_plan,
+    defer_draft_tasks_to_tomorrow,
     update_task_status,
+    start_task_timer,
+    pause_task_timer,
+    resume_task_timer,
+    finish_task_with_timer,
+    get_task_elapsed_seconds,
+    is_task_timer_paused,
     run_scheduler_for_today,
     get_last_scheduling_conflicts,
+    get_last_scheduler_error,
     add_break_to_plan,
     reschedule_break,
     start_break,
@@ -184,6 +193,65 @@ def render_break_card(b: dict) -> None:
             st.caption("✅ Break completed")
 
 
+def render_task_countdown(task_id: int, remaining_seconds: int, key_suffix: str) -> None:
+    """
+    Live client-side countdown for an active (non-paused) task timer.
+    Unlike the break countdown, running past zero isn't alarming for a
+    real task — it's normal to go over an estimate — so instead of an
+    end-of-timer alert this just keeps counting upward as "+mm:ss over"
+    in a muted amber once it crosses zero.
+
+    ``remaining_seconds`` is computed server-side (via
+    get_task_elapsed_seconds, which already excludes any paused time)
+    on every render, so it's always accurate after a reload — same
+    accuracy contract as render_break_countdown.
+    """
+    html_code = f"""
+    <div id="task-wrap-{key_suffix}" style="
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        text-align: center;
+        padding: 10px 12px;
+        border-radius: 10px;
+        background: rgba(124,58,237,0.10);
+        border: 1px solid rgba(124,58,237,0.25);
+    ">
+        <div id="task-timer-display-{key_suffix}" style="font-size: 1.5rem; font-weight: 700; color: #a78bfa;">
+            --:--
+        </div>
+        <div id="task-timer-label-{key_suffix}" style="color: #9ca3af; font-size: 0.78rem; margin-top: 1px;">
+            time left
+        </div>
+    </div>
+    <script>
+        (function() {{
+            let remaining = {remaining_seconds};
+            const display = document.getElementById("task-timer-display-{key_suffix}");
+            const label = document.getElementById("task-timer-label-{key_suffix}");
+
+            function fmt(totalSeconds) {{
+                const sign = totalSeconds < 0 ? "+" : "";
+                const abs = Math.abs(totalSeconds);
+                const m = Math.floor(abs / 60);
+                const s = abs % 60;
+                return sign + String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
+            }}
+
+            function tick() {{
+                display.textContent = fmt(remaining);
+                if (remaining < 0) {{
+                    display.style.color = "#f59e0b";
+                    label.textContent = "over estimate";
+                }}
+                remaining -= 1;
+            }}
+            tick();
+            setInterval(tick, 1000);
+        }})();
+    </script>
+    """
+    components.html(html_code, height=85)
+
+
 
 # ─────────────────────────────────────────────────────────────
 # Page Setup
@@ -262,33 +330,21 @@ def _capacity_evidence_caption(info: dict) -> None:
     )
 
 
-def _capacity_suggestions(plan_output, raw_input: str, info: dict) -> list[dict]:
+def _capacity_split(plan_output, recommended_minutes: int) -> tuple[list, list, list]:
     """
-    Build capacity-aware rewrites of the drafted plan, using the actual
-    priorities the AI already assigned to each task — not a generic
-    hint. Clicking one prefills the text box with it; the user still
-    reviews, edits, and presses Generate themselves.
-
-    Primary suggestion: keep the highest-priority tasks first (greedy,
-    in priority order) until the recommended budget is used up, defer
-    the rest. Fixed-time tasks (e.g. "gym at 6pm") are never deferred —
-    the user committed to a clock time for those — but their minutes
-    still count against the budget.
-
-    Always offers a second, non-destructive option: keep every task but
-    ask the planner to compress durations instead of dropping anything.
+    Split a drafted plan's tasks into (fixed, keep, defer) using the
+    same greedy priority-budget rule described in
+    _capacity_suggestions()'s docstring. Shared by the "Keep top
+    priorities, defer the rest" direct action and its preview text.
     """
-    recommended = int(info["recommended_minutes"])
     tasks = list(plan_output.tasks or [])
-
     fixed = [t for t in tasks if t.is_fixed_time]
     flexible = sorted(
         [t for t in tasks if not t.is_fixed_time],
         key=lambda t: t.priority,  # 1 = highest importance first
     )
-
     fixed_minutes = sum(t.estimated_minutes for t in fixed)
-    budget = max(0, recommended - fixed_minutes)
+    budget = max(0, recommended_minutes - fixed_minutes)
 
     keep: list = []
     defer: list = []
@@ -299,33 +355,25 @@ def _capacity_suggestions(plan_output, raw_input: str, info: dict) -> list[dict]
             running += t.estimated_minutes
         else:
             defer.append(t)
+    return fixed, keep, defer
 
-    suggestions: list[dict] = []
 
-    if defer:
-        keep_all = fixed + keep
-        keep_desc = "; ".join(
-            f"{t.title} (at {t.fixed_start}, {t.estimated_minutes} minutes)"
-            if t.is_fixed_time
-            else f"{t.title} ({t.estimated_minutes} minutes)"
-            for t in keep_all
-        )
-        defer_desc = "; ".join(
-            f"{t.title} ({t.estimated_minutes} minutes)" for t in defer
-        )
-        suggestions.append({
-            "label": "✂️ Keep top priorities, defer the rest",
-            "text": (
-                f"{keep_desc}.\n\n"
-                f"(Note to planner: preserve the exact durations stated "
-                f"above for each task — do not re-estimate them. "
-                f"Deferring these lower-priority items "
-                f"to another day to stay close to {recommended} minutes "
-                f"today: {defer_desc}.)"
-            ),
-        })
+def _capacity_suggestions(raw_input: str, info: dict) -> list[dict]:
+    """
+    Build a capacity-aware rewrite of the drafted plan that keeps every
+    task but asks the planner to compress durations instead of dropping
+    anything. Clicking it prefills the text box; the user still
+    reviews, edits, and presses Generate themselves.
 
-    suggestions.append({
+    (The other option — keep top priorities, defer the rest — is a
+    direct one-click action instead of a text rewrite; see the
+    "Keep top priorities, defer the rest" button in
+    _render_ai_capacity_warning, which actually saves today's kept
+    tasks AND creates the deferred ones on tomorrow's plan, rather than
+    just asking the AI to quietly leave them out of a regenerated draft.)
+    """
+    recommended = int(info["recommended_minutes"])
+    return [{
         "label": "🪶 Shorten instead of dropping",
         "text": (
             f"{raw_input.strip()}\n\n"
@@ -333,9 +381,7 @@ def _capacity_suggestions(plan_output, raw_input: str, info: dict) -> list[dict]
             f"durations so today's total stays close to {recommended} "
             f"minutes.)"
         ),
-    })
-
-    return suggestions
+    }]
 
 
 def _render_ai_capacity_warning(key_prefix: str) -> bool:
@@ -351,6 +397,7 @@ def _render_ai_capacity_warning(key_prefix: str) -> bool:
 
     info = pending["capacity_info"]
     raw_input = pending["raw_input"]
+    plan_output = pending["plan_output"]
 
     st.markdown("#### 🛡️ Realistic Capacity Check")
     st.warning(
@@ -364,9 +411,67 @@ def _render_ai_capacity_warning(key_prefix: str) -> bool:
     _capacity_evidence_caption(info)
 
     st.markdown("<div style='height:0.4rem;'></div>", unsafe_allow_html=True)
-    st.caption("Create it anyway, try a lighter version below, or cancel.")
+    st.caption("Create it anyway, split it below, or cancel.")
 
-    suggestions = _capacity_suggestions(pending["plan_output"], raw_input, info)
+    fixed, keep, defer = _capacity_split(plan_output, int(info["recommended_minutes"]))
+    flexible = keep + defer  # same priority order, just re-joined
+
+    if flexible:
+        st.markdown("**✂️ Review the split before confirming**")
+        st.caption(
+            "The AI ranked these by priority — flip any that are wrong "
+            "(e.g. something due today that got ranked low) before you "
+            "confirm. Fixed-time tasks always stay today."
+        )
+        override_keys = []
+        for i, t in enumerate(flexible):
+            cb_key = f"{key_prefix}_keep_{i}"
+            override_keys.append((cb_key, t))
+            default_keep = t in keep
+            row = st.columns([5, 2])
+            with row[0]:
+                st.checkbox(
+                    f"{get_priority_icon(t.priority)} {t.title} · {format_duration(t.estimated_minutes)}",
+                    value=default_keep,
+                    key=cb_key,
+                )
+            with row[1]:
+                st.caption("today" if st.session_state.get(cb_key, default_keep) else "→ tomorrow")
+
+        today_flexible = [t for cb_key, t in override_keys if st.session_state.get(cb_key, t in keep)]
+        tomorrow_flexible = [t for cb_key, t in override_keys if not st.session_state.get(cb_key, t in keep)]
+
+        st.markdown("<div style='height:0.3rem;'></div>", unsafe_allow_html=True)
+        if st.button(
+            f"✅ Confirm: {len(fixed) + len(today_flexible)} today, "
+            f"{len(tomorrow_flexible)} tomorrow",
+            key=f"{key_prefix}_split_defer", use_container_width=True, type="primary",
+        ):
+            if plan is None:
+                target_plan_id = create_today_plan(raw_input=raw_input, user_id=user_id)
+                if target_plan_id is None:
+                    st.error("Couldn't create today's plan. Try again.")
+                    return True
+            else:
+                target_plan_id = plan["plan_id"]
+
+            kept_count = save_draft_tasks_to_plan(fixed + today_flexible, target_plan_id)
+            deferred_count = defer_draft_tasks_to_tomorrow(tomorrow_flexible, user_id=user_id)
+
+            for k in pending.get("also_pop_keys", []):
+                st.session_state.pop(k, None)
+            for cb_key, _ in override_keys:
+                st.session_state.pop(cb_key, None)
+            _clear_capacity_warning(key_prefix)
+            st.toast(
+                f"Saved {kept_count} task(s) today, deferred {deferred_count} "
+                f"to tomorrow's plan.",
+                icon="✂️",
+            )
+            st.rerun()
+        st.markdown("<div style='height:0.4rem;'></div>", unsafe_allow_html=True)
+
+    suggestions = _capacity_suggestions(raw_input, info)
     sug_cols = st.columns(len(suggestions))
     for i, sug in enumerate(suggestions):
         with sug_cols[i]:
@@ -843,26 +948,13 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
     else:
         st.caption("No breaks added yet — the scheduler will run without one.")
 
-    add_cols = st.columns([2, 2, 1])
-    with add_cols[0]:
-        new_break_start = st.time_input("Starts at", value=time(12, 0), key="new_break_start")
-    with add_cols[1]:
-        new_break_minutes = st.number_input(
-            "Duration (min)", min_value=5, max_value=180, value=30, step=5, key="new_break_minutes"
-        )
-    with add_cols[2]:
-        st.markdown("<div style='height:1.8rem;'></div>", unsafe_allow_html=True)
-        if st.button("➕ Add", key="add_break_btn", use_container_width=True):
-            new_break_id = add_break_to_plan(plan["plan_id"], new_break_start, int(new_break_minutes))
-            if new_break_id:
-                st.toast("Break added — run the Scheduler to slot it in.", icon="☕")
-                st.rerun()
-            else:
-                st.error("Couldn't add the break. Try again.")
-
-    st.markdown("<div style='height:0.6rem;'></div>", unsafe_allow_html=True)
-
     # ── Conflict state (survives st.rerun, unlike a plain st.warning) ──
+    # Defined here (before the Add-break button) so adding a break can
+    # trigger an immediate re-schedule + conflict check, instead of
+    # silently sitting there until the user separately presses "Run
+    # Scheduler" — that gap was exactly why a break overlapping a fixed
+    # task, or a flexible task left at its now-stale time, showed no
+    # warning at all until a second manual click.
     CONFLICTS_KEY = "_scheduling_conflicts"
 
     def _shift_time(t: time, delta_minutes: int) -> time:
@@ -885,6 +977,29 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
                 return b
         return None
 
+    add_cols = st.columns([2, 2, 1])
+    with add_cols[0]:
+        new_break_start = st.time_input("Starts at", value=time(12, 0), key="new_break_start")
+    with add_cols[1]:
+        new_break_minutes = st.number_input(
+            "Duration (min)", min_value=5, max_value=180, value=30, step=5, key="new_break_minutes"
+        )
+    with add_cols[2]:
+        st.markdown("<div style='height:1.8rem;'></div>", unsafe_allow_html=True)
+        if st.button("➕ Add", key="add_break_btn", use_container_width=True):
+            new_break_id = add_break_to_plan(plan["plan_id"], new_break_start, int(new_break_minutes))
+            if new_break_id:
+                _run_and_track_conflicts()
+                if st.session_state.get(CONFLICTS_KEY):
+                    st.toast("Break added — but it overlaps a fixed task, see below.", icon="⚠️")
+                else:
+                    st.toast("Break added and slotted into your schedule ☕", icon="✅")
+                st.rerun()
+            else:
+                st.error("Couldn't add the break. Try again.")
+
+    st.markdown("<div style='height:0.6rem;'></div>", unsafe_allow_html=True)
+
     if st.button("▶️ Run Scheduler", type="primary"):
         scheduled = _run_and_track_conflicts()
         if scheduled:
@@ -893,7 +1008,11 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
             st.rerun()
         else:
             st.session_state[CONFLICTS_KEY] = []
-            st.error("Scheduling failed. Make sure today's plan has at least one task.")
+            error_detail = get_last_scheduler_error()
+            if error_detail:
+                st.error(f"Scheduling failed: {error_detail}")
+            else:
+                st.error("Scheduling failed. Make sure today's plan has at least one task.")
 
     # ── Persistent conflict banner + resolution actions ──
     # Shown on every render until resolved (unlike st.warning above the
@@ -1065,7 +1184,7 @@ for task in tasks_display:
         f"{format_time_12h(task.get('scheduled_start'))} – {format_time_12h(task.get('scheduled_end'))}",
         expanded=False,
     ):
-        top = st.columns([3, 1])
+        top = st.columns([3, 1, 1])
         with top[0]:
             st.markdown(
                 f"""
@@ -1083,26 +1202,48 @@ for task in tasks_display:
             if task.get("description"):
                 st.caption(task["description"])
         with top[1]:
+            if status == "pending":
+                if st.button("📆", key=f"defer_{task['task_id']}", use_container_width=True, help="Defer to tomorrow"):
+                    if defer_task_to_tomorrow(task["task_id"], user_id=user_id):
+                        st.toast("Moved to tomorrow.", icon="📆")
+                        st.rerun()
+        with top[2]:
             if st.button("🗑️ Delete", key=f"del_{task['task_id']}", use_container_width=True):
                 if delete_task(task["task_id"]):
                     st.toast("Task deleted.", icon="🗑️")
                     st.rerun()
 
         if status in ("pending", "in_progress"):
+            paused = is_task_timer_paused(task)
+            if status == "in_progress" and not paused:
+                duration_minutes = int(task.get("estimated_minutes") or 0)
+                remaining_seconds = duration_minutes * 60 - get_task_elapsed_seconds(task)
+                render_task_countdown(task["task_id"], remaining_seconds, key_suffix=str(task["task_id"]))
+            elif status == "in_progress" and paused:
+                banked_minutes = get_task_elapsed_seconds(task) / 60
+                st.caption(f"⏸️ Paused · {banked_minutes:.1f} of {format_duration(task.get('estimated_minutes'))} elapsed")
+
             action_cols = st.columns(3)
             with action_cols[0]:
                 if st.button("✅ Mark Completed", key=f"complete_{task['task_id']}", use_container_width=True):
-                    # actual_minutes is left unset on purpose: the database
-                    # auto-computes it from (now - started_at) if the task
-                    # was started, or falls back to the estimate otherwise.
-                    if update_task_status(task["task_id"], status="completed"):
+                    if finish_task_with_timer(task["task_id"], status="completed"):
                         st.toast("Nice work! Task completed.", icon="🎉")
                         st.rerun()
             with action_cols[1]:
                 if status == "pending":
                     if st.button("▶️ Start Task", key=f"start_{task['task_id']}", use_container_width=True):
-                        if update_task_status(task["task_id"], status="in_progress"):
+                        if start_task_timer(task["task_id"]):
                             st.toast("Timer started ⏱️", icon="▶️")
+                            st.rerun()
+                elif not paused:
+                    if st.button("⏸️ Pause", key=f"pause_{task['task_id']}", use_container_width=True):
+                        if pause_task_timer(task["task_id"]):
+                            st.toast("Timer paused ⏸️", icon="⏸️")
+                            st.rerun()
+                else:
+                    if st.button("▶️ Resume", key=f"resume_{task['task_id']}", use_container_width=True):
+                        if resume_task_timer(task["task_id"]):
+                            st.toast("Timer resumed ▶️", icon="▶️")
                             st.rerun()
             with action_cols[2]:
                 with st.popover("❌ Mark Failed", use_container_width=True):
@@ -1110,7 +1251,7 @@ for task in tasks_display:
                         "Why?", FAILURE_REASONS, key=f"reason_{task['task_id']}"
                     )
                     if st.button("Confirm", key=f"fail_{task['task_id']}"):
-                        if update_task_status(task["task_id"], status="failed", failure_reason=reason):
+                        if finish_task_with_timer(task["task_id"], status="failed", failure_reason=reason):
                             st.toast("Logged — your coach will factor this in.", icon="📝")
                             st.rerun()
         else:

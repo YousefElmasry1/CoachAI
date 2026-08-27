@@ -87,6 +87,8 @@ tasks = Table(
     Column("actual_minutes", Integer),
     Column("started_at", DateTime),
     Column("completed_at", DateTime),
+    Column("timer_accumulated_seconds", Integer, nullable=False, server_default="0"),
+    Column("timer_segment_started_at", DateTime),
     Column("created_at", DateTime, nullable=False, server_default=func.current_timestamp()),
     Column("updated_at", DateTime, nullable=False, server_default=func.current_timestamp()),
     Column("google_event_id", String),
@@ -340,6 +342,7 @@ class Database:
             self._maybe_migrate_task_is_fixed_time()
             self._maybe_migrate_task_google_exported_at()
             self._maybe_migrate_task_is_break()
+            self._maybe_migrate_task_timer_fields()
             return  # Schema already applied
 
         schema_path = Path(__file__).with_name(SCHEMA_FILE)
@@ -365,6 +368,7 @@ class Database:
         self._maybe_migrate_task_is_fixed_time()
         self._maybe_migrate_task_google_exported_at()
         self._maybe_migrate_task_is_break()
+        self._maybe_migrate_task_timer_fields()
 
     def _maybe_migrate_started_at(self) -> None:
         """
@@ -586,6 +590,42 @@ class Database:
                     "ALTER TABLE tasks ADD COLUMN is_break "
                     "INTEGER NOT NULL DEFAULT 0"
                 )
+            )
+            self.connection.commit()
+
+    def _maybe_migrate_task_timer_fields(self) -> None:
+        """
+        Add ``timer_accumulated_seconds`` and ``timer_segment_started_at``
+        to an existing ``tasks`` table if missing. Together these let a
+        task's timer be paused and resumed without losing accuracy:
+
+        - timer_accumulated_seconds: total active seconds banked from
+          every PREVIOUS run segment (i.e. excludes any time currently
+          paused, and excludes the segment still in progress).
+        - timer_segment_started_at: when the CURRENT active segment
+          began. NULL means the timer is currently paused (or the task
+          was never started) — there's deliberately no separate
+          "paused" status; a task stays 'in_progress' the whole time,
+          and pause/resume just toggles whether a segment is running.
+
+        Existing rows default to 0 / NULL, which is exactly correct for
+        a task that predates this feature (no time banked, no segment
+        running) — it behaves as if freshly started once someone
+        presses Start.
+        """
+        cursor = self.connection.execute(text("PRAGMA table_info(tasks)"))
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        if "timer_accumulated_seconds" not in existing_columns:
+            self.connection.execute(
+                text(
+                    "ALTER TABLE tasks ADD COLUMN timer_accumulated_seconds "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            )
+            self.connection.commit()
+        if "timer_segment_started_at" not in existing_columns:
+            self.connection.execute(
+                text("ALTER TABLE tasks ADD COLUMN timer_segment_started_at DATETIME")
             )
             self.connection.commit()
 
@@ -1119,6 +1159,38 @@ class Database:
             "SELECT * FROM tasks WHERE task_id = ?",
             (task_id,),
         )
+
+    def set_task_timer_segment(
+        self,
+        task_id: int,
+        accumulated_seconds: int,
+        segment_started_at: Optional[str],
+    ) -> None:
+        """
+        Directly set a task's pause/resume timer fields. Low-level —
+        callers (services.start_task_timer/pause_task_timer/
+        resume_task_timer) are responsible for computing the right
+        values; this just persists them.
+
+        Args:
+            task_id: Target task.
+            accumulated_seconds: Total active seconds banked from
+                every completed run segment (excludes the current one).
+            segment_started_at: ``YYYY-MM-DD HH:MM:SS`` UTC timestamp
+                marking the start of the currently-running segment, or
+                None if the timer is paused right now.
+        """
+        self.execute(
+            """
+            UPDATE tasks
+            SET timer_accumulated_seconds = ?,
+                timer_segment_started_at = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE task_id = ?
+            """,
+            (accumulated_seconds, segment_started_at, task_id),
+        )
+        self.commit()
 
     def update_task_status(
         self,

@@ -21,7 +21,7 @@ from __future__ import annotations
 import os
 import threading
 import uuid
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Optional
 
 import streamlit as st
@@ -196,6 +196,13 @@ def get_scheduler_service():
         from scheduler_service import SchedulerService
         _local.scheduler_service = SchedulerService(get_database())
     return _local.scheduler_service
+
+
+# Holds the error message from the most recent failed scheduler run (see
+# run_scheduler_for_plan / get_last_scheduler_error below). A plain
+# module-level dict rather than a bare variable so it's mutable from
+# inside run_scheduler_for_plan without a `global` statement.
+_LAST_SCHEDULER_ERROR: dict = {"message": None}
 
 
 def get_planner_service():
@@ -387,6 +394,125 @@ def update_task_status(
         # Clear cached analytics so they rebuild next load
         load_analytics_profile.clear()
         return True
+    except Exception:
+        return False
+
+
+# ─────────────────────────────────────────────────────────────
+# Task Timer (pause / resume without losing accuracy)
+#
+# A task's `status` never gains a "paused" value — it stays
+# 'in_progress' the whole time. Whether a timer is actively running or
+# paused is tracked purely by timer_segment_started_at: non-None means
+# a segment is currently running, None means paused. Every time a
+# segment ends (pause, complete, or fail), its duration gets folded
+# into timer_accumulated_seconds, so paused time is never counted.
+# ─────────────────────────────────────────────────────────────
+
+def _utc_now_str() -> str:
+    return datetime.now(timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def get_task_elapsed_seconds(task: dict) -> int:
+    """
+    Total active (non-paused) seconds elapsed on a task's timer right
+    now: everything already banked, plus the still-running segment (if
+    any). Safe to call regardless of status — returns the banked total
+    even for a task that's paused, completed, or never started.
+    """
+    accumulated = int(task.get("timer_accumulated_seconds") or 0)
+    segment_started_raw = task.get("timer_segment_started_at")
+    if not segment_started_raw:
+        return accumulated
+    try:
+        segment_started = datetime.fromisoformat(str(segment_started_raw))
+        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        return accumulated + max(0, int((now_utc - segment_started).total_seconds()))
+    except (ValueError, TypeError):
+        return accumulated
+
+
+def is_task_timer_paused(task: dict) -> bool:
+    """True if the task is in_progress but its timer is currently paused."""
+    return task.get("status") == "in_progress" and not task.get("timer_segment_started_at")
+
+
+def start_task_timer(task_id: int) -> bool:
+    """Start a task's timer for the first time (pending -> in_progress)."""
+    try:
+        db = get_database()
+        db.update_task_status(task_id, status="in_progress")  # stamps started_at once
+        db.set_task_timer_segment(
+            task_id, accumulated_seconds=0, segment_started_at=_utc_now_str()
+        )
+        return True
+    except Exception:
+        return False
+
+
+def pause_task_timer(task_id: int) -> bool:
+    """Pause a running task's timer, banking the elapsed segment."""
+    try:
+        db = get_database()
+        task = db.get_task(task_id)
+        if task is None:
+            return False
+        task_dict = dict(task)
+        elapsed = get_task_elapsed_seconds(task_dict)
+        db.set_task_timer_segment(task_id, accumulated_seconds=elapsed, segment_started_at=None)
+        return True
+    except Exception:
+        return False
+
+
+def resume_task_timer(task_id: int) -> bool:
+    """Resume a paused task's timer — starts a new active segment."""
+    try:
+        db = get_database()
+        task = db.get_task(task_id)
+        if task is None:
+            return False
+        accumulated = int(task["timer_accumulated_seconds"] or 0)
+        db.set_task_timer_segment(
+            task_id, accumulated_seconds=accumulated, segment_started_at=_utc_now_str()
+        )
+        return True
+    except Exception:
+        return False
+
+
+def finish_task_with_timer(
+    task_id: int,
+    status: str,
+    failure_reason: Optional[str] = None,
+) -> bool:
+    """
+    Mark a task completed/failed, using its real accumulated timer
+    time (banked segments + whatever's still running) as actual_minutes
+    instead of the naive (now - started_at) fallback — which would
+    incorrectly include any paused stretches.
+
+    Falls back to letting update_task_status compute actual_minutes
+    the old way if the task was never started (no timer data at all).
+    """
+    try:
+        db = get_database()
+        task = db.get_task(task_id)
+        actual_minutes = None
+        if task is not None:
+            task_dict = dict(task)
+            elapsed_seconds = get_task_elapsed_seconds(task_dict)
+            if elapsed_seconds > 0:
+                actual_minutes = max(1, round(elapsed_seconds / 60))
+            # Freeze the segment either way, so a completed/failed task
+            # never shows a "still running" timer if re-read later.
+            db.set_task_timer_segment(
+                task_id, accumulated_seconds=elapsed_seconds, segment_started_at=None
+            )
+        return update_task_status(
+            task_id, status=status, failure_reason=failure_reason,
+            actual_minutes=actual_minutes,
+        )
     except Exception:
         return False
 
@@ -835,6 +961,86 @@ def defer_task_to_tomorrow(task_id: int, user_id: int = DEFAULT_USER_ID) -> bool
         return False
 
 
+def save_draft_tasks_to_plan(tasks: list, plan_id: int) -> int:
+    """
+    Persist a list of not-yet-saved drafted task objects (from a
+    planner DayPlanOutput, e.g. `plan_output.tasks`) as real rows on an
+    existing plan.
+
+    Args:
+        tasks: Task objects/dicts with at least a title and
+            estimated_minutes (title/priority/description/is_fixed_time/
+            fixed_start are read via getattr with sane fallbacks, so this
+            works whether `tasks` holds Pydantic objects or plain dicts).
+        plan_id: The plan to attach them to.
+
+    Returns:
+        How many tasks were successfully saved.
+    """
+    def _get(t, name, default=None):
+        if hasattr(t, name):
+            return getattr(t, name)
+        if isinstance(t, dict):
+            return t.get(name, default)
+        return default
+
+    db = get_database()
+    existing_count = len(db.get_tasks_by_plan(plan_id))
+    saved = 0
+    for i, t in enumerate(tasks):
+        try:
+            is_fixed = bool(_get(t, "is_fixed_time", False))
+            fixed_start = _get(t, "fixed_start", None)
+            db.add_task(
+                plan_id=plan_id,
+                title=str(_get(t, "title", "Untitled")),
+                description=str(_get(t, "description", "") or ""),
+                priority=int(_get(t, "priority", 3)),
+                estimated_minutes=int(_get(t, "estimated_minutes", 30)),
+                scheduled_start=str(fixed_start) if (is_fixed and fixed_start) else None,
+                order_index=existing_count + i,
+                is_fixed_time=is_fixed,
+            )
+            saved += 1
+        except Exception:
+            continue
+
+    if saved:
+        load_analytics_profile.clear()
+    return saved
+
+
+def defer_draft_tasks_to_tomorrow(tasks: list, user_id: int = DEFAULT_USER_ID) -> int:
+    """
+    Create real task rows for TOMORROW from a list of not-yet-saved
+    drafted task objects — the counterpart to defer_task_to_tomorrow()
+    for tasks that were never saved to today's plan in the first place
+    (e.g. the "defer the rest" side of a Realistic Capacity split,
+    where the AI Planner's draft output is trimmed before saving and
+    the trimmed-out tasks would otherwise just vanish instead of
+    actually showing up tomorrow).
+
+    Creates tomorrow's plan container if it doesn't exist yet.
+
+    Returns:
+        How many tasks were successfully saved to tomorrow's plan.
+    """
+    if not tasks:
+        return 0
+    db = get_database()
+    tomorrow = date.today() + timedelta(days=1)
+    target_plan = db.get_plan_by_date(user_id=user_id, plan_date=tomorrow)
+    if target_plan is None:
+        plan_id = db.create_plan(
+            user_id=user_id,
+            plan_date=tomorrow,
+            raw_input="Tasks deferred from a previous day's capacity check.",
+        )
+    else:
+        plan_id = int(target_plan["plan_id"])
+    return save_draft_tasks_to_plan(tasks, plan_id)
+
+
 def create_category(
     user_id: int,
     name: str,
@@ -887,15 +1093,31 @@ def run_scheduler_for_plan(
         user_breaks=user_breaks,
     )
     try:
-        return service.schedule_plan(
+        result = service.schedule_plan(
             plan_id=plan_id,
             preferences=preferences,
             blocked_slots=blocked_slots,
         )
-    except Exception:
+        _LAST_SCHEDULER_ERROR["message"] = None
+        return result
+    except Exception as exc:
         import traceback
         traceback.print_exc()
+        _LAST_SCHEDULER_ERROR["message"] = str(exc)
         return []
+
+
+def get_last_scheduler_error() -> Optional[str]:
+    """
+    Return the error message from the most recent failed
+    run_scheduler_for_plan()/run_scheduler_for_today() call, or None if
+    the last run succeeded (or the scheduler hasn't run yet).
+
+    Call this when run_scheduler_for_today() returns an empty list, to
+    show the person the real reason (e.g. "a task can't fit in one day")
+    instead of a generic "scheduling failed".
+    """
+    return _LAST_SCHEDULER_ERROR.get("message")
 
 
 def get_last_scheduling_conflicts() -> list:

@@ -221,11 +221,28 @@ class Scheduler:
             for i, task in enumerate(tasks)
         ]
 
+        # A single calendar day only has 1440 minutes. Anything at or
+        # above that can never actually fit in one day — worse, silently
+        # letting it through makes the cursor roll into a LATER day while
+        # every scheduled_start/scheduled_end still only stores a bare
+        # time-of-day (by design — this is a single-day planner, not a
+        # multi-day one), so the extra days quietly vanish and two
+        # unrelated tasks can end up displaying the exact same time even
+        # though they're actually far apart. Reject it outright instead.
+        MAX_TASK_MINUTES = 16 * 60  # 16h — a generous, still same-day cap
+
         for st in converted:
             if st.estimated_minutes <= 0:
                 raise ValueError(
                     f"Task '{st.title}' (index {st.order_index}) has invalid "
                     f"estimated_minutes: {st.estimated_minutes}. Must be positive."
+                )
+            if st.estimated_minutes >= MAX_TASK_MINUTES:
+                raise ValueError(
+                    f"Task '{st.title}' (index {st.order_index}) has an "
+                    f"estimated_minutes of {st.estimated_minutes} "
+                    f"({st.estimated_minutes / 60:.1f}h), which can't fit in a "
+                    f"single day. Break it into smaller tasks instead."
                 )
             if st.is_fixed_time and st.fixed_start is None:
                 raise ValueError(
