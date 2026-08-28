@@ -47,7 +47,9 @@ from services import (
     resume_task_timer,
     finish_task_with_timer,
     get_task_elapsed_seconds,
+    get_task_paused_seconds,
     is_task_timer_paused,
+    load_pause_matrix,
     run_scheduler_for_today,
     get_last_scheduling_conflicts,
     get_last_scheduler_error,
@@ -193,19 +195,29 @@ def render_break_card(b: dict) -> None:
             st.caption("✅ Break completed")
 
 
-def render_task_countdown(task_id: int, remaining_seconds: int, key_suffix: str) -> None:
+TASK_TIME_UP_MESSAGES = [
+    "Estimated time's up.",
+    "That's the time you planned for.",
+    "Hit your estimate.",
+    "Estimate reached.",
+]
+
+
+def render_task_countdown(task_id: int, remaining_seconds: int, estimated_seconds: int, key_suffix: str) -> None:
     """
     Live client-side countdown for an active (non-paused) task timer.
-    Unlike the break countdown, running past zero isn't alarming for a
-    real task — it's normal to go over an estimate — so instead of an
-    end-of-timer alert this just keeps counting upward as "+mm:ss over"
-    in a muted amber once it crosses zero.
+    Running past zero isn't alarming for a real task — it's normal to
+    go over an estimate — so once it crosses zero this shows a single,
+    low-key "estimated time's up" banner (once) and then keeps counting
+    upward as "+mm:ss (N% over)" in a muted amber, rather than the
+    break countdown's more insistent end-of-timer alert.
 
     ``remaining_seconds`` is computed server-side (via
     get_task_elapsed_seconds, which already excludes any paused time)
     on every render, so it's always accurate after a reload — same
     accuracy contract as render_break_countdown.
     """
+    message = random.choice(TASK_TIME_UP_MESSAGES)
     html_code = f"""
     <div id="task-wrap-{key_suffix}" style="
         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -221,12 +233,18 @@ def render_task_countdown(task_id: int, remaining_seconds: int, key_suffix: str)
         <div id="task-timer-label-{key_suffix}" style="color: #9ca3af; font-size: 0.78rem; margin-top: 1px;">
             time left
         </div>
+        <div id="task-timer-alert-{key_suffix}" style="display:none; margin-top:8px; padding:6px 10px; border-radius:6px; background:rgba(245,158,11,0.14); color:#f59e0b; font-size:0.8rem; font-weight:600;">
+            ⏰ {message}
+        </div>
     </div>
     <script>
         (function() {{
             let remaining = {remaining_seconds};
+            const estimated = {estimated_seconds};
             const display = document.getElementById("task-timer-display-{key_suffix}");
             const label = document.getElementById("task-timer-label-{key_suffix}");
+            const alertBox = document.getElementById("task-timer-alert-{key_suffix}");
+            let alertShown = {str(remaining_seconds <= 0).lower()};
 
             function fmt(totalSeconds) {{
                 const sign = totalSeconds < 0 ? "+" : "";
@@ -238,9 +256,15 @@ def render_task_countdown(task_id: int, remaining_seconds: int, key_suffix: str)
 
             function tick() {{
                 display.textContent = fmt(remaining);
-                if (remaining < 0) {{
+                if (remaining <= 0) {{
                     display.style.color = "#f59e0b";
-                    label.textContent = "over estimate";
+                    const overSeconds = -remaining;
+                    const pct = estimated > 0 ? Math.round((overSeconds / estimated) * 100) : 0;
+                    label.textContent = pct > 0 ? pct + "% over estimate" : "over estimate";
+                    if (!alertShown) {{
+                        alertBox.style.display = "block";
+                        alertShown = true;
+                    }}
                 }}
                 remaining -= 1;
             }}
@@ -249,7 +273,7 @@ def render_task_countdown(task_id: int, remaining_seconds: int, key_suffix: str)
         }})();
     </script>
     """
-    components.html(html_code, height=85)
+    components.html(html_code, height=115)
 
 
 
@@ -1155,6 +1179,47 @@ st.markdown("<div style='height:1.2rem;'></div>", unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────────────────────
+# Focus Pattern Matrix (Category x Time-of-day pause counts)
+#
+# Standalone data source (load_pause_matrix in services.py) meant to
+# be reusable by other analytics/AI Coach prompts too — this is just
+# the simplest possible surface for it here on Today's Schedule.
+# ─────────────────────────────────────────────────────────────
+
+_pause_matrix = load_pause_matrix(user_id=user_id)
+if _pause_matrix:
+    with st.expander("📊 Focus Pattern Matrix (category × time of day)", expanded=False):
+        st.caption(
+            "How many times you've paused tasks, broken down by category "
+            "and when you started them. A category with a high pause "
+            "count at a specific time of day is a pattern worth acting on "
+            "— e.g. move it to a time slot where it rarely gets paused."
+        )
+        _bucket_order = ["Morning", "Afternoon", "Evening", "Night", "Unknown"]
+        _sorted_matrix = sorted(
+            _pause_matrix,
+            key=lambda r: (
+                r["category"],
+                _bucket_order.index(r["time_bucket"]) if r["time_bucket"] in _bucket_order else 99,
+            ),
+        )
+        _mx_cols = st.columns([2, 2, 1, 1, 1, 1])
+        for col, label in zip(_mx_cols, ["Category", "Time of day", "Tasks", "Paused", "Avg/task", "Avg pause"]):
+            col.markdown(f"**{label}**")
+        for row in _sorted_matrix:
+            _r_cols = st.columns([2, 2, 1, 1, 1, 1])
+            _r_cols[0].write(row["category"])
+            _r_cols[1].write(row["time_bucket"])
+            _r_cols[2].write(row["task_count"])
+            highlight = "⚠️ " if row["avg_pauses_per_task"] >= 1.5 else ""
+            _r_cols[3].write(f"{highlight}{row['total_pauses']}")
+            _r_cols[4].write(f"{row['avg_pauses_per_task']:.1f}")
+            _r_cols[5].write(format_duration(round(row["avg_pause_duration_seconds"] / 60)))
+
+st.markdown("<div style='height:0.6rem;'></div>", unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────
 # Task Cards (expandable, with status actions)
 # ─────────────────────────────────────────────────────────────
 
@@ -1218,10 +1283,20 @@ for task in tasks_display:
             if status == "in_progress" and not paused:
                 duration_minutes = int(task.get("estimated_minutes") or 0)
                 remaining_seconds = duration_minutes * 60 - get_task_elapsed_seconds(task)
-                render_task_countdown(task["task_id"], remaining_seconds, key_suffix=str(task["task_id"]))
+                render_task_countdown(
+                    task["task_id"], remaining_seconds, duration_minutes * 60,
+                    key_suffix=str(task["task_id"]),
+                )
             elif status == "in_progress" and paused:
                 banked_minutes = get_task_elapsed_seconds(task) / 60
-                st.caption(f"⏸️ Paused · {banked_minutes:.1f} of {format_duration(task.get('estimated_minutes'))} elapsed")
+                paused_minutes = get_task_paused_seconds(task) / 60
+                st.caption(
+                    f"⏸️ Paused · {banked_minutes:.1f} of {format_duration(task.get('estimated_minutes'))} "
+                    f"elapsed · paused for {paused_minutes:.1f}m so far"
+                )
+
+            if int(task.get("pause_count") or 0) > 0:
+                st.caption(f"🔁 Paused {int(task['pause_count'])}x so far")
 
             action_cols = st.columns(3)
             with action_cols[0]:

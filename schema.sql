@@ -69,6 +69,9 @@ CREATE TABLE tasks (
         CHECK (is_break IN (0, 1)),
     timer_accumulated_seconds INTEGER NOT NULL DEFAULT 0,
     timer_segment_started_at DATETIME,
+    pause_count INTEGER NOT NULL DEFAULT 0,
+    paused_at DATETIME,
+    timer_total_paused_seconds INTEGER NOT NULL DEFAULT 0,
     order_index INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'pending' 
         CHECK (status IN ('pending', 'in_progress', 'completed', 'failed')), 

@@ -89,6 +89,9 @@ tasks = Table(
     Column("completed_at", DateTime),
     Column("timer_accumulated_seconds", Integer, nullable=False, server_default="0"),
     Column("timer_segment_started_at", DateTime),
+    Column("pause_count", Integer, nullable=False, server_default="0"),
+    Column("paused_at", DateTime),
+    Column("timer_total_paused_seconds", Integer, nullable=False, server_default="0"),
     Column("created_at", DateTime, nullable=False, server_default=func.current_timestamp()),
     Column("updated_at", DateTime, nullable=False, server_default=func.current_timestamp()),
     Column("google_event_id", String),
@@ -343,6 +346,8 @@ class Database:
             self._maybe_migrate_task_google_exported_at()
             self._maybe_migrate_task_is_break()
             self._maybe_migrate_task_timer_fields()
+            self._maybe_migrate_task_pause_count()
+            self._maybe_migrate_task_pause_duration_fields()
             return  # Schema already applied
 
         schema_path = Path(__file__).with_name(SCHEMA_FILE)
@@ -369,6 +374,8 @@ class Database:
         self._maybe_migrate_task_google_exported_at()
         self._maybe_migrate_task_is_break()
         self._maybe_migrate_task_timer_fields()
+        self._maybe_migrate_task_pause_count()
+        self._maybe_migrate_task_pause_duration_fields()
 
     def _maybe_migrate_started_at(self) -> None:
         """
@@ -626,6 +633,58 @@ class Database:
         if "timer_segment_started_at" not in existing_columns:
             self.connection.execute(
                 text("ALTER TABLE tasks ADD COLUMN timer_segment_started_at DATETIME")
+            )
+            self.connection.commit()
+
+    def _maybe_migrate_task_pause_count(self) -> None:
+        """
+        Add the ``pause_count`` column to an existing ``tasks`` table if
+        missing. Incremented once per pause (see
+        Database.increment_task_pause_count / services.pause_task_timer)
+        and read by get_pause_matrix() to build the Category × Time-of-
+        day focus matrix — a per-task counter, not derived from the
+        timer segment fields, since those only track total banked time,
+        not how many times a task was interrupted.
+        """
+        cursor = self.connection.execute(text("PRAGMA table_info(tasks)"))
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        if "pause_count" not in existing_columns:
+            self.connection.execute(
+                text("ALTER TABLE tasks ADD COLUMN pause_count INTEGER NOT NULL DEFAULT 0")
+            )
+            self.connection.commit()
+
+    def _maybe_migrate_task_pause_duration_fields(self) -> None:
+        """
+        Add ``paused_at`` and ``timer_total_paused_seconds`` to an
+        existing ``tasks`` table if missing. pause_count alone only says
+        HOW MANY TIMES a task was interrupted — these two add HOW LONG
+        it stayed paused each time, which matters a lot for analysis:
+        five short 30-second pauses (a bit of fidgeting) reads very
+        differently from one 40-minute pause (a real interruption or
+        context switch), even though pause_count is 5 either way.
+
+        - paused_at: when the CURRENT pause began. NULL whenever the
+          timer isn't paused right now (running, not yet started, or
+          already finished).
+        - timer_total_paused_seconds: cumulative total of every FINISHED
+          pause's duration for this task (the currently-open pause, if
+          any, is added on top of this at read time — see
+          services.get_task_paused_seconds — not stored until it ends).
+        """
+        cursor = self.connection.execute(text("PRAGMA table_info(tasks)"))
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        if "paused_at" not in existing_columns:
+            self.connection.execute(
+                text("ALTER TABLE tasks ADD COLUMN paused_at DATETIME")
+            )
+            self.connection.commit()
+        if "timer_total_paused_seconds" not in existing_columns:
+            self.connection.execute(
+                text(
+                    "ALTER TABLE tasks ADD COLUMN timer_total_paused_seconds "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
             )
             self.connection.commit()
 
@@ -1160,37 +1219,158 @@ class Database:
             (task_id,),
         )
 
-    def set_task_timer_segment(
+    def set_task_timer_state(
         self,
         task_id: int,
         accumulated_seconds: int,
         segment_started_at: Optional[str],
+        paused_at: Optional[str],
+        total_paused_seconds: int,
     ) -> None:
         """
-        Directly set a task's pause/resume timer fields. Low-level —
+        Directly set a task's full pause/resume timer state. Low-level —
         callers (services.start_task_timer/pause_task_timer/
-        resume_task_timer) are responsible for computing the right
-        values; this just persists them.
+        resume_task_timer/finish_task_with_timer) are responsible for
+        computing the right values; this just persists them all in one
+        statement (they always change together, so there's no reason to
+        risk a partial update between two separate calls).
 
         Args:
             task_id: Target task.
-            accumulated_seconds: Total active seconds banked from
-                every completed run segment (excludes the current one).
+            accumulated_seconds: Total active seconds banked from every
+                completed run segment (excludes the current one).
             segment_started_at: ``YYYY-MM-DD HH:MM:SS`` UTC timestamp
-                marking the start of the currently-running segment, or
-                None if the timer is paused right now.
+                marking the start of the currently-running active
+                segment, or None if paused/not started/finished.
+            paused_at: ``YYYY-MM-DD HH:MM:SS`` UTC timestamp marking the
+                start of the CURRENT pause, or None if not paused.
+            total_paused_seconds: Cumulative duration of every FINISHED
+                pause (the currently-open one, if any, is on top of
+                this at read time, not included here yet).
         """
         self.execute(
             """
             UPDATE tasks
             SET timer_accumulated_seconds = ?,
                 timer_segment_started_at = ?,
+                paused_at = ?,
+                timer_total_paused_seconds = ?,
                 updated_at = CURRENT_TIMESTAMP
             WHERE task_id = ?
             """,
-            (accumulated_seconds, segment_started_at, task_id),
+            (accumulated_seconds, segment_started_at, paused_at, total_paused_seconds, task_id),
         )
         self.commit()
+
+    def increment_task_pause_count(self, task_id: int) -> None:
+        """Bump a task's pause_count by 1 (called once per Pause click)."""
+        self.execute(
+            "UPDATE tasks SET pause_count = pause_count + 1, "
+            "updated_at = CURRENT_TIMESTAMP WHERE task_id = ?",
+            (task_id,),
+        )
+        self.commit()
+
+    def get_pause_matrix(
+        self,
+        user_id: int,
+        since_date: str,
+    ) -> list[dict]:
+        """
+        Build the Category x Time-of-day focus matrix: for every task
+        this user started within the window, bucket it by the category
+        it belongs to and the hour-of-day it was FIRST started
+        (started_at), and sum pause_count within each bucket.
+
+        This is the raw data behind "when/on what do you lose focus
+        most" — e.g. a user who consistently pauses 'Study' tasks
+        started in the Evening bucket, but rarely pauses 'Study' tasks
+        started in the Morning, has a clear, actionable pattern.
+        Deliberately returned as flat (category, time_bucket) rows
+        rather than a pre-pivoted grid, so any caller (a UI table, the
+        AI Coach's recommendation prompt, a future analytics chart) can
+        reshape it however it needs without re-querying.
+
+        Only tasks with started_at set are included (a task that was
+        never started has no time-of-day to bucket it by). Uncategorised
+        tasks are grouped under 'Uncategorised'.
+
+        Args:
+            user_id: Whose tasks to analyze.
+            since_date: ISO date string — only plans on/after this date.
+
+        Returns:
+            List of dicts: {category, time_bucket, task_count,
+            paused_task_count, total_pauses, avg_pauses_per_task}.
+            time_bucket is one of 'Morning' (5-12), 'Afternoon' (12-17),
+            'Evening' (17-21), 'Night' (21-5).
+        """
+        rows = self.fetch_all(
+            """
+            SELECT
+                COALESCE(c.name, 'Uncategorised') AS category,
+                t.started_at AS started_at,
+                t.pause_count AS pause_count,
+                t.timer_total_paused_seconds AS timer_total_paused_seconds
+            FROM tasks t
+            JOIN plans p ON t.plan_id = p.plan_id
+            LEFT JOIN categories c ON t.category_id = c.category_id
+            WHERE p.user_id = ?
+              AND p.plan_date >= ?
+              AND t.started_at IS NOT NULL
+              AND t.is_break = 0
+            """,
+            (user_id, since_date),
+        )
+
+        def _bucket(started_at_raw) -> str:
+            try:
+                hour = datetime.fromisoformat(str(started_at_raw)).hour
+            except (ValueError, TypeError):
+                return "Unknown"
+            if 5 <= hour < 12:
+                return "Morning"
+            if 12 <= hour < 17:
+                return "Afternoon"
+            if 17 <= hour < 21:
+                return "Evening"
+            return "Night"
+
+        cells: dict[tuple[str, str], dict[str, int]] = {}
+        for row in rows:
+            key = (row["category"], _bucket(row["started_at"]))
+            cell = cells.setdefault(
+                key, {
+                    "task_count": 0, "paused_task_count": 0, "total_pauses": 0,
+                    "total_paused_seconds": 0,
+                }
+            )
+            cell["task_count"] += 1
+            pause_count = int(row["pause_count"] or 0)
+            cell["total_pauses"] += pause_count
+            cell["total_paused_seconds"] += int(row["timer_total_paused_seconds"] or 0)
+            if pause_count > 0:
+                cell["paused_task_count"] += 1
+
+        matrix: list[dict] = []
+        for (category, time_bucket), cell in cells.items():
+            matrix.append({
+                "category": category,
+                "time_bucket": time_bucket,
+                "task_count": cell["task_count"],
+                "paused_task_count": cell["paused_task_count"],
+                "total_pauses": cell["total_pauses"],
+                "avg_pauses_per_task": (
+                    cell["total_pauses"] / cell["task_count"] if cell["task_count"] else 0.0
+                ),
+                "total_paused_seconds": cell["total_paused_seconds"],
+                "avg_pause_duration_seconds": (
+                    cell["total_paused_seconds"] / cell["total_pauses"]
+                    if cell["total_pauses"] else 0.0
+                ),
+            })
+        matrix.sort(key=lambda r: (-r["total_pauses"], r["category"], r["time_bucket"]))
+        return matrix
 
     def update_task_status(
         self,

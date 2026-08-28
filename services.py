@@ -281,6 +281,35 @@ def load_analytics_summary(
     return formatter.to_summary(profile)
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def load_pause_matrix(
+    user_id: int = DEFAULT_USER_ID,
+    window_days: int = DEFAULT_ANALYTICS_WINDOW,
+) -> list[dict]:
+    """
+    Cached Category x Time-of-day focus matrix (see
+    Database.get_pause_matrix for the full shape/meaning of each row).
+
+    This is deliberately a standalone, cacheable data source — not
+    folded into AnalyticsProfile itself — specifically so any other
+    part of the app (a dedicated analytics view, the AI Coach's
+    recommendation prompt, a future dashboard widget) can pull the same
+    numbers without needing to touch analytics.py. TTL matches
+    load_analytics_profile (5 min) for consistency; cleared automatically
+    whenever a task is paused (see pause_task_timer), so it never lags
+    more than one page load behind reality.
+
+    Returns:
+        List of {category, time_bucket, task_count, paused_task_count,
+        total_pauses, avg_pauses_per_task} dicts, sorted by total_pauses
+        descending (heaviest distraction pattern first). Empty list if
+        the user has no started tasks in the window.
+    """
+    db = get_database()
+    since = date.today() - timedelta(days=window_days)
+    return db.get_pause_matrix(user_id=user_id, since_date=since.isoformat())
+
+
 # ─────────────────────────────────────────────────────────────
 # User Data
 # ─────────────────────────────────────────────────────────────
@@ -432,6 +461,27 @@ def get_task_elapsed_seconds(task: dict) -> int:
         return accumulated
 
 
+def get_task_paused_seconds(task: dict) -> int:
+    """
+    Total time this task has spent paused, ever: every finished pause's
+    duration, plus however long the CURRENT pause has run so far (if
+    it's paused right now). Complements get_task_elapsed_seconds — the
+    two together fully account for the time since a task was first
+    started (elapsed + paused == wall-clock time since started_at, for
+    a task that hasn't finished yet).
+    """
+    total = int(task.get("timer_total_paused_seconds") or 0)
+    paused_at_raw = task.get("paused_at")
+    if not paused_at_raw:
+        return total
+    try:
+        paused_at = datetime.fromisoformat(str(paused_at_raw))
+        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        return total + max(0, int((now_utc - paused_at).total_seconds()))
+    except (ValueError, TypeError):
+        return total
+
+
 def is_task_timer_paused(task: dict) -> bool:
     """True if the task is in_progress but its timer is currently paused."""
     return task.get("status") == "in_progress" and not task.get("timer_segment_started_at")
@@ -442,8 +492,9 @@ def start_task_timer(task_id: int) -> bool:
     try:
         db = get_database()
         db.update_task_status(task_id, status="in_progress")  # stamps started_at once
-        db.set_task_timer_segment(
-            task_id, accumulated_seconds=0, segment_started_at=_utc_now_str()
+        db.set_task_timer_state(
+            task_id, accumulated_seconds=0, segment_started_at=_utc_now_str(),
+            paused_at=None, total_paused_seconds=0,
         )
         return True
     except Exception:
@@ -451,7 +502,9 @@ def start_task_timer(task_id: int) -> bool:
 
 
 def pause_task_timer(task_id: int) -> bool:
-    """Pause a running task's timer, banking the elapsed segment."""
+    """Pause a running task's timer: banks the elapsed active segment,
+    starts the pause clock (paused_at), and bumps pause_count (feeds
+    get_pause_matrix / load_pause_matrix)."""
     try:
         db = get_database()
         task = db.get_task(task_id)
@@ -459,22 +512,36 @@ def pause_task_timer(task_id: int) -> bool:
             return False
         task_dict = dict(task)
         elapsed = get_task_elapsed_seconds(task_dict)
-        db.set_task_timer_segment(task_id, accumulated_seconds=elapsed, segment_started_at=None)
+        db.set_task_timer_state(
+            task_id, accumulated_seconds=elapsed, segment_started_at=None,
+            paused_at=_utc_now_str(),
+            total_paused_seconds=int(task_dict.get("timer_total_paused_seconds") or 0),
+        )
+        db.increment_task_pause_count(task_id)
+        load_pause_matrix.clear()
         return True
     except Exception:
         return False
 
 
 def resume_task_timer(task_id: int) -> bool:
-    """Resume a paused task's timer — starts a new active segment."""
+    """
+    Resume a paused task's timer: folds however long that pause just
+    lasted into timer_total_paused_seconds (so it's never lost), then
+    starts a new active segment.
+    """
     try:
         db = get_database()
         task = db.get_task(task_id)
         if task is None:
             return False
-        accumulated = int(task["timer_accumulated_seconds"] or 0)
-        db.set_task_timer_segment(
-            task_id, accumulated_seconds=accumulated, segment_started_at=_utc_now_str()
+        task_dict = dict(task)
+        # Finalise the pause that's ending right now.
+        total_paused = get_task_paused_seconds(task_dict)
+        accumulated = int(task_dict.get("timer_accumulated_seconds") or 0)
+        db.set_task_timer_state(
+            task_id, accumulated_seconds=accumulated, segment_started_at=_utc_now_str(),
+            paused_at=None, total_paused_seconds=total_paused,
         )
         return True
     except Exception:
@@ -490,7 +557,10 @@ def finish_task_with_timer(
     Mark a task completed/failed, using its real accumulated timer
     time (banked segments + whatever's still running) as actual_minutes
     instead of the naive (now - started_at) fallback — which would
-    incorrectly include any paused stretches.
+    incorrectly include any paused stretches. Also finalises an
+    in-progress pause (if the task happened to be paused, not running,
+    at the moment it's marked done), so timer_total_paused_seconds
+    always reflects the complete picture once a task is finished.
 
     Falls back to letting update_task_status compute actual_minutes
     the old way if the task was never started (no timer data at all).
@@ -502,12 +572,15 @@ def finish_task_with_timer(
         if task is not None:
             task_dict = dict(task)
             elapsed_seconds = get_task_elapsed_seconds(task_dict)
+            total_paused = get_task_paused_seconds(task_dict)
             if elapsed_seconds > 0:
                 actual_minutes = max(1, round(elapsed_seconds / 60))
-            # Freeze the segment either way, so a completed/failed task
-            # never shows a "still running" timer if re-read later.
-            db.set_task_timer_segment(
-                task_id, accumulated_seconds=elapsed_seconds, segment_started_at=None
+            # Freeze both the active segment and any open pause, so a
+            # completed/failed task never shows a "still running" or
+            # "still paused" timer if re-read later.
+            db.set_task_timer_state(
+                task_id, accumulated_seconds=elapsed_seconds, segment_started_at=None,
+                paused_at=None, total_paused_seconds=total_paused,
             )
         return update_task_status(
             task_id, status=status, failure_reason=failure_reason,
@@ -1584,3 +1657,4 @@ def get_stale_export_count(user_id: int = DEFAULT_USER_ID) -> int:
 def clear_all_caches() -> None:
     """Clear every st.cache_data store used across the app."""
     load_analytics_profile.clear()
+    load_pause_matrix.clear()
