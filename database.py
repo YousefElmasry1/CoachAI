@@ -17,6 +17,8 @@ from sqlalchemy import (
 from sqlalchemy.engine import Connection, CursorResult, Engine
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
+from timezone_utils import local_hour_from_utc_string
+
 
 # ---------------------------------------------------------------------------
 # Schema — dialect-agnostic table definitions
@@ -919,6 +921,28 @@ class Database:
             (email,),
         )
 
+    def update_user_timezone(self, user_id: int, timezone: str) -> None:
+        """
+        Update a user's stored IANA timezone name.
+
+        Intended to be called by the client (mobile app, or a web
+        settings page) whenever it has a real device/browser timezone
+        to report — e.g. once at login, or whenever the app detects the
+        device timezone changed (user travelled). Not validated against
+        the IANA database here; invalid values safely fall back to UTC
+        wherever they're consumed (see timezone_utils.safe_zoneinfo).
+
+        Args:
+            user_id: Whose timezone to update.
+            timezone: IANA timezone name (e.g. "Africa/Cairo",
+                "America/New_York").
+        """
+        self.execute(
+            "UPDATE users SET timezone = ? WHERE user_id = ?",
+            (timezone, user_id),
+        )
+        self.commit()
+
     # =====================================================================
     # PLANS
     # =====================================================================
@@ -1275,12 +1299,14 @@ class Database:
         self,
         user_id: int,
         since_date: str,
+        user_timezone: str = "UTC",
     ) -> list[dict]:
         """
         Build the Category x Time-of-day focus matrix: for every task
         this user started within the window, bucket it by the category
-        it belongs to and the hour-of-day it was FIRST started
-        (started_at), and sum pause_count within each bucket.
+        it belongs to and the LOCAL hour-of-day it was FIRST started
+        (started_at, converted from UTC to the user's timezone), and
+        sum pause_count within each bucket.
 
         This is the raw data behind "when/on what do you lose focus
         most" — e.g. a user who consistently pauses 'Study' tasks
@@ -1298,12 +1324,17 @@ class Database:
         Args:
             user_id: Whose tasks to analyze.
             since_date: ISO date string — only plans on/after this date.
+            user_timezone: IANA timezone name (e.g. "Africa/Cairo") used
+                to convert the stored UTC started_at into the hour the
+                user actually experienced. Defaults to "UTC" for users
+                who haven't had a real timezone captured yet.
 
         Returns:
             List of dicts: {category, time_bucket, task_count,
             paused_task_count, total_pauses, avg_pauses_per_task}.
             time_bucket is one of 'Morning' (5-12), 'Afternoon' (12-17),
-            'Evening' (17-21), 'Night' (21-5).
+            'Evening' (17-21), 'Night' (21-5), all in the user's local
+            time.
         """
         rows = self.fetch_all(
             """
@@ -1324,9 +1355,8 @@ class Database:
         )
 
         def _bucket(started_at_raw) -> str:
-            try:
-                hour = datetime.fromisoformat(str(started_at_raw)).hour
-            except (ValueError, TypeError):
+            hour = local_hour_from_utc_string(started_at_raw, user_timezone)
+            if hour is None:
                 return "Unknown"
             if 5 <= hour < 12:
                 return "Morning"

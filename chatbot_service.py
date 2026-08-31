@@ -15,6 +15,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
+import re
 from datetime import date, timedelta
 from typing import Any, Optional
 
@@ -92,6 +94,27 @@ If the user asks about something completely unrelated (politics, entertainment, 
 - Do NOT answer the unrelated question.
 - Politely redirect: "I'm CoachAI Assistant, and my main focus is helping you with productivity, planning, and performance. If you have a question about your tasks, schedule, or productivity, I'm here to help!"
 
+## Casual & General Questions
+
+Not every message needs the full data-retrieval-and-analysis treatment. Match your response to what's actually being asked:
+
+- **Small talk** (greetings, thanks, how-are-you, goodbyes): respond briefly and warmly. No tools, no fact/analysis/recommendation structure — a short natural reply is the whole answer.
+- **General, non-personal questions** (e.g. "what does burnout risk mean?", "what's a good way to prioritize tasks?", "how many hours of deep work is realistic?"): answer directly and concisely from general knowledge. If your answer could be mistaken for something personalized, clearly label it as general advice. Don't call tools unless the user is also asking about their own data.
+- **Personal data questions and what-if scenarios**: this is where the full grounded approach applies — call the relevant tools, then use the fact/analysis/recommendation structure from above.
+
+Only reach for the heavier structure when the question genuinely calls for it. A one-line answer to a one-line question is not a failure to be thorough — it's the right amount of help.
+
+### Examples
+
+User: "hey, what's up?"
+Assistant: "Hey! Doing well and ready to help — want me to check your tasks or progress for today?"
+
+User: "what does burnout risk mean?"
+Assistant: "Burnout risk is a general measure of whether your recent workload and completion patterns suggest you might be overextending yourself — things like consistently high planned time paired with low completion rates. (This is a general explanation, not your specific number — ask me to check your current burnout risk if you'd like that!)"
+
+User: "should I study for 2 more hours right now?"
+Assistant: [calls get_daily_analysis and get_productivity_by_hour, then answers using the fact/analysis/recommendation structure, grounded in what those tools returned]
+
 ## Personality
 
 - Friendly, supportive, and professional
@@ -106,6 +129,82 @@ You have access to tools that retrieve the user's actual CoachAI data. **Always 
 
 When multiple tools are relevant, call them all to get a comprehensive picture.
 """
+
+
+# ─────────────────────────────────────────────────────────────
+# Casual Message Shortcut (no API call at all)
+#
+# Bare greetings/thanks/farewells never need Gemini, tools, or the
+# fact/analysis/recommendation structure — matching them here and
+# replying instantly is both cheaper (no API round-trip) and more
+# naturally conversational than routing them through the full model.
+#
+# Deliberately conservative: every pattern anchors on the WHOLE
+# trimmed message (^...$), not a substring search, so a message that
+# merely starts with a greeting but goes on to ask something real
+# (e.g. "hey, what's my best category?") is never short-circuited —
+# only messages that are ENTIRELY a greeting/thanks/farewell are.
+# The system prompt's "Casual & General Questions" section is the
+# backstop for anything phrased slightly differently that slips past
+# these patterns (e.g. "hey, how's it going today?").
+# ─────────────────────────────────────────────────────────────
+
+_GREETING_PATTERN = re.compile(
+    r"^\s*(hi+|hello+|hey+|hiya|yo|sup|good\s*(morning|evening|afternoon)|"
+    r"مرحبا|اهلا|أهلا|السلام عليكم|هاي|هلا|ازيك|إزيك)\s*[!.,؟?]*\s*$",
+    re.IGNORECASE,
+)
+_THANKS_PATTERN = re.compile(
+    r"^\s*(thanks?( you)?( so much| a lot)?|thx|ty|"
+    r"شكرا|شكرًا|تسلم|متشكر|مشكور|الله يخليك)\s*[!.,؟?]*\s*$",
+    re.IGNORECASE,
+)
+_FAREWELL_PATTERN = re.compile(
+    r"^\s*(bye|goodbye|see\s*you|later|take\s*care|"
+    r"مع السلامة|باي|سلام)\s*[!.,؟?]*\s*$",
+    re.IGNORECASE,
+)
+
+_GREETING_REPLIES: list[str] = [
+    "Hey! How's your day going so far? Ask me anything about your tasks or productivity.",
+    "Hi there! Ready to dig into your schedule or progress whenever you are.",
+    "Hello! What would you like to know about your productivity today?",
+]
+_THANKS_REPLIES: list[str] = [
+    "You're welcome! Let me know if you want to dig into anything else.",
+    "Anytime! Happy to help with your planning.",
+    "Glad I could help. 🙂",
+]
+_FAREWELL_REPLIES: list[str] = [
+    "See you later — good luck with your tasks today!",
+    "Take care! I'll be here whenever you need me.",
+    "Bye for now — go get that to-do list done. 💪",
+]
+
+
+def _try_casual_shortcut(user_message: str) -> Optional[str]:
+    """
+    Return an instant, canned reply for a bare greeting/thanks/farewell,
+    or None if the message needs the real model (which is the case for
+    almost everything — this only ever matches whole, standalone
+    small-talk messages, never a question of any kind).
+
+    Args:
+        user_message: The raw message as typed by the user.
+
+    Returns:
+        A short friendly reply, or None to fall through to Gemini.
+    """
+    text = user_message.strip()
+    if not text:
+        return None
+    if _GREETING_PATTERN.match(text):
+        return random.choice(_GREETING_REPLIES)
+    if _THANKS_PATTERN.match(text):
+        return random.choice(_THANKS_REPLIES)
+    if _FAREWELL_PATTERN.match(text):
+        return random.choice(_FAREWELL_REPLIES)
+    return None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -765,12 +864,22 @@ class ChatbotService:
         Handles function calling automatically: if Gemini requests
         tool calls, executes them and sends results back until
         Gemini produces a final text response.
+
+        Bare small talk (a standalone greeting, thanks, or farewell —
+        see _try_casual_shortcut) is answered instantly without
+        touching Gemini at all, since it never needs tools or the
+        fact/analysis/recommendation structure the real model is
+        prompted to use for substantive questions.
         """
         if not user_message or not user_message.strip():
             return (
                 "It looks like you sent an empty message. "
                 "How can I help you with your productivity today?"
             )
+
+        casual_reply = _try_casual_shortcut(user_message)
+        if casual_reply is not None:
+            return casual_reply
 
         try:
             response = self._chat.send_message(user_message)
@@ -860,6 +969,9 @@ class ChatbotService:
         Function calls are handled with non-streaming (fast tool
         decisions). The final text response is streamed chunk-by-chunk
         so the user sees text appearing progressively.
+
+        Bare small talk is yielded instantly as a single chunk without
+        touching Gemini at all — see send_message's docstring for why.
         """
         from google.genai import types
 
@@ -868,6 +980,11 @@ class ChatbotService:
                 "It looks like you sent an empty message. "
                 "How can I help you with your productivity today?"
             )
+            return
+
+        casual_reply = _try_casual_shortcut(user_message)
+        if casual_reply is not None:
+            yield casual_reply
             return
 
         try:

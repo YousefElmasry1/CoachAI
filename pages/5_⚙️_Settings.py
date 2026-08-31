@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import streamlit as st
 
-from config import DEFAULT_ANALYTICS_WINDOW
+from config import DEFAULT_ANALYTICS_WINDOW, TIMEZONE_CHOICES
 from layout import page_setup, page_title
 from services import (
     get_current_user_id,
@@ -29,6 +29,8 @@ from services import (
     get_selected_calendars,
     sync_google_calendar,
     get_last_sync_time,
+    load_user,
+    set_user_timezone,
 )
 
 
@@ -59,6 +61,39 @@ with tabs[0]:
         st.session_state.dark_mode = new_dark_mode
         st.rerun()
     st.caption("Tip: this same toggle is always available in the sidebar.")
+
+    st.markdown("#### Timezone")
+    st.caption(
+        "Used to show the right time of day in your greeting and in "
+        "analytics like the Focus Pattern Matrix. Temporary manual "
+        "picker — the mobile app will set this automatically."
+    )
+    current_timezone = load_user(user_id=user_id).get("timezone", "UTC")
+    tz_labels = [label for label, _ in TIMEZONE_CHOICES]
+    tz_values = [value for _, value in TIMEZONE_CHOICES]
+    try:
+        current_index = tz_values.index(current_timezone)
+    except ValueError:
+        # User's stored timezone isn't in the curated shortlist (e.g. an
+        # IANA name set directly in the DB) — show it as a trailing
+        # extra option instead of silently overwriting it on save.
+        tz_labels = tz_labels + [current_timezone]
+        tz_values = tz_values + [current_timezone]
+        current_index = len(tz_values) - 1
+
+    chosen_label = st.selectbox(
+        "Your timezone",
+        options=tz_labels,
+        index=current_index,
+        key="timezone_settings_select",
+    )
+    chosen_timezone = tz_values[tz_labels.index(chosen_label)]
+
+    if chosen_timezone != current_timezone:
+        if st.button("💾 Save Timezone", type="primary"):
+            set_user_timezone(user_id, chosen_timezone)
+            st.toast(f"Timezone set to {chosen_label}.", icon="🌍")
+            st.rerun()
 
 
 # ═════════════════════════════════════════════════════════════

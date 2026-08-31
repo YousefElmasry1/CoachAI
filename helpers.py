@@ -1,330 +1,421 @@
 """
-CoachAI – Helper Utilities
-============================
+CoachAI – Main Application & Dashboard
+========================================
 
-Pure formatting and display helper functions.
-No backend imports — this module is dependency-free.
+The primary entry point for the Streamlit application.
+This file renders the 🏠 Dashboard (home page) and configures
+multipage navigation.
 """
 
 from __future__ import annotations
 
-import hashlib
-import random
-from datetime import date, datetime
-from typing import Any, Optional
+import streamlit as st
+
+from layout import page_setup
+
+# ─────────────────────────────────────────────────────────────
+# Page Setup (MUST happen before any other Streamlit call) —
+# handles set_page_config, session-state defaults, theme, sidebar.
+# ─────────────────────────────────────────────────────────────
+
+page_setup(title="Dashboard", icon="🏠")
+
+# ─────────────────────────────────────────────────────────────
+# Imports
+# ─────────────────────────────────────────────────────────────
 
 from config import (
-    BURNOUT_COLORS,
-    BURNOUT_LABELS,
-    BURNOUT_THRESHOLDS,
-    CONFIDENCE_COLORS,
-    FAILURE_REASONS,
-    MOTIVATIONAL_QUOTES,
+    CHART_COLORS,
     PRIORITY_COLORS,
-    PRIORITY_ICONS,
-    PRIORITY_LABELS,
-    STATUS_COLORS,
-    STATUS_ICONS,
-    STATUS_LABELS,
-    TREND_COLORS,
-    TREND_ICONS,
 )
+from helpers import (
+    badge_html,
+    confidence_badge_html,
+    format_date_long,
+    format_duration,
+    format_percentage,
+    format_score,
+    format_time_12h,
+    get_burnout_color,
+    get_burnout_label,
+    get_daily_quote,
+    get_greeting,
+    get_priority_icon,
+    get_status_icon,
+    get_today_display,
+    get_trend_color,
+    get_trend_icon,
+    kpi_card_html,
+    progress_bar_html,
+    status_badge_html,
+)
+from services import (
+    get_current_user_id,
+    get_database_status,
+    get_system_info,
+    load_analytics_profile,
+    load_today_plan,
+    load_today_tasks,
+    load_user,
+)
+from charts import create_gauge
 
 
 # ─────────────────────────────────────────────────────────────
-# Time & Date Formatting
+# Dashboard Content
 # ─────────────────────────────────────────────────────────────
 
-def format_time_12h(time_str: Optional[str]) -> str:
-    """Convert 'HH:MM' to '8:00 AM' format."""
-    if not time_str:
-        return "—"
-    try:
-        parts = str(time_str).split(":")
-        h, m = int(parts[0]), int(parts[1])
-        period = "AM" if h < 12 else "PM"
-        display_h = h % 12 or 12
-        return f"{display_h}:{m:02d} {period}"
-    except (ValueError, IndexError):
-        return str(time_str)
+def render_dashboard() -> None:
+    """Render the main executive dashboard."""
 
+    # ── Load Data ────────────────────────────────────────
+    user_id = get_current_user_id()
+    with st.spinner(""):
+        user = load_user(user_id=user_id)
+        plan = load_today_plan(user_id=user_id)
+        tasks = load_today_tasks(user_id=user_id)
+        profile = load_analytics_profile(
+            user_id=user_id,
+            window_days=st.session_state.analytics_window,
+        )
 
-def format_time_24h(time_str: Optional[str]) -> str:
-    """Normalise time to HH:MM."""
-    if not time_str:
-        return "—"
-    try:
-        parts = str(time_str).split(":")
-        return f"{int(parts[0]):02d}:{int(parts[1]):02d}"
-    except (ValueError, IndexError):
-        return str(time_str)
+    user_name = st.session_state.get("user_display_name") or user.get("display_name", "there")
+    user_timezone = user.get("timezone")
 
-
-def format_duration(minutes: Optional[int]) -> str:
-    """Convert minutes to human-readable duration: 90 → '1h 30m'."""
-    if minutes is None or minutes <= 0:
-        return "—"
-    hours = minutes // 60
-    mins = minutes % 60
-    if hours and mins:
-        return f"{hours}h {mins}m"
-    if hours:
-        return f"{hours}h"
-    return f"{mins}m"
-
-
-def format_date_long(date_str: Optional[str]) -> str:
-    """Convert ISO date to 'July 25, 2026'."""
-    if not date_str:
-        return "—"
-    try:
-        d = date.fromisoformat(str(date_str))
-        return d.strftime("%B %d, %Y")
-    except (ValueError, TypeError):
-        return str(date_str)
-
-
-def format_date_short(date_str: Optional[str]) -> str:
-    """Convert ISO date to 'Jul 25'."""
-    if not date_str:
-        return "—"
-    try:
-        d = date.fromisoformat(str(date_str))
-        return d.strftime("%b %d")
-    except (ValueError, TypeError):
-        return str(date_str)
-
-
-def format_date_relative(date_str: Optional[str]) -> str:
-    """Convert ISO date to 'Today', 'Yesterday', '3 days ago', etc."""
-    if not date_str:
-        return "—"
-    try:
-        d = date.fromisoformat(str(date_str))
-        diff = (date.today() - d).days
-        if diff == 0:
-            return "Today"
-        if diff == 1:
-            return "Yesterday"
-        if diff < 7:
-            return f"{diff} days ago"
-        if diff < 30:
-            weeks = diff // 7
-            return f"{weeks} week{'s' if weeks > 1 else ''} ago"
-        return d.strftime("%b %d")
-    except (ValueError, TypeError):
-        return str(date_str)
-
-
-def format_percentage(value: Optional[float], decimals: int = 0) -> str:
-    """Convert 0.75 → '75%'."""
-    if value is None:
-        return "—"
-    return f"{value * 100:.{decimals}f}%"
-
-
-def format_score(value: Optional[float], max_val: float = 100.0) -> str:
-    """Format a score like 72.5 → '72.5'."""
-    if value is None:
-        return "—"
-    return f"{value:.1f}"
-
-
-# ─────────────────────────────────────────────────────────────
-# Priority & Status Helpers
-# ─────────────────────────────────────────────────────────────
-
-def get_priority_label(priority: int) -> str:
-    """Get human label for priority level."""
-    return PRIORITY_LABELS.get(priority, f"P{priority}")
-
-
-def get_priority_color(priority: int) -> str:
-    """Get hex color for priority level."""
-    return PRIORITY_COLORS.get(priority, "#6b7280")
-
-
-def get_priority_icon(priority: int) -> str:
-    """Get emoji icon for priority level."""
-    return PRIORITY_ICONS.get(priority, "⚪")
-
-
-def get_status_label(status: str) -> str:
-    """Get display label for task status."""
-    return STATUS_LABELS.get(status, status.replace("_", " ").title())
-
-
-def get_status_color(status: str) -> str:
-    """Get hex color for task status."""
-    return STATUS_COLORS.get(status, "#6b7280")
-
-
-def get_status_icon(status: str) -> str:
-    """Get emoji icon for task status."""
-    return STATUS_ICONS.get(status, "•")
-
-
-# ─────────────────────────────────────────────────────────────
-# Trend, Confidence, Burnout
-# ─────────────────────────────────────────────────────────────
-
-def get_trend_icon(direction: str) -> str:
-    """Get emoji for trend direction."""
-    return TREND_ICONS.get(direction, "➡️")
-
-
-def get_trend_color(direction: str) -> str:
-    """Get hex color for trend direction."""
-    return TREND_COLORS.get(direction, "#6b7280")
-
-
-def get_confidence_color(level: str) -> str:
-    """Get hex color for confidence level."""
-    return CONFIDENCE_COLORS.get(level, "#6b7280")
-
-
-def get_burnout_level(risk: float) -> str:
-    """Map burnout risk score (0–100) to severity key."""
-    for level, (low, high) in BURNOUT_THRESHOLDS.items():
-        if low <= risk < high:
-            return level
-    return "critical"
-
-
-def get_burnout_label(risk: float) -> str:
-    """Get display label for burnout risk level."""
-    return BURNOUT_LABELS.get(get_burnout_level(risk), "Unknown")
-
-
-def get_burnout_color(risk: float) -> str:
-    """Get hex color for burnout risk level."""
-    return BURNOUT_COLORS.get(get_burnout_level(risk), "#ef4444")
-
-
-# ─────────────────────────────────────────────────────────────
-# HTML Builders
-# ─────────────────────────────────────────────────────────────
-
-def badge_html(text: str, variant: str = "muted") -> str:
-    """Return a styled badge HTML span."""
-    return f'<span class="badge badge-{variant}">{text}</span>'
-
-
-def status_badge_html(status: str) -> str:
-    """Return a badge colored by task status."""
-    variant_map = {
-        "completed": "success",
-        "failed": "danger",
-        "in_progress": "info",
-        "pending": "muted",
-    }
-    variant = variant_map.get(status, "muted")
-    icon = get_status_icon(status)
-    label = get_status_label(status)
-    return f'<span class="badge badge-{variant}">{icon} {label}</span>'
-
-
-def priority_badge_html(priority: int) -> str:
-    """Return a badge colored by priority level."""
-    color = get_priority_color(priority)
-    label = get_priority_label(priority)
-    return (
-        f'<span class="badge" style="background: {color}20; color: {color};">'
-        f'{get_priority_icon(priority)} {label}</span>'
+    # ── Hero Header ──────────────────────────────────────
+    st.markdown(
+        f"""
+        <div class="hero-gradient animate-in">
+            <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:1rem;">
+                <div>
+                    <p style="font-size:0.85rem; opacity:0.8; margin-bottom:0.3rem;">
+                        📅 {get_today_display(user_timezone)}
+                    </p>
+                    <h1>{get_greeting(user_timezone)}, {user_name}</h1>
+                    <p>Here's your productivity overview for today.</p>
+                </div>
+                <div style="text-align:right;">
+                    <div style="font-size:2.5rem; font-weight:800; line-height:1;">
+                        {format_score(profile.productivity.score)}
+                    </div>
+                    <div style="font-size:0.82rem; opacity:0.8;">Productivity Score</div>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
+    # ── Smart Banners ────────────────────────────────────
+    _render_smart_banners(profile, tasks)
 
-def confidence_badge_html(level: str) -> str:
-    """Return a badge colored by confidence level."""
-    color = get_confidence_color(level)
-    return (
-        f'<span class="badge" style="background: {color}18; color: {color};">'
-        f'{level.title()} Confidence</span>'
-    )
+    # ── KPI Row 1: Core Metrics ──────────────────────────
+    cols = st.columns(4)
+    with cols[0]:
+        st.markdown(
+            kpi_card_html(
+                label="Completion Rate",
+                value=format_percentage(profile.completion_rate),
+                subtitle=f"{profile.total_completed}/{profile.total_tasks} tasks",
+                accent="green",
+                icon="✅",
+            ),
+            unsafe_allow_html=True,
+        )
+    with cols[1]:
+        st.markdown(
+            kpi_card_html(
+                label="Failure Rate",
+                value=format_percentage(profile.failure_rate),
+                subtitle=f"{profile.total_failed} failed",
+                accent="red",
+                icon="❌",
+            ),
+            unsafe_allow_html=True,
+        )
+    with cols[2]:
+        st.markdown(
+            kpi_card_html(
+                label="Planning Accuracy",
+                value=format_percentage(profile.planning.planning_accuracy),
+                subtitle=f"Bias: {profile.planning.bias_direction}",
+                accent="blue",
+                icon="🎯",
+            ),
+            unsafe_allow_html=True,
+        )
+    with cols[3]:
+        st.markdown(
+            kpi_card_html(
+                label="Consistency",
+                value=format_percentage(profile.consistency.consistency_score),
+                subtitle=f"{profile.consistency.active_days} active days",
+                accent="purple",
+                icon="📊",
+            ),
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("<div style='height:1rem;'></div>", unsafe_allow_html=True)
+
+    # ── KPI Row 2: Streaks & Risk ────────────────────────
+    cols2 = st.columns(4)
+    with cols2[0]:
+        st.markdown(
+            kpi_card_html(
+                label="Current Streak",
+                value=f"{profile.consistency.current_streak}",
+                subtitle="consecutive days",
+                accent="orange",
+                icon="🔥",
+            ),
+            unsafe_allow_html=True,
+        )
+    with cols2[1]:
+        st.markdown(
+            kpi_card_html(
+                label="Longest Streak",
+                value=f"{profile.consistency.longest_streak}",
+                subtitle="personal best",
+                accent="teal",
+                icon="🏆",
+            ),
+            unsafe_allow_html=True,
+        )
+    with cols2[2]:
+        burnout_color_name = "green"
+        if profile.burnout.burnout_risk > 55:
+            burnout_color_name = "red"
+        elif profile.burnout.burnout_risk > 30:
+            burnout_color_name = "orange"
+        st.markdown(
+            kpi_card_html(
+                label="Burnout Risk",
+                value=f"{profile.burnout.burnout_risk:.0f}%",
+                subtitle=get_burnout_label(profile.burnout.burnout_risk),
+                accent=burnout_color_name,
+                icon="🛡️",
+            ),
+            unsafe_allow_html=True,
+        )
+    with cols2[3]:
+        best_hour_text = f"{profile.best_hour.best_hour}:00" if profile.best_hour.best_hour is not None else "—"
+        st.markdown(
+            kpi_card_html(
+                label="Best Hour",
+                value=best_hour_text,
+                subtitle=(
+                    f"{format_percentage(profile.best_hour.completion_rate_at_best)} completion"
+                    if profile.best_hour.best_hour is not None
+                    else "Insufficient data"
+                ),
+                accent="pink",
+                icon="⏰",
+            ),
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("<div style='height:1.5rem;'></div>", unsafe_allow_html=True)
+
+    # ── Main Content: Two Columns ────────────────────────
+    left_col, right_col = st.columns([3, 2])
+
+    with left_col:
+        # Productivity Score Gauge
+        st.markdown("#### Productivity Overview")
+        gauge_fig = create_gauge(
+            value=profile.productivity.score,
+            title="Overall Score",
+            max_val=100,
+            height=220,
+        )
+        st.plotly_chart(gauge_fig, use_container_width=True, key="dash_gauge")
+
+        # Trend & Confidence Row
+        trend_cols = st.columns(3)
+        with trend_cols[0]:
+            trend_dir = profile.trend.trend_direction
+            st.metric(
+                label="Trend",
+                value=f"{get_trend_icon(trend_dir)} {trend_dir.title()}",
+                delta=f"Score: {profile.trend.trend_score:.2f}",
+            )
+        with trend_cols[1]:
+            st.metric(
+                label="Confidence",
+                value=profile.overall_confidence.level.title(),
+                delta=f"Sample: {profile.sample_size}",
+            )
+        with trend_cols[2]:
+            st.metric(
+                label="Analysis Window",
+                value=f"{profile.window_days} days",
+                delta=f"{profile.consistency.total_observation_days} observed",
+            )
+
+        # Today's Schedule Mini
+        st.markdown("#### Today's Schedule")
+        if tasks:
+            for task in tasks[:6]:  # Show first 6 tasks
+                priority = task.get("priority", 3)
+                status = task.get("status", "pending")
+                p_color = PRIORITY_COLORS.get(priority, "#6b7280")
+                start = format_time_12h(task.get("scheduled_start"))
+                end = format_time_12h(task.get("scheduled_end"))
+                duration = format_duration(task.get("estimated_minutes"))
+                s_icon = get_status_icon(status)
+
+                st.markdown(
+                    f"""
+                    <div class="task-card">
+                        <div class="priority-dot" style="background:{p_color};"></div>
+                        <div class="task-info">
+                            <div class="task-title">{s_icon} {task.get('title', 'Untitled')}</div>
+                            <div class="task-meta">
+                                <span>{get_priority_icon(priority)} {priority}</span>
+                                <span>⏱️ {duration}</span>
+                            </div>
+                        </div>
+                        <div class="task-time">{start} – {end}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+            if len(tasks) > 6:
+                st.caption(f"+ {len(tasks) - 6} more tasks — see Schedule page")
+        else:
+            st.info("📋 No plan for today. Create a plan to get started!")
+
+    with right_col:
+        # Quick Insights
+        st.markdown("#### Quick Insights")
+
+        insights = profile.insights.insights
+        if insights:
+            for insight in insights[:3]:
+                st.markdown(
+                    f"""
+                    <div class="insight-card">
+                        <p>💡 {insight.observation}</p>
+                        <p class="evidence">{insight.evidence}</p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.caption("Insights will appear as you complete more tasks.")
+
+        # Quick Patterns
+        patterns = profile.patterns.patterns
+        if patterns:
+            st.markdown("#### Detected Patterns")
+            for pattern in patterns[:3]:
+                conf = pattern.confidence
+                st.markdown(
+                    f"""
+                    <div class="coach-card">
+                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+                            <strong style="color:var(--text-primary); font-size:0.88rem;">
+                                🔍 {pattern.pattern_name}
+                            </strong>
+                            {confidence_badge_html(conf)}
+                        </div>
+                        <p style="color:var(--text-secondary); font-size:0.83rem; margin:0;">
+                            {pattern.observation}
+                        </p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+        # Motivational Quote
+        st.markdown("#### Daily Motivation")
+        quote = get_daily_quote()
+        st.markdown(
+            f"""
+            <div class="quote-card">
+                <div class="quote-text">"{quote['text']}"</div>
+                <div class="quote-author">— {quote['author']}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # System Status Footer
+        st.markdown("#### System Status")
+        sys_info = get_system_info()
+        db_st = get_database_status()
+
+        status_items = [
+            ("Database", "🟢 Online" if db_st["connected"] else "🔴 Offline"),
+            ("AI Model", sys_info.get("ai_model", "—")),
+            ("Analytics", f"v{sys_info.get('analytics_version', '?')}"),
+            ("Profile", f"v{sys_info.get('profile_version', '?')}"),
+            ("Plan Today", "✅ Active" if plan else "❌ No Plan"),
+        ]
+
+        for label, value in status_items:
+            st.markdown(
+                f"""
+                <div style="display:flex; justify-content:space-between; padding:6px 0;
+                            border-bottom: 1px solid var(--border); font-size:0.82rem;">
+                    <span style="color:var(--text-secondary);">{label}</span>
+                    <span style="color:var(--text-primary); font-weight:500;">{value}</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
 
-def kpi_card_html(
-    label: str,
-    value: str,
-    subtitle: str = "",
-    accent: str = "purple",
-    icon: str = "",
-) -> str:
-    """Render a premium KPI card as raw HTML."""
-    icon_html = f'<span style="font-size:1.4rem;margin-right:4px;">{icon}</span>' if icon else ""
-    subtitle_html = f'<div class="kpi-subtitle">{subtitle}</div>' if subtitle else ""
-    return f"""
-    <div class="kpi-card kpi-accent-{accent}">
-        <div class="kpi-label">{icon_html}{label}</div>
-        <div class="kpi-value">{value}</div>
-        {subtitle_html}
-    </div>
-    """
+def _render_smart_banners(profile, tasks: list) -> None:
+    """Render contextual smart banners based on current state."""
 
+    # Burnout Warning
+    if profile.burnout.burnout_risk > 60:
+        st.warning(
+            f"🛡️ **Burnout Risk is {get_burnout_label(profile.burnout.burnout_risk)}** "
+            f"({profile.burnout.burnout_risk:.0f}/100). "
+            "Consider reducing your schedule density and taking more breaks.",
+            icon="⚠️",
+        )
 
-def progress_bar_html(value: float, color: str = "#6c63ff", height: int = 8) -> str:
-    """Render a custom progress bar (value 0.0–1.0)."""
-    pct = max(0.0, min(1.0, value)) * 100
-    return f"""
-    <div class="custom-progress" style="height:{height}px;">
-        <div class="bar" style="width:{pct:.1f}%;background:{color};"></div>
-    </div>
-    """
+    # Excellent Productivity
+    if profile.productivity.score >= 80:
+        st.success(
+            f"🎉 **Outstanding productivity!** Your score of {profile.productivity.score:.1f}/100 "
+            "is excellent. Keep up the great work!",
+            icon="🌟",
+        )
+
+    # Streak Celebration
+    if profile.consistency.current_streak >= 5:
+        st.success(
+            f"🔥 **{profile.consistency.current_streak}-day streak!** "
+            "You're building a strong habit of consistency.",
+            icon="🔥",
+        )
+
+    # Low Confidence Warning
+    if profile.overall_confidence.level in ("insufficient", "low"):
+        st.info(
+            f"📊 **Analytics confidence is {profile.overall_confidence.level}**. "
+            f"Only {profile.sample_size} tasks analyzed over {profile.overall_confidence.observation_days} days. "
+            "Keep completing tasks to improve accuracy.",
+            icon="ℹ️",
+        )
+
+    # No Tasks Today
+    if not tasks:
+        st.info(
+            "📋 **No plan for today.** Create a daily plan to unlock scheduling, "
+            "analytics, and AI coaching.",
+            icon="💡",
+        )
 
 
 # ─────────────────────────────────────────────────────────────
-# Data Conversion
+# Run
 # ─────────────────────────────────────────────────────────────
 
-def row_to_dict(row: Any) -> dict:
-    """Convert a sqlite3.Row (or dict-like object) to a plain dict."""
-    if row is None:
-        return {}
-    if isinstance(row, dict):
-        return row
-    try:
-        return dict(row)
-    except (TypeError, ValueError):
-        return {}
-
-
-def rows_to_dicts(rows: list) -> list[dict]:
-    """Convert a list of sqlite3.Row objects to list of dicts."""
-    return [row_to_dict(r) for r in rows]
-
-
-def safe_divide(numerator: float, denominator: float, default: float = 0.0) -> float:
-    """Safe division with zero guard."""
-    if denominator == 0:
-        return default
-    return numerator / denominator
-
-
-# ─────────────────────────────────────────────────────────────
-# Motivational Quotes
-# ─────────────────────────────────────────────────────────────
-
-def get_daily_quote() -> dict[str, str]:
-    """Get a deterministic daily quote (same quote all day)."""
-    today_seed = hashlib.md5(date.today().isoformat().encode()).hexdigest()
-    idx = int(today_seed, 16) % len(MOTIVATIONAL_QUOTES)
-    return MOTIVATIONAL_QUOTES[idx]
-
-
-# ─────────────────────────────────────────────────────────────
-# Greeting
-# ─────────────────────────────────────────────────────────────
-
-def get_greeting() -> str:
-    """Get a time-appropriate greeting."""
-    hour = datetime.now().hour
-    if hour < 12:
-        return "Good Morning"
-    if hour < 17:
-        return "Good Afternoon"
-    return "Good Evening"
-
-
-def get_today_display() -> str:
-    """Get today's date formatted nicely."""
-    return datetime.now().strftime("%A, %B %d, %Y")
+render_dashboard()

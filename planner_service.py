@@ -28,7 +28,6 @@ from planner import PlannerEngine, DayPlanOutput, TaskOutput
 from database import Database
 from config import CHART_COLORS
 
-
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -42,7 +41,6 @@ _DEFAULT_CATEGORY_COLOR: str = CHART_COLORS[0]
 # ---------------------------------------------------------------------------
 
 class PlannerService:
-
     def __init__(self, db: Database) -> None:
         """
         Initialise the service with a database connection.
@@ -175,6 +173,31 @@ class PlannerService:
         return category_id
 
     @staticmethod
+    def _is_break_task(task: TaskOutput) -> bool:
+        """
+        Detect whether a drafted task represents a break, so it can be
+        flagged is_break=True and get the dedicated Start/countdown UI
+        (see render_break_card in 2___Todays_Schedule.py) instead of
+        being treated as an ordinary task with Complete/Fail actions.
+
+        The Planner's system prompt (rules 9 and 10 in planner.py)
+        instructs the AI to ALWAYS use category_name 'Break' — with or
+        without a concrete clock time — for anything the user describes
+        as a break, rest, lunch, or meal period. That's the one reliable
+        signal available here; matching on the task's title instead
+        would miss AI-generated breaks with a different wording, and
+        break case-insensitively/whitespace-insensitively since the AI
+        won't always capitalise it exactly the same way twice.
+
+        Args:
+            task: A drafted TaskOutput from the Planner.
+
+        Returns:
+            True if this task should be persisted as a break.
+        """
+        return (task.category_name or "").strip().lower() == "break"
+
+    @staticmethod
     def _compute_fixed_end(fixed_start: str, estimated_minutes: int) -> Optional[str]:
         """
         Compute a fixed task's end time from its start time and duration.
@@ -191,7 +214,6 @@ class PlannerService:
             start_dt = datetime(2000, 1, 1, hour, minute)
         except (ValueError, AttributeError):
             return None
-
         end_dt = start_dt + timedelta(minutes=max(estimated_minutes, 0))
         return end_dt.strftime("%H:%M")
 
@@ -234,8 +256,8 @@ class PlannerService:
             raise ValueError("raw_input cannot be empty.")
 
         category_lookup = self._load_existing_categories(user_id)
-
         engine = self._get_engine()
+
         return engine.plan_day(
             raw_input=cleaned_input,
             existing_categories=[
@@ -268,7 +290,7 @@ class PlannerService:
                 - planning_notes: str (the AI's brief interpretation note)
                 - tasks: list of dicts, each with task_id, title,
                   category_name, is_new_category, needs_review,
-                  review_reason, is_fixed_time.
+                  review_reason, is_fixed_time, is_break.
         """
         cleaned_input = raw_input.strip()
 
@@ -285,6 +307,7 @@ class PlannerService:
         saved_tasks: list[dict[str, Any]] = []
         for offset, task in enumerate(plan_output.tasks):
             category_id = self._resolve_category_id(task, category_lookup, user_id)
+            is_break = self._is_break_task(task)
 
             scheduled_start: Optional[str] = None
             scheduled_end: Optional[str] = None
@@ -305,6 +328,7 @@ class PlannerService:
                 scheduled_end=scheduled_end,
                 order_index=existing_task_count + offset,
                 is_fixed_time=task.is_fixed_time,
+                is_break=is_break,
             )
 
             saved_tasks.append({
@@ -315,6 +339,7 @@ class PlannerService:
                 "needs_review": task.needs_review,
                 "review_reason": task.review_reason,
                 "is_fixed_time": task.is_fixed_time,
+                "is_break": is_break,
             })
 
         return {
@@ -350,4 +375,4 @@ class PlannerService:
         plan_output = self.draft_plan(raw_input=raw_input, user_id=user_id)
         return self.save_plan(
             plan_output=plan_output, raw_input=raw_input, user_id=user_id,
-        )
+        ) 

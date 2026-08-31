@@ -270,3 +270,33 @@ GOOGLE_CALENDAR_SCOPES: list[str] = [
 ]
 GOOGLE_CALENDAR_SYNC_INTERVAL_MINUTES: int = 15
 GOOGLE_CALENDAR_EVENT_COLOR: str = "#4285F4"  # Google Blue (fallback)
+# ─────────────────────────────────────────────────────────────
+# Timezones (manual selector — temporary, until the mobile app
+# sends the device's real IANA timezone automatically)
+# ─────────────────────────────────────────────────────────────
+
+# A curated shortlist rather than the full ~600-zone IANA database,
+# for a usable dropdown. (city, IANA name) pairs, roughly ordered by
+# UTC offset west-to-east. Extend freely — any valid IANA name works,
+# this list only affects what's easy to pick from Settings.
+TIMEZONE_CHOICES: list[tuple[str, str]] = [
+    ("UTC", "UTC"),
+    ("Los Angeles (USA)", "America/Los_Angeles"),
+    ("Denver (USA)", "America/Denver"),
+    ("Chicago (USA)", "America/Chicago"),
+    ("New York (USA)", "America/New_York"),
+    ("São Paulo (Brazil)", "America/Sao_Paulo"),
+    ("London (UK)", "Europe/London"),
+    ("Paris (France)", "Europe/Paris"),
+    ("Cairo (Egypt)", "Africa/Cairo"),
+    ("Riyadh (Saudi Arabia)", "Asia/Riyadh"),
+    ("Dubai (UAE)", "Asia/Dubai"),
+    ("Karachi (Pakistan)", "Asia/Karachi"),
+    ("Delhi (India)", "Asia/Kolkata"),
+    ("Dhaka (Bangladesh)", "Asia/Dhaka"),
+    ("Bangkok (Thailand)", "Asia/Bangkok"),
+    ("Singapore", "Asia/Singapore"),
+    ("Shanghai (China)", "Asia/Shanghai"),
+    ("Tokyo (Japan)", "Asia/Tokyo"),
+    ("Sydney (Australia)", "Australia/Sydney"),
+]

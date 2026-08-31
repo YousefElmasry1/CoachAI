@@ -307,7 +307,13 @@ def load_pause_matrix(
     """
     db = get_database()
     since = date.today() - timedelta(days=window_days)
-    return db.get_pause_matrix(user_id=user_id, since_date=since.isoformat())
+    user_row = db.get_user(user_id)
+    user_timezone = user_row["timezone"] if user_row is not None else "UTC"
+    return db.get_pause_matrix(
+        user_id=user_id,
+        since_date=since.isoformat(),
+        user_timezone=user_timezone,
+    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -321,6 +327,20 @@ def load_user(user_id: int = DEFAULT_USER_ID) -> dict:
     if row is None:
         return {}
     return dict(row)
+
+
+def set_user_timezone(user_id: int, timezone: str) -> None:
+    """
+    Update the user's stored IANA timezone (e.g. from a manual Settings
+    dropdown, or later from the mobile app's device timezone).
+
+    Clears load_pause_matrix's cache so the Focus Pattern Matrix
+    reflects the new timezone on the very next view, instead of
+    waiting out its 5-minute TTL.
+    """
+    db = get_database()
+    db.update_user_timezone(user_id, timezone)
+    load_pause_matrix.clear()
 
 
 def load_user_profile(user_id: int = DEFAULT_USER_ID) -> dict:
