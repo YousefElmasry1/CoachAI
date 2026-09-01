@@ -6,12 +6,11 @@
 PRAGMA foreign_keys = ON;
 
 -- ==========================================================
--- 1. USERS
+-- 1. USERS  (Firebase Auth handles identity — user_id is the Firebase uid)
 -- ==========================================================
 CREATE TABLE users (
-    user_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT PRIMARY KEY,
     email TEXT NOT NULL UNIQUE,
-    password_hash TEXT NOT NULL,
     display_name TEXT NOT NULL,
     timezone TEXT NOT NULL DEFAULT 'UTC',
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -22,7 +21,7 @@ CREATE TABLE users (
 -- ==========================================================
 CREATE TABLE categories (
     category_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
+    user_id TEXT NOT NULL,
     name TEXT NOT NULL,
     color TEXT NOT NULL DEFAULT '#3B82F6',
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -36,7 +35,7 @@ CREATE TABLE categories (
 -- ==========================================================
 CREATE TABLE plans (
     plan_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
+    user_id TEXT NOT NULL,
     plan_date DATE NOT NULL,
     raw_input TEXT NOT NULL,
     ai_summary TEXT,
@@ -100,7 +99,7 @@ CREATE TABLE tasks (
 -- ==========================================================
 CREATE TABLE user_profiles (
     profile_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL UNIQUE,
+    user_id TEXT NOT NULL UNIQUE,
     completion_rate REAL NOT NULL DEFAULT 0.0 
         CHECK (completion_rate BETWEEN 0 AND 1),
     productivity_score REAL NOT NULL DEFAULT 0.0 
@@ -146,7 +145,7 @@ CREATE TABLE badges (
 -- ==========================================================
 CREATE TABLE user_badges (
     user_badge_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
+    user_id TEXT NOT NULL,
     badge_id INTEGER NOT NULL,
     earned_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     
@@ -160,7 +159,7 @@ CREATE TABLE user_badges (
 -- ==========================================================
 CREATE TABLE IF NOT EXISTS google_oauth_tokens (
     token_id      INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id       INTEGER NOT NULL UNIQUE,
+    user_id       TEXT NOT NULL UNIQUE,
     access_token  TEXT NOT NULL,
     refresh_token TEXT NOT NULL,
     token_expiry  DATETIME NOT NULL,
@@ -175,7 +174,7 @@ CREATE TABLE IF NOT EXISTS google_oauth_tokens (
 -- ==========================================================
 CREATE TABLE IF NOT EXISTS google_selected_calendars (
     selection_id  INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id       INTEGER NOT NULL,
+    user_id       TEXT NOT NULL,
     calendar_id   TEXT NOT NULL,
     calendar_name TEXT NOT NULL DEFAULT '',
     color         TEXT NOT NULL DEFAULT '#4285F4',
@@ -190,7 +189,7 @@ CREATE TABLE IF NOT EXISTS google_selected_calendars (
 -- ==========================================================
 CREATE TABLE IF NOT EXISTS google_calendar_events (
     event_id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id         INTEGER NOT NULL,
+    user_id         TEXT NOT NULL,
     google_event_id TEXT NOT NULL,
     title           TEXT NOT NULL DEFAULT '',
     start_time      TIME NOT NULL,

@@ -181,7 +181,13 @@ _PLANNER_SYSTEM_PROMPT: str = (
     "NOT create tasks for calendar events — they are not tasks. Plan the "
     "user's requested tasks around these commitments using the available "
     "windows. If available time is limited by calendar commitments, note "
-    "it in planning_notes."
+    "it in planning_notes.\n"
+    "12. Language: write ai_summary and planning_notes in the SAME "
+    "language as the user's raw_input. If raw_input is in Arabic, write "
+    "them in Arabic — do not mix in English words or terms. category_name "
+    "should also match the user's language for any NEW category you "
+    "propose (rule 2), unless it exactly matches an existing category "
+    "name already in the user's list."
 )
 
 _PLANNER_USER_PROMPT: str = (

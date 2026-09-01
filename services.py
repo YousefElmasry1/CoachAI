@@ -32,126 +32,16 @@ _local = threading.local()
 
 
 # ─────────────────────────────────────────────────────────────
-# Per-Session Identity (lightweight guest accounts — no real auth)
+# Identity
+#
+# NOTE: Local guest accounts and email/password auth (get_current_user_id,
+# create_guest_user, sign_up, log_in, and the PBKDF2 hashing helpers)
+# have been removed. Firebase Auth now owns identity — the Android app
+# authenticates with Firebase and sends the resulting ID token with
+# every API request. The future FastAPI layer verifies that token
+# (Firebase Admin SDK) and calls Database.get_or_create_user() with the
+# resulting uid; nothing in this Streamlit-era file replaces that flow.
 # ─────────────────────────────────────────────────────────────
-
-def get_current_user_id() -> int:
-    """
-    Return the user_id for the current browser session.
-
-    Every visitor gets their own guest row in `users` (created by
-    create_guest_user() once they answer the name prompt), so their
-    plans/tasks/categories/analytics never mix with anyone else's.
-    Falls back to DEFAULT_USER_ID if that hasn't happened yet (e.g.
-    the key is missing, or present but still None).
-    """
-    user_id = st.session_state.get("user_id")
-    return user_id if user_id is not None else DEFAULT_USER_ID
-
-
-def create_guest_user(display_name: str) -> Optional[int]:
-    """
-    Register a brand-new, fully isolated guest account for this
-    browser session. Not real authentication (no login, no password
-    the user knows) — just a unique row so this visitor's data is
-    separate from everyone else's.
-
-    Returns the new user_id, or None on failure.
-    """
-    db = get_database()
-    guest_email = f"guest-{uuid.uuid4().hex}@coachai.local"
-    guest_password_placeholder = uuid.uuid4().hex
-    try:
-        return db.create_user(
-            email=guest_email,
-            password_hash=guest_password_placeholder,
-            display_name=display_name,
-        )
-    except Exception:
-        return None
-
-
-# ─────────────────────────────────────────────────────────────
-# Real Accounts (email + password, so people can come back to the
-# same data later). Hashing uses only the standard library (PBKDF2)
-# so no new dependency is needed.
-# ─────────────────────────────────────────────────────────────
-
-_PBKDF2_ITERATIONS: int = 260_000
-
-
-def _hash_password(password: str) -> str:
-    """Hash a plaintext password into a 'salt$hash' string for storage."""
-    import hashlib
-
-    salt = uuid.uuid4().hex
-    digest = hashlib.pbkdf2_hmac(
-        "sha256", password.encode("utf-8"), salt.encode("utf-8"), _PBKDF2_ITERATIONS
-    ).hex()
-    return f"{salt}${digest}"
-
-
-def _verify_password(password: str, stored_hash: str) -> bool:
-    """Check a plaintext password against a 'salt$hash' string from the DB."""
-    import hashlib
-    import hmac
-
-    try:
-        salt, digest = stored_hash.split("$", 1)
-    except (ValueError, AttributeError):
-        return False
-    candidate = hashlib.pbkdf2_hmac(
-        "sha256", password.encode("utf-8"), salt.encode("utf-8"), _PBKDF2_ITERATIONS
-    ).hex()
-    return hmac.compare_digest(candidate, digest)
-
-
-def sign_up(email: str, password: str, display_name: str) -> tuple[Optional[int], Optional[str]]:
-    """
-    Create a real account with email + password.
-
-    Returns:
-        (user_id, None) on success, or (None, error_message) on failure
-        (e.g. the email is already registered).
-    """
-    cleaned_email = email.strip().lower()
-    if not cleaned_email or "@" not in cleaned_email:
-        return None, "Please enter a valid email address."
-    if len(password) < 6:
-        return None, "Password must be at least 6 characters."
-    if not display_name.strip():
-        return None, "Please enter a name."
-
-    db = get_database()
-    if db.get_user_by_email(cleaned_email) is not None:
-        return None, "An account with this email already exists — try logging in instead."
-
-    try:
-        user_id = db.create_user(
-            email=cleaned_email,
-            password_hash=_hash_password(password),
-            display_name=display_name.strip(),
-        )
-        return user_id, None
-    except Exception:
-        return None, "Something went wrong creating your account. Please try again."
-
-
-def log_in(email: str, password: str) -> tuple[Optional[int], Optional[str]]:
-    """
-    Verify email + password against an existing account.
-
-    Returns:
-        (user_id, display_name) on success, or (None, error_message) on
-        failure (unknown email or wrong password — same generic message
-        for both, so we don't leak which emails are registered).
-    """
-    cleaned_email = email.strip().lower()
-    db = get_database()
-    row = db.get_user_by_email(cleaned_email)
-    if row is None or not _verify_password(password, row["password_hash"]):
-        return None, "Incorrect email or password."
-    return row["user_id"], row["display_name"]
 
 
 # ─────────────────────────────────────────────────────────────
@@ -250,6 +140,7 @@ def transcribe_voice_note(audio_bytes: bytes, mime_type: str = "audio/wav") -> s
 def load_analytics_profile(
     user_id: int = DEFAULT_USER_ID,
     window_days: int = DEFAULT_ANALYTICS_WINDOW,
+    language: str = "en",
 ) -> Any:
     """
     Build and cache the full AnalyticsProfile.
@@ -258,7 +149,7 @@ def load_analytics_profile(
     without hammering the database.
     """
     engine = get_analytics_engine()
-    return engine.build_profile(user_id=user_id, window_days=window_days)
+    return engine.build_profile(user_id=user_id, window_days=window_days, language=language)
 
 
 def load_analytics_dashboard(
@@ -307,13 +198,7 @@ def load_pause_matrix(
     """
     db = get_database()
     since = date.today() - timedelta(days=window_days)
-    user_row = db.get_user(user_id)
-    user_timezone = user_row["timezone"] if user_row is not None else "UTC"
-    return db.get_pause_matrix(
-        user_id=user_id,
-        since_date=since.isoformat(),
-        user_timezone=user_timezone,
-    )
+    return db.get_pause_matrix(user_id=user_id, since_date=since.isoformat())
 
 
 # ─────────────────────────────────────────────────────────────
@@ -327,20 +212,6 @@ def load_user(user_id: int = DEFAULT_USER_ID) -> dict:
     if row is None:
         return {}
     return dict(row)
-
-
-def set_user_timezone(user_id: int, timezone: str) -> None:
-    """
-    Update the user's stored IANA timezone (e.g. from a manual Settings
-    dropdown, or later from the mobile app's device timezone).
-
-    Clears load_pause_matrix's cache so the Focus Pattern Matrix
-    reflects the new timezone on the very next view, instead of
-    waiting out its 5-minute TTL.
-    """
-    db = get_database()
-    db.update_user_timezone(user_id, timezone)
-    load_pause_matrix.clear()
 
 
 def load_user_profile(user_id: int = DEFAULT_USER_ID) -> dict:

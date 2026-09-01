@@ -17,8 +17,6 @@ from sqlalchemy import (
 from sqlalchemy.engine import Connection, CursorResult, Engine
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
-from timezone_utils import local_hour_from_utc_string
-
 
 # ---------------------------------------------------------------------------
 # Schema — dialect-agnostic table definitions
@@ -34,9 +32,8 @@ metadata = MetaData()
 
 users = Table(
     "users", metadata,
-    Column("user_id", Integer, primary_key=True, autoincrement=True),
+    Column("user_id", String, primary_key=True),
     Column("email", String, nullable=False, unique=True),
-    Column("password_hash", String, nullable=False),
     Column("display_name", String, nullable=False),
     Column("timezone", String, nullable=False, server_default="UTC"),
     Column("created_at", DateTime, nullable=False, server_default=func.current_timestamp()),
@@ -46,7 +43,7 @@ Index("idx_users_email", users.c.email)
 categories = Table(
     "categories", metadata,
     Column("category_id", Integer, primary_key=True, autoincrement=True),
-    Column("user_id", Integer, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False),
+    Column("user_id", String, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False),
     Column("name", String, nullable=False),
     Column("color", String, nullable=False, server_default="#3B82F6"),
     Column("created_at", DateTime, nullable=False, server_default=func.current_timestamp()),
@@ -57,7 +54,7 @@ Index("idx_categories_user_id", categories.c.user_id)
 plans = Table(
     "plans", metadata,
     Column("plan_id", Integer, primary_key=True, autoincrement=True),
-    Column("user_id", Integer, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False),
+    Column("user_id", String, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False),
     Column("plan_date", Date, nullable=False),
     Column("raw_input", Text, nullable=False),
     Column("ai_summary", Text),
@@ -118,7 +115,7 @@ Index("idx_tasks_plan_status", tasks.c.plan_id, tasks.c.status)
 user_profiles = Table(
     "user_profiles", metadata,
     Column("profile_id", Integer, primary_key=True, autoincrement=True),
-    Column("user_id", Integer, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, unique=True),
+    Column("user_id", String, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, unique=True),
     Column("completion_rate", Float, nullable=False, server_default="0.0"),
     Column("productivity_score", Float, nullable=False, server_default="0.0"),
     Column("best_productivity_hour", Integer),
@@ -158,7 +155,7 @@ badges = Table(
 user_badges = Table(
     "user_badges", metadata,
     Column("user_badge_id", Integer, primary_key=True, autoincrement=True),
-    Column("user_id", Integer, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False),
+    Column("user_id", String, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False),
     Column("badge_id", Integer, ForeignKey("badges.badge_id", ondelete="CASCADE"), nullable=False),
     Column("earned_at", DateTime, nullable=False, server_default=func.current_timestamp()),
     UniqueConstraint("user_id", "badge_id"),
@@ -168,7 +165,7 @@ Index("idx_user_badges_user_id", user_badges.c.user_id)
 google_oauth_tokens = Table(
     "google_oauth_tokens", metadata,
     Column("token_id", Integer, primary_key=True, autoincrement=True),
-    Column("user_id", Integer, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, unique=True),
+    Column("user_id", String, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, unique=True),
     Column("access_token", Text, nullable=False),
     Column("refresh_token", Text, nullable=False),
     Column("token_expiry", DateTime, nullable=False),
@@ -180,7 +177,7 @@ google_oauth_tokens = Table(
 google_selected_calendars = Table(
     "google_selected_calendars", metadata,
     Column("selection_id", Integer, primary_key=True, autoincrement=True),
-    Column("user_id", Integer, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False),
+    Column("user_id", String, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False),
     Column("calendar_id", String, nullable=False),
     Column("calendar_name", String, nullable=False, server_default=""),
     Column("color", String, nullable=False, server_default="#4285F4"),
@@ -193,7 +190,7 @@ Index("idx_gcal_selected_user", google_selected_calendars.c.user_id)
 google_calendar_events = Table(
     "google_calendar_events", metadata,
     Column("event_id", Integer, primary_key=True, autoincrement=True),
-    Column("user_id", Integer, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False),
+    Column("user_id", String, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False),
     Column("google_event_id", String, nullable=False),
     Column("title", String, nullable=False, server_default=""),
     Column("start_time", Time, nullable=False),
@@ -853,34 +850,37 @@ class Database:
 
     def create_user(
         self,
+        user_id: str,
         email: str,
-        password_hash: str,
         display_name: str,
         timezone: str = "UTC",
-    ) -> int:
+    ) -> str:
         """
         Register a new user and initialise an empty profile.
 
+        Identity is owned by Firebase Auth, not this database — user_id
+        is the Firebase uid, passed in explicitly rather than generated
+        here. No password is stored; Firebase handles credentials.
+
         Args:
+            user_id: The Firebase uid for this user.
             email: Unique email address.
-            password_hash: Pre-hashed password string.
             display_name: Human-readable name.
             timezone: IANA timezone name (default ``UTC``).
 
         Returns:
-            The newly created ``user_id``.
+            The ``user_id`` that was inserted (same value passed in).
 
         Raises:
-            sqlite3.IntegrityError: If the email already exists.
+            sqlite3.IntegrityError: If the user_id or email already exists.
         """
         with self.transaction():
-            user_id = self._insert_and_get_id(
+            self.execute(
                 """
-                INSERT INTO users (email, password_hash, display_name, timezone)
+                INSERT INTO users (user_id, email, display_name, timezone)
                 VALUES (?, ?, ?, ?)
                 """,
-                (email, password_hash, display_name, timezone),
-                pk_column="user_id",
+                (user_id, email, display_name, timezone),
             )
 
             # Initialise empty profile so AI always has a row to read
@@ -891,12 +891,49 @@ class Database:
 
         return user_id
 
-    def get_user(self, user_id: int) -> Optional[sqlite3.Row]:
+    def get_or_create_user(
+        self,
+        user_id: str,
+        email: str,
+        display_name: str,
+        timezone: str = "UTC",
+    ) -> sqlite3.Row:
+        """
+        Fetch the user row for a Firebase uid, creating it (idempotently)
+        on first login.
+
+        Call this right after verifying a Firebase ID token, every time
+        — not just on first sign-up — so a user's row always exists
+        before any other query needs it. Safe to call repeatedly: if
+        the user already exists, this is a single read and no write.
+
+        Args:
+            user_id: The Firebase uid for this user.
+            email: Email from the verified Firebase token.
+            display_name: Display name from the verified Firebase token.
+            timezone: IANA timezone name, used only on first creation.
+
+        Returns:
+            The user row (freshly created or pre-existing).
+        """
+        existing = self.get_user(user_id)
+        if existing is not None:
+            return existing
+
+        self.create_user(
+            user_id=user_id,
+            email=email,
+            display_name=display_name,
+            timezone=timezone,
+        )
+        return self.get_user(user_id)
+
+    def get_user(self, user_id: str) -> Optional[sqlite3.Row]:
         """
         Retrieve a user by ID.
 
         Args:
-            user_id: Primary key of the user.
+            user_id: Primary key of the user (the Firebase uid).
 
         Returns:
             User row, or ``None`` if not found.
@@ -921,35 +958,13 @@ class Database:
             (email,),
         )
 
-    def update_user_timezone(self, user_id: int, timezone: str) -> None:
-        """
-        Update a user's stored IANA timezone name.
-
-        Intended to be called by the client (mobile app, or a web
-        settings page) whenever it has a real device/browser timezone
-        to report — e.g. once at login, or whenever the app detects the
-        device timezone changed (user travelled). Not validated against
-        the IANA database here; invalid values safely fall back to UTC
-        wherever they're consumed (see timezone_utils.safe_zoneinfo).
-
-        Args:
-            user_id: Whose timezone to update.
-            timezone: IANA timezone name (e.g. "Africa/Cairo",
-                "America/New_York").
-        """
-        self.execute(
-            "UPDATE users SET timezone = ? WHERE user_id = ?",
-            (timezone, user_id),
-        )
-        self.commit()
-
     # =====================================================================
     # PLANS
     # =====================================================================
 
     def create_plan(
         self,
-        user_id: int,
+        user_id: str,
         plan_date: date,
         raw_input: str,
         ai_summary: Optional[str] = None,
@@ -982,7 +997,7 @@ class Database:
         self.commit()
         return plan_id
 
-    def get_today_plan(self, user_id: int) -> Optional[sqlite3.Row]:
+    def get_today_plan(self, user_id: str) -> Optional[sqlite3.Row]:
         """
         Fetch the active plan for today (system local date).
 
@@ -1005,7 +1020,7 @@ class Database:
 
     def get_plan_by_date(
         self,
-        user_id: int,
+        user_id: str,
         plan_date: date,
     ) -> Optional[sqlite3.Row]:
         """
@@ -1040,7 +1055,7 @@ class Database:
 
     def get_recent_plans(
         self,
-        user_id: int,
+        user_id: str,
         since_date: date,
         exclude_plan_id: Optional[int] = None,
     ) -> list[sqlite3.Row]:
@@ -1297,16 +1312,14 @@ class Database:
 
     def get_pause_matrix(
         self,
-        user_id: int,
+        user_id: str,
         since_date: str,
-        user_timezone: str = "UTC",
     ) -> list[dict]:
         """
         Build the Category x Time-of-day focus matrix: for every task
         this user started within the window, bucket it by the category
-        it belongs to and the LOCAL hour-of-day it was FIRST started
-        (started_at, converted from UTC to the user's timezone), and
-        sum pause_count within each bucket.
+        it belongs to and the hour-of-day it was FIRST started
+        (started_at), and sum pause_count within each bucket.
 
         This is the raw data behind "when/on what do you lose focus
         most" — e.g. a user who consistently pauses 'Study' tasks
@@ -1324,17 +1337,12 @@ class Database:
         Args:
             user_id: Whose tasks to analyze.
             since_date: ISO date string — only plans on/after this date.
-            user_timezone: IANA timezone name (e.g. "Africa/Cairo") used
-                to convert the stored UTC started_at into the hour the
-                user actually experienced. Defaults to "UTC" for users
-                who haven't had a real timezone captured yet.
 
         Returns:
             List of dicts: {category, time_bucket, task_count,
             paused_task_count, total_pauses, avg_pauses_per_task}.
             time_bucket is one of 'Morning' (5-12), 'Afternoon' (12-17),
-            'Evening' (17-21), 'Night' (21-5), all in the user's local
-            time.
+            'Evening' (17-21), 'Night' (21-5).
         """
         rows = self.fetch_all(
             """
@@ -1355,8 +1363,9 @@ class Database:
         )
 
         def _bucket(started_at_raw) -> str:
-            hour = local_hour_from_utc_string(started_at_raw, user_timezone)
-            if hour is None:
+            try:
+                hour = datetime.fromisoformat(str(started_at_raw)).hour
+            except (ValueError, TypeError):
                 return "Unknown"
             if 5 <= hour < 12:
                 return "Morning"
@@ -1478,7 +1487,7 @@ class Database:
         )
         self.commit()
 
-    def close_out_stale_tasks(self, user_id: int) -> int:
+    def close_out_stale_tasks(self, user_id: str) -> int:
         """
         Auto-close any task left ``pending``/``in_progress`` on a
         past-dated plan for this user, so tasks never sit unresolved
@@ -1542,7 +1551,7 @@ class Database:
 
     def get_recent_tasks_for_user(
         self,
-        user_id: int,
+        user_id: str,
         since_date: date,
         exclude_plan_id: Optional[int] = None,
     ) -> list[sqlite3.Row]:
@@ -1586,7 +1595,7 @@ class Database:
 
     def get_failure_reason_counts(
         self,
-        user_id: int,
+        user_id: str,
         since_date: date,
         exclude_plan_id: Optional[int] = None,
     ) -> list[sqlite3.Row]:
@@ -1634,7 +1643,7 @@ class Database:
     # USER PROFILES
     # =====================================================================
 
-    def get_profile(self, user_id: int) -> Optional[sqlite3.Row]:
+    def get_profile(self, user_id: str) -> Optional[sqlite3.Row]:
         """
         Retrieve the pre-computed analytics profile for a user.
 
@@ -1651,7 +1660,7 @@ class Database:
 
     def update_profile(
         self,
-        user_id: int,
+        user_id: str,
         **kwargs: Any,
     ) -> None:
         """
@@ -1703,7 +1712,7 @@ class Database:
     # BADGES
     # =====================================================================
 
-    def award_badge(self, user_id: int, badge_id: int) -> Optional[int]:
+    def award_badge(self, user_id: str, badge_id: int) -> Optional[int]:
         """
         Award a badge to a user if they do not already have it.
 
@@ -1734,7 +1743,7 @@ class Database:
             self.connection.rollback()
             return None
 
-    def get_user_badges(self, user_id: int) -> list[sqlite3.Row]:
+    def get_user_badges(self, user_id: str) -> list[sqlite3.Row]:
         """
         Retrieve all badges earned by a user.
 
@@ -1810,7 +1819,7 @@ class Database:
 
     def create_category(
         self,
-        user_id: int,
+        user_id: str,
         name: str,
         color: str = "#3B82F6",
     ) -> int:
@@ -1836,7 +1845,7 @@ class Database:
         self.commit()
         return category_id
 
-    def get_categories(self, user_id: int) -> list[sqlite3.Row]:
+    def get_categories(self, user_id: str) -> list[sqlite3.Row]:
         """
         List all categories belonging to a user.
 
@@ -1857,7 +1866,7 @@ class Database:
 
     def save_google_tokens(
         self,
-        user_id: int,
+        user_id: str,
         access_token: str,
         refresh_token: str,
         token_expiry: str,
@@ -1882,7 +1891,7 @@ class Database:
         self.commit()
         return token_id
 
-    def get_google_tokens(self, user_id: int) -> Optional[sqlite3.Row]:
+    def get_google_tokens(self, user_id: str) -> Optional[sqlite3.Row]:
         """Fetch stored Google OAuth tokens for a user."""
         return self.fetch_one(
             "SELECT * FROM google_oauth_tokens WHERE user_id = ?",
@@ -1891,7 +1900,7 @@ class Database:
 
     def update_google_tokens(
         self,
-        user_id: int,
+        user_id: str,
         access_token: str,
         token_expiry: str,
     ) -> None:
@@ -1906,7 +1915,7 @@ class Database:
         )
         self.commit()
 
-    def delete_google_tokens(self, user_id: int) -> None:
+    def delete_google_tokens(self, user_id: str) -> None:
         """Remove Google OAuth tokens (disconnect)."""
         self.execute(
             "DELETE FROM google_oauth_tokens WHERE user_id = ?",
@@ -1920,7 +1929,7 @@ class Database:
 
     def save_selected_calendars(
         self,
-        user_id: int,
+        user_id: str,
         calendars: list[dict],
     ) -> None:
         """
@@ -1951,14 +1960,14 @@ class Database:
                     ),
                 )
 
-    def get_selected_calendars(self, user_id: int) -> list[sqlite3.Row]:
+    def get_selected_calendars(self, user_id: str) -> list[sqlite3.Row]:
         """Fetch the user's selected Google Calendars."""
         return self.fetch_all(
             "SELECT * FROM google_selected_calendars WHERE user_id = ? ORDER BY is_primary DESC, calendar_name",
             (user_id,),
         )
 
-    def get_selected_calendar_ids(self, user_id: int) -> list[str]:
+    def get_selected_calendar_ids(self, user_id: str) -> list[str]:
         """Return just the calendar_id strings for the user's selections."""
         rows = self.fetch_all(
             "SELECT calendar_id FROM google_selected_calendars WHERE user_id = ?",
@@ -1966,7 +1975,7 @@ class Database:
         )
         return [row["calendar_id"] for row in rows]
 
-    def delete_selected_calendars(self, user_id: int) -> None:
+    def delete_selected_calendars(self, user_id: str) -> None:
         """Remove all selected calendars for a user."""
         self.execute(
             "DELETE FROM google_selected_calendars WHERE user_id = ?",
@@ -1980,7 +1989,7 @@ class Database:
 
     def upsert_google_calendar_event(
         self,
-        user_id: int,
+        user_id: str,
         google_event_id: str,
         title: str,
         start_time: str,
@@ -2061,7 +2070,7 @@ class Database:
 
     def get_google_calendar_events(
         self,
-        user_id: int,
+        user_id: str,
         event_date: str,
     ) -> list[sqlite3.Row]:
         """Fetch synced Google Calendar events for a given date."""
@@ -2076,7 +2085,7 @@ class Database:
 
     def delete_google_events_not_in(
         self,
-        user_id: int,
+        user_id: str,
         event_date: str,
         calendar_id: str,
         keep_ids: list[str],
@@ -2102,7 +2111,7 @@ class Database:
             )
         self.commit()
 
-    def delete_all_google_calendar_events(self, user_id: int) -> None:
+    def delete_all_google_calendar_events(self, user_id: str) -> None:
         """Remove all synced events for a user (disconnect cleanup)."""
         self.execute(
             "DELETE FROM google_calendar_events WHERE user_id = ?",
@@ -2112,7 +2121,7 @@ class Database:
 
     def delete_google_events_by_calendar(
         self,
-        user_id: int,
+        user_id: str,
         calendar_id: str,
     ) -> None:
         """Remove all events from a specific calendar (deselection)."""

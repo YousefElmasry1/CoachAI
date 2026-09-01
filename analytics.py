@@ -38,6 +38,13 @@ from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 from database import Database
+from insight_templates import (
+    render_pattern,
+    render_insight,
+    render_correlation,
+    translate_reason,
+    translate_direction,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1000,6 +1007,7 @@ class TrendResult(BaseModel):
 class PatternEntry(BaseModel):
     """A single detected behavioural pattern."""
     pattern_name: str
+    pattern_type: str = ""
     observation: str
     evidence: str
     confidence: str = "low"
@@ -1015,6 +1023,7 @@ class PatternResult(BaseModel):
 
 class InsightEntry(BaseModel):
     """A single actionable insight (distinct from patterns and recommendations)."""
+    insight_type: str = ""
     observation: str
     evidence: str
     confidence: str = "low"
@@ -1927,18 +1936,18 @@ class PatternCalculator:
     Edge Cases: Insufficient data → no patterns emitted.
     """
 
-    def compute(self, stats: IntermediateStats) -> PatternResult:
+    def compute(self, stats: IntermediateStats, language: str = "en") -> PatternResult:
         patterns: list[PatternEntry] = []
 
         if stats.total_tasks < MIN_TASKS_FOR_BASIC_CONFIDENCE:
             return PatternResult(patterns=[])
 
-        self._detect_failure_time_cluster(stats, patterns)
-        self._detect_category_failure_pattern(stats, patterns)
-        self._detect_failure_reason_pattern(stats, patterns)
-        self._detect_high_priority_struggle(stats, patterns)
-        self._detect_late_day_overload(stats, patterns)
-        self._detect_duration_sweet_spot(stats, patterns)
+        self._detect_failure_time_cluster(stats, patterns, language)
+        self._detect_category_failure_pattern(stats, patterns, language)
+        self._detect_failure_reason_pattern(stats, patterns, language)
+        self._detect_high_priority_struggle(stats, patterns, language)
+        self._detect_late_day_overload(stats, patterns, language)
+        self._detect_duration_sweet_spot(stats, patterns, language)
 
         return PatternResult(patterns=patterns)
 
@@ -1946,6 +1955,7 @@ class PatternCalculator:
         self,
         stats: IntermediateStats,
         patterns: list[PatternEntry],
+        language: str = "en",
     ) -> None:
         """Detect if failures cluster around specific hours."""
         if stats.total_failed < MIN_TASKS_FOR_BASIC_CONFIDENCE:
@@ -1969,30 +1979,29 @@ class PatternCalculator:
         fail_rate_at_hour = worst_count / total_at_hour
         if fail_rate_at_hour > stats.failure_rate * 1.5 and worst_count >= 3:
             conf = compute_confidence(total_at_hour, stats.observation_days)
+            data = {
+                "hour": worst_hour,
+                "failure_rate_at_hour": round(fail_rate_at_hour, 4),
+                "overall_failure_rate": round(stats.failure_rate, 4),
+                "worst_count": worst_count,
+                "total_at_hour": total_at_hour,
+            }
+            observation, evidence = render_pattern("failure_time_cluster", data, language)
             patterns.append(PatternEntry(
                 pattern_name="Failure Time Cluster",
-                observation=(
-                    f"Failures cluster around hour {worst_hour}:00 with "
-                    f"a {fail_rate_at_hour:.0%} failure rate vs "
-                    f"{stats.failure_rate:.0%} overall."
-                ),
-                evidence=(
-                    f"{worst_count} failures out of {total_at_hour} tasks "
-                    f"at hour {worst_hour}:00."
-                ),
+                pattern_type="failure_time_cluster",
+                observation=observation,
+                evidence=evidence,
                 confidence=conf.level,
                 observation_window=stats.window_days,
-                supporting_metrics={
-                    "hour": worst_hour,
-                    "failure_rate_at_hour": round(fail_rate_at_hour, 4),
-                    "overall_failure_rate": round(stats.failure_rate, 4),
-                },
+                supporting_metrics=data,
             ))
 
     def _detect_category_failure_pattern(
         self,
         stats: IntermediateStats,
         patterns: list[PatternEntry],
+        language: str = "en",
     ) -> None:
         """Detect categories with disproportionately high failure rates."""
         for cat, tasks in stats.tasks_by_category.items():
@@ -2004,29 +2013,30 @@ class PatternCalculator:
 
             if cat_fail_rate > stats.failure_rate * 1.5 and fail_count >= 3:
                 conf = compute_confidence(len(tasks), stats.observation_days)
+                data = {
+                    "category": cat,
+                    "category_failure_rate": round(cat_fail_rate, 4),
+                    "overall_failure_rate": round(stats.failure_rate, 4),
+                    "fail_count": fail_count,
+                    "total_tasks": len(tasks),
+                }
+                observation, evidence = render_pattern("category_failure_pattern", data, language)
                 patterns.append(PatternEntry(
                     pattern_name="Category Failure Pattern",
-                    observation=(
-                        f"Category '{cat}' has a {cat_fail_rate:.0%} failure "
-                        f"rate, significantly above {stats.failure_rate:.0%} "
-                        f"overall."
-                    ),
-                    evidence=(
-                        f"{fail_count} failures in {len(tasks)} '{cat}' tasks."
-                    ),
+                    pattern_type="category_failure_pattern",
+                    observation=observation,
+                    evidence=evidence,
                     confidence=conf.level,
                     observation_window=stats.window_days,
                     affected_categories=[cat],
-                    supporting_metrics={
-                        "category_failure_rate": round(cat_fail_rate, 4),
-                        "overall_failure_rate": round(stats.failure_rate, 4),
-                    },
+                    supporting_metrics=data,
                 ))
 
     def _detect_failure_reason_pattern(
         self,
         stats: IntermediateStats,
         patterns: list[PatternEntry],
+        language: str = "en",
     ) -> None:
         """Detect dominant failure reasons."""
         if stats.total_failed < MIN_TASKS_FOR_BASIC_CONFIDENCE:
@@ -2038,29 +2048,28 @@ class PatternCalculator:
                 conf = compute_confidence(
                     stats.total_failed, stats.observation_days,
                 )
+                data = {
+                    "reason": translate_reason(reason, language),
+                    "count": count,
+                    "total_failed": stats.total_failed,
+                    "ratio": round(ratio, 4),
+                }
+                observation, evidence = render_pattern("dominant_failure_reason", data, language)
                 patterns.append(PatternEntry(
                     pattern_name="Dominant Failure Reason",
-                    observation=(
-                        f"'{reason}' accounts for {ratio:.0%} of all failures "
-                        f"({count} out of {stats.total_failed})."
-                    ),
-                    evidence=(
-                        f"{count}/{stats.total_failed} failed tasks cite "
-                        f"'{reason}'."
-                    ),
+                    pattern_type="dominant_failure_reason",
+                    observation=observation,
+                    evidence=evidence,
                     confidence=conf.level,
                     observation_window=stats.window_days,
-                    supporting_metrics={
-                        "reason": reason,
-                        "count": count,
-                        "ratio": round(ratio, 4),
-                    },
+                    supporting_metrics={**data, "reason": reason},
                 ))
 
     def _detect_high_priority_struggle(
         self,
         stats: IntermediateStats,
         patterns: list[PatternEntry],
+        language: str = "en",
     ) -> None:
         """Detect struggling with high-priority tasks."""
         hp_tasks = []
@@ -2075,27 +2084,27 @@ class PatternCalculator:
 
         if hp_fail_rate > 0.3 and hp_fail >= 3:
             conf = compute_confidence(len(hp_tasks), stats.observation_days)
+            data = {
+                "hp_failure_rate": round(hp_fail_rate, 4),
+                "hp_fail": hp_fail,
+                "hp_total": len(hp_tasks),
+            }
+            observation, evidence = render_pattern("high_priority_struggle", data, language)
             patterns.append(PatternEntry(
                 pattern_name="High Priority Struggle",
-                observation=(
-                    f"High-priority tasks (P1-P2) have a {hp_fail_rate:.0%} "
-                    f"failure rate."
-                ),
-                evidence=(
-                    f"{hp_fail} failures in {len(hp_tasks)} high-priority tasks."
-                ),
+                pattern_type="high_priority_struggle",
+                observation=observation,
+                evidence=evidence,
                 confidence=conf.level,
                 observation_window=stats.window_days,
-                supporting_metrics={
-                    "hp_failure_rate": round(hp_fail_rate, 4),
-                    "hp_total": len(hp_tasks),
-                },
+                supporting_metrics=data,
             ))
 
     def _detect_late_day_overload(
         self,
         stats: IntermediateStats,
         patterns: list[PatternEntry],
+        language: str = "en",
     ) -> None:
         """Detect if afternoon/evening tasks have significantly higher failure."""
         afternoon_tasks = []
@@ -2112,28 +2121,28 @@ class PatternCalculator:
             conf = compute_confidence(
                 len(afternoon_tasks), stats.observation_days,
             )
+            data = {
+                "afternoon_failure_rate": round(pm_fail_rate, 4),
+                "overall_failure_rate": round(stats.failure_rate, 4),
+                "pm_fail": pm_fail,
+                "afternoon_total": len(afternoon_tasks),
+            }
+            observation, evidence = render_pattern("late_day_overload", data, language)
             patterns.append(PatternEntry(
                 pattern_name="Late Day Overload",
-                observation=(
-                    f"Tasks scheduled after 14:00 have a {pm_fail_rate:.0%} "
-                    f"failure rate vs {stats.failure_rate:.0%} overall."
-                ),
-                evidence=(
-                    f"{pm_fail} failures in {len(afternoon_tasks)} "
-                    f"afternoon/evening tasks."
-                ),
+                pattern_type="late_day_overload",
+                observation=observation,
+                evidence=evidence,
                 confidence=conf.level,
                 observation_window=stats.window_days,
-                supporting_metrics={
-                    "afternoon_failure_rate": round(pm_fail_rate, 4),
-                    "overall_failure_rate": round(stats.failure_rate, 4),
-                },
+                supporting_metrics=data,
             ))
 
     def _detect_duration_sweet_spot(
         self,
         stats: IntermediateStats,
         patterns: list[PatternEntry],
+        language: str = "en",
     ) -> None:
         """Detect duration ranges with notably better completion."""
         best_bucket: Optional[str] = None
@@ -2153,28 +2162,23 @@ class PatternCalculator:
             and best_rate > stats.completion_rate + 0.1
             and best_rate > 0.5
         ):
-            conf = compute_confidence(
-                len(stats.tasks_by_duration_bucket.get(best_bucket, [])),
-                stats.observation_days,
-            )
+            bucket_total = len(stats.tasks_by_duration_bucket.get(best_bucket, []))
+            conf = compute_confidence(bucket_total, stats.observation_days)
+            data = {
+                "bucket": best_bucket,
+                "bucket_completion_rate": round(best_rate, 4),
+                "overall_completion_rate": round(stats.completion_rate, 4),
+                "bucket_total": bucket_total,
+            }
+            observation, evidence = render_pattern("duration_sweet_spot", data, language)
             patterns.append(PatternEntry(
                 pattern_name="Duration Sweet Spot",
-                observation=(
-                    f"Tasks in the {best_bucket} min range have a "
-                    f"{best_rate:.0%} completion rate, above the "
-                    f"{stats.completion_rate:.0%} overall."
-                ),
-                evidence=(
-                    f"{len(stats.tasks_by_duration_bucket.get(best_bucket, []))} "
-                    f"tasks in {best_bucket} min bucket."
-                ),
+                pattern_type="duration_sweet_spot",
+                observation=observation,
+                evidence=evidence,
                 confidence=conf.level,
                 observation_window=stats.window_days,
-                supporting_metrics={
-                    "bucket": best_bucket,
-                    "bucket_completion_rate": round(best_rate, 4),
-                    "overall_completion_rate": round(stats.completion_rate, 4),
-                },
+                supporting_metrics=data,
             ))
 
 
@@ -2194,105 +2198,121 @@ class InsightCalculator:
     Edge Cases: Insufficient data → no insights emitted.
     """
 
-    def compute(self, stats: IntermediateStats) -> InsightResult:
+    def compute(self, stats: IntermediateStats, language: str = "en") -> InsightResult:
         insights: list[InsightEntry] = []
 
         if stats.total_tasks < MIN_TASKS_FOR_BASIC_CONFIDENCE:
             return InsightResult(insights=[])
 
-        self._insight_completion_rate(stats, insights)
-        self._insight_planning_bias(stats, insights)
-        self._insight_consistency(stats, insights)
-        self._insight_category_diversity(stats, insights)
-        self._insight_failure_concentration(stats, insights)
+        self._insight_completion_rate(stats, insights, language)
+        self._insight_planning_bias(stats, insights, language)
+        self._insight_consistency(stats, insights, language)
+        self._insight_category_diversity(stats, insights, language)
+        self._insight_failure_concentration(stats, insights, language)
 
         return InsightResult(insights=insights)
 
     def _insight_completion_rate(
-        self, stats: IntermediateStats, insights: list[InsightEntry],
+        self, stats: IntermediateStats, insights: list[InsightEntry], language: str = "en",
     ) -> None:
         """Insight about overall completion rate significance."""
         if stats.completion_rate >= 0.8:
+            data = {
+                "completion_rate": round(stats.completion_rate, 4),
+                "total_completed": stats.total_completed,
+                "total_tasks": stats.total_tasks,
+            }
+            observation, evidence = render_insight("completion_rate_excellent", data, language)
             insights.append(InsightEntry(
-                observation=(
-                    f"Completion rate of {stats.completion_rate:.0%} is "
-                    f"excellent, indicating strong follow-through."
-                ),
-                evidence=f"{stats.total_completed}/{stats.total_tasks} completed.",
+                insight_type="completion_rate_excellent",
+                observation=observation,
+                evidence=evidence,
                 confidence=compute_confidence(
                     stats.total_tasks, stats.observation_days,
                 ).level,
             ))
         elif stats.completion_rate < 0.5 and stats.total_tasks >= MIN_TASKS_FOR_BASIC_CONFIDENCE:
+            data = {
+                "completion_rate": round(stats.completion_rate, 4),
+                "total_completed": stats.total_completed,
+                "total_tasks": stats.total_tasks,
+            }
+            observation, evidence = render_insight("completion_rate_low", data, language)
             insights.append(InsightEntry(
-                observation=(
-                    f"Completion rate of {stats.completion_rate:.0%} is below "
-                    f"50%, suggesting task load may exceed capacity."
-                ),
-                evidence=f"{stats.total_completed}/{stats.total_tasks} completed.",
+                insight_type="completion_rate_low",
+                observation=observation,
+                evidence=evidence,
                 confidence=compute_confidence(
                     stats.total_tasks, stats.observation_days,
                 ).level,
             ))
 
     def _insight_planning_bias(
-        self, stats: IntermediateStats, insights: list[InsightEntry],
+        self, stats: IntermediateStats, insights: list[InsightEntry], language: str = "en",
     ) -> None:
         """Insight about planning bias significance."""
         if abs(stats.avg_planning_error) > 0.3 and stats.tasks_with_actual >= MIN_TASKS_FOR_BASIC_CONFIDENCE:
-            direction = "underestimates" if stats.avg_planning_error > 0 else "overestimates"
+            raw_direction = "underestimates" if stats.avg_planning_error > 0 else "overestimates"
+            data = {
+                "direction": translate_direction(raw_direction, language),
+                "planning_error": round(abs(stats.avg_planning_error), 4),
+                "avg_planning_error": round(stats.avg_planning_error, 4),
+                "tasks_with_actual": stats.tasks_with_actual,
+            }
+            observation, evidence = render_insight("planning_bias", data, language)
             insights.append(InsightEntry(
-                observation=(
-                    f"Planning consistently {direction} task duration by "
-                    f"{abs(stats.avg_planning_error):.0%}, which affects "
-                    f"schedule reliability."
-                ),
-                evidence=(
-                    f"Average planning error of {stats.avg_planning_error:.2f} "
-                    f"across {stats.tasks_with_actual} measured tasks."
-                ),
+                insight_type="planning_bias",
+                observation=observation,
+                evidence=evidence,
                 confidence=compute_confidence(
                     stats.tasks_with_actual, stats.observation_days,
                 ).level,
             ))
 
     def _insight_consistency(
-        self, stats: IntermediateStats, insights: list[InsightEntry],
+        self, stats: IntermediateStats, insights: list[InsightEntry], language: str = "en",
     ) -> None:
         """Insight about consistency significance."""
         if stats.observation_days > 0:
             consistency = stats.active_days / stats.observation_days
             if consistency >= 0.85:
+                data = {
+                    "consistency": round(consistency, 4),
+                    "active_days": stats.active_days,
+                    "observation_days": stats.observation_days,
+                }
+                observation, evidence = render_insight("consistency_strong", data, language)
                 insights.append(InsightEntry(
-                    observation=(
-                        f"Active on {consistency:.0%} of observed days, "
-                        f"indicating strong habit formation."
-                    ),
-                    evidence=f"{stats.active_days}/{stats.observation_days} active days.",
+                    insight_type="consistency_strong",
+                    observation=observation,
+                    evidence=evidence,
                     confidence=compute_confidence(
                         stats.total_tasks, stats.observation_days,
                     ).level,
                 ))
 
     def _insight_category_diversity(
-        self, stats: IntermediateStats, insights: list[InsightEntry],
+        self, stats: IntermediateStats, insights: list[InsightEntry], language: str = "en",
     ) -> None:
         """Insight about category diversity."""
         num_categories = len(stats.tasks_by_category)
         if num_categories >= 4:
+            data = {
+                "num_categories": num_categories,
+                "categories_list": ", ".join(stats.tasks_by_category.keys()),
+            }
+            observation, evidence = render_insight("category_diversity", data, language)
             insights.append(InsightEntry(
-                observation=(
-                    f"Active across {num_categories} categories, indicating "
-                    f"well-rounded engagement."
-                ),
-                evidence=f"Categories: {', '.join(stats.tasks_by_category.keys())}.",
+                insight_type="category_diversity",
+                observation=observation,
+                evidence=evidence,
                 confidence=compute_confidence(
                     stats.total_tasks, stats.observation_days,
                 ).level,
             ))
 
     def _insight_failure_concentration(
-        self, stats: IntermediateStats, insights: list[InsightEntry],
+        self, stats: IntermediateStats, insights: list[InsightEntry], language: str = "en",
     ) -> None:
         """Insight about failure concentration in specific areas."""
         if not stats.failure_reason_counts:
@@ -2305,13 +2325,17 @@ class InsightCalculator:
         concentration = top_count / total_reasons if total_reasons > 0 else 0
 
         if concentration >= 0.6 and top_count >= 3:
+            data = {
+                "top_reason": translate_reason(top_reason, language),
+                "top_count": top_count,
+                "total_reasons": total_reasons,
+                "concentration": round(concentration, 4),
+            }
+            observation, evidence = render_insight("failure_concentration", data, language)
             insights.append(InsightEntry(
-                observation=(
-                    f"'{top_reason}' dominates failures at {concentration:.0%} "
-                    f"concentration, making it the primary target for "
-                    f"improvement."
-                ),
-                evidence=f"{top_count}/{total_reasons} failures cite '{top_reason}'.",
+                insight_type="failure_concentration",
+                observation=observation,
+                evidence=evidence,
                 confidence=compute_confidence(
                     stats.total_failed, stats.observation_days,
                 ).level,
@@ -2340,23 +2364,23 @@ class CorrelationCalculator:
     Edge Cases: Insufficient data → correlation = 0.
     """
 
-    def compute(self, stats: IntermediateStats) -> CorrelationResult:
+    def compute(self, stats: IntermediateStats, language: str = "en") -> CorrelationResult:
         correlations: list[CorrelationEntry] = []
 
         if stats.total_tasks < MIN_TASKS_FOR_BASIC_CONFIDENCE:
             return CorrelationResult(correlations=[])
 
-        self._priority_vs_completion(stats, correlations)
-        self._priority_vs_failure(stats, correlations)
-        self._duration_vs_completion(stats, correlations)
-        self._duration_vs_failure(stats, correlations)
-        self._delay_vs_failure(stats, correlations)
-        self._category_vs_delay(stats, correlations)
+        self._priority_vs_completion(stats, correlations, language)
+        self._priority_vs_failure(stats, correlations, language)
+        self._duration_vs_completion(stats, correlations, language)
+        self._duration_vs_failure(stats, correlations, language)
+        self._delay_vs_failure(stats, correlations, language)
+        self._category_vs_delay(stats, correlations, language)
 
         return CorrelationResult(correlations=correlations)
 
     def _priority_vs_completion(
-        self, stats: IntermediateStats, out: list[CorrelationEntry],
+        self, stats: IntermediateStats, out: list[CorrelationEntry], language: str = "en",
     ) -> None:
         """Higher priority (lower number) → higher completion?"""
         rates = []
@@ -2369,24 +2393,24 @@ class CorrelationCalculator:
         if len(rates) < 2:
             out.append(CorrelationEntry(
                 name="priority_vs_completion", value=0.0,
-                description="Insufficient priority diversity.",
+                description=render_correlation("priority_vs_completion_insufficient", {}, language),
             ))
             return
 
         # Simple direction: is P1 rate > P5 rate?
         direction = rates[0][1] - rates[-1][1]
+        data = {
+            "top_priority": rates[0][0], "top_rate": rates[0][1],
+            "bottom_priority": rates[-1][0], "bottom_rate": rates[-1][1],
+        }
         out.append(CorrelationEntry(
             name="priority_vs_completion",
             value=round(direction, 4),
-            description=(
-                "Positive = higher-priority tasks have better completion. "
-                f"P{rates[0][0]} rate: {rates[0][1]:.2f}, "
-                f"P{rates[-1][0]} rate: {rates[-1][1]:.2f}."
-            ),
+            description=render_correlation("priority_vs_completion", data, language),
         ))
 
     def _priority_vs_failure(
-        self, stats: IntermediateStats, out: list[CorrelationEntry],
+        self, stats: IntermediateStats, out: list[CorrelationEntry], language: str = "en",
     ) -> None:
         """Higher priority → higher failure?"""
         rates = []
@@ -2399,23 +2423,23 @@ class CorrelationCalculator:
         if len(rates) < 2:
             out.append(CorrelationEntry(
                 name="priority_vs_failure", value=0.0,
-                description="Insufficient priority diversity.",
+                description=render_correlation("priority_vs_failure_insufficient", {}, language),
             ))
             return
 
         direction = rates[0][1] - rates[-1][1]
+        data = {
+            "top_priority": rates[0][0], "top_rate": rates[0][1],
+            "bottom_priority": rates[-1][0], "bottom_rate": rates[-1][1],
+        }
         out.append(CorrelationEntry(
             name="priority_vs_failure",
             value=round(direction, 4),
-            description=(
-                "Positive = higher-priority tasks fail more. "
-                f"P{rates[0][0]} fail: {rates[0][1]:.2f}, "
-                f"P{rates[-1][0]} fail: {rates[-1][1]:.2f}."
-            ),
+            description=render_correlation("priority_vs_failure", data, language),
         ))
 
     def _duration_vs_completion(
-        self, stats: IntermediateStats, out: list[CorrelationEntry],
+        self, stats: IntermediateStats, out: list[CorrelationEntry], language: str = "en",
     ) -> None:
         """Short tasks vs long tasks — completion rate."""
         bucket_rates: dict[str, float] = {}
@@ -2427,24 +2451,21 @@ class CorrelationCalculator:
         if len(bucket_rates) < 2:
             out.append(CorrelationEntry(
                 name="duration_vs_completion", value=0.0,
-                description="Insufficient duration diversity.",
+                description=render_correlation("duration_vs_completion_insufficient", {}, language),
             ))
             return
 
         sorted_rates = sorted(bucket_rates.items())
         direction = sorted_rates[0][1] - sorted_rates[-1][1]
+        data = {"shortest_rate": sorted_rates[0][1], "longest_rate": sorted_rates[-1][1]}
         out.append(CorrelationEntry(
             name="duration_vs_completion",
             value=round(direction, 4),
-            description=(
-                "Positive = shorter tasks complete more. "
-                f"Shortest bucket rate: {sorted_rates[0][1]:.2f}, "
-                f"longest: {sorted_rates[-1][1]:.2f}."
-            ),
+            description=render_correlation("duration_vs_completion", data, language),
         ))
 
     def _duration_vs_failure(
-        self, stats: IntermediateStats, out: list[CorrelationEntry],
+        self, stats: IntermediateStats, out: list[CorrelationEntry], language: str = "en",
     ) -> None:
         """Short tasks vs long tasks — failure rate."""
         bucket_rates: dict[str, float] = {}
@@ -2456,24 +2477,21 @@ class CorrelationCalculator:
         if len(bucket_rates) < 2:
             out.append(CorrelationEntry(
                 name="duration_vs_failure", value=0.0,
-                description="Insufficient duration diversity.",
+                description=render_correlation("duration_vs_failure_insufficient", {}, language),
             ))
             return
 
         sorted_rates = sorted(bucket_rates.items())
         direction = sorted_rates[-1][1] - sorted_rates[0][1]
+        data = {"shortest_rate": sorted_rates[0][1], "longest_rate": sorted_rates[-1][1]}
         out.append(CorrelationEntry(
             name="duration_vs_failure",
             value=round(direction, 4),
-            description=(
-                "Positive = longer tasks fail more. "
-                f"Shortest bucket fail: {sorted_rates[0][1]:.2f}, "
-                f"longest: {sorted_rates[-1][1]:.2f}."
-            ),
+            description=render_correlation("duration_vs_failure", data, language),
         ))
 
     def _delay_vs_failure(
-        self, stats: IntermediateStats, out: list[CorrelationEntry],
+        self, stats: IntermediateStats, out: list[CorrelationEntry], language: str = "en",
     ) -> None:
         """Do tasks with delays fail more?"""
         delayed = [
@@ -2490,25 +2508,22 @@ class CorrelationCalculator:
         if not delayed or not non_delayed:
             out.append(CorrelationEntry(
                 name="delay_vs_failure", value=0.0,
-                description="No contrast between delayed and non-delayed tasks.",
+                description=render_correlation("delay_vs_failure_insufficient", {}, language),
             ))
             return
 
         delayed_fail = sum(1 for t in delayed if t.status == "failed") / len(delayed)
         non_delayed_fail = sum(1 for t in non_delayed if t.status == "failed") / len(non_delayed)
 
+        data = {"delayed_fail": delayed_fail, "non_delayed_fail": non_delayed_fail}
         out.append(CorrelationEntry(
             name="delay_vs_failure",
             value=round(delayed_fail - non_delayed_fail, 4),
-            description=(
-                "Positive = delayed tasks fail more. "
-                f"Delayed fail: {delayed_fail:.2f}, "
-                f"non-delayed fail: {non_delayed_fail:.2f}."
-            ),
+            description=render_correlation("delay_vs_failure", data, language),
         ))
 
     def _category_vs_delay(
-        self, stats: IntermediateStats, out: list[CorrelationEntry],
+        self, stats: IntermediateStats, out: list[CorrelationEntry], language: str = "en",
     ) -> None:
         """Average delay per category — max spread."""
         cat_delays: dict[str, float] = {}
@@ -2524,7 +2539,7 @@ class CorrelationCalculator:
         if len(cat_delays) < 2:
             out.append(CorrelationEntry(
                 name="category_vs_delay", value=0.0,
-                description="Insufficient category diversity for delay comparison.",
+                description=render_correlation("category_vs_delay_insufficient", {}, language),
             ))
             return
 
@@ -2532,14 +2547,14 @@ class CorrelationCalculator:
         min_delay_cat = min(cat_delays, key=cat_delays.get)
         spread = cat_delays[max_delay_cat] - cat_delays[min_delay_cat]
 
+        data = {
+            "max_delay_cat": max_delay_cat, "max_delay_value": cat_delays[max_delay_cat],
+            "min_delay_cat": min_delay_cat, "min_delay_value": cat_delays[min_delay_cat],
+        }
         out.append(CorrelationEntry(
             name="category_vs_delay",
             value=round(spread, 2),
-            description=(
-                f"Max delay spread across categories: "
-                f"'{max_delay_cat}' ({cat_delays[max_delay_cat]:.1f} min) vs "
-                f"'{min_delay_cat}' ({cat_delays[min_delay_cat]:.1f} min)."
-            ),
+            description=render_correlation("category_vs_delay", data, language),
         ))
 
 
@@ -3670,6 +3685,7 @@ class AnalyticsEngine:
         self,
         user_id: int,
         window_days: int = DEFAULT_WINDOW_DAYS,
+        language: str = "en",
     ) -> AnalyticsProfile:
         """
         Build a complete AnalyticsProfile for a user.
@@ -3680,6 +3696,11 @@ class AnalyticsEngine:
         Args:
             user_id: Target user.
             window_days: Analysis window size in days.
+            language: Language for generated observation/evidence/
+                description text ("en" or "ar"). Only affects
+                PatternCalculator, InsightCalculator, and
+                CorrelationCalculator — all other calculators return
+                pure numbers with no natural-language text.
 
         Returns:
             A fully populated AnalyticsProfile.
@@ -3700,9 +3721,9 @@ class AnalyticsEngine:
         failure = FailureCalculator().compute(stats)
         consistency = ConsistencyCalculator().compute(stats)
         trend = TrendCalculator().compute(stats)
-        patterns = PatternCalculator().compute(stats)
-        insights_result = InsightCalculator().compute(stats)
-        correlations = CorrelationCalculator().compute(stats)
+        patterns = PatternCalculator().compute(stats, language)
+        insights_result = InsightCalculator().compute(stats, language)
+        correlations = CorrelationCalculator().compute(stats, language)
         heatmaps = HeatmapCalculator().compute(stats)
         duration = DurationCalculator().compute(stats)
         weekday_weekend = WeekdayWeekendCalculator().compute(stats)

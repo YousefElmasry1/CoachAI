@@ -80,6 +80,7 @@ def render_dashboard() -> None:
         )
 
     user_name = st.session_state.get("user_display_name") or user.get("display_name", "there")
+    user_timezone = user.get("timezone")
 
     # ── Hero Header ──────────────────────────────────────
     st.markdown(
@@ -88,9 +89,9 @@ def render_dashboard() -> None:
             <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:1rem;">
                 <div>
                     <p style="font-size:0.85rem; opacity:0.8; margin-bottom:0.3rem;">
-                        📅 {get_today_display()}
+                        📅 {get_today_display(user_timezone)}
                     </p>
-                    <h1>{get_greeting()}, {user_name}</h1>
+                    <h1>{get_greeting(user_timezone)}, {user_name}</h1>
                     <p>Here's your productivity overview for today.</p>
                 </div>
                 <div style="text-align:right;">

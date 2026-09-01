@@ -128,6 +128,17 @@ Assistant: [calls get_daily_analysis and get_productivity_by_hour, then answers 
 You have access to tools that retrieve the user's actual CoachAI data. **Always call relevant tools before making user-specific claims.** Do not answer productivity questions from memory alone — use the tools to get current data first.
 
 When multiple tools are relevant, call them all to get a comprehensive picture.
+
+## Language
+
+Always reply in the SAME language the user just wrote in. If they write in Arabic, your entire reply must be Arabic — do not mix in English words or technical terms. Use this glossary and do NOT leave these terms in English or add English in parentheses next to them:
+
+- burnout risk → خطر الإرهاق
+- streak / current streak / longest streak → سلسلة الإنجاز
+- completion rate → نسبة الإنجاز
+- productivity score → مؤشر الإنتاجية
+- consistency score → مؤشر الانتظام
+- planning accuracy → دقة التخطيط
 """
 
 
@@ -165,20 +176,43 @@ _FAREWELL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-_GREETING_REPLIES: list[str] = [
+_ARABIC_CHARS_PATTERN = re.compile(r"[\u0600-\u06FF]")
+
+
+def _is_arabic(text: str) -> bool:
+    """True if the text contains any Arabic script characters."""
+    return bool(_ARABIC_CHARS_PATTERN.search(text))
+
+
+_GREETING_REPLIES_EN: list[str] = [
     "Hey! How's your day going so far? Ask me anything about your tasks or productivity.",
     "Hi there! Ready to dig into your schedule or progress whenever you are.",
     "Hello! What would you like to know about your productivity today?",
 ]
-_THANKS_REPLIES: list[str] = [
+_GREETING_REPLIES_AR: list[str] = [
+    "أهلاً! عامل إيه النهاردة؟ اسألني عن أي حاجة في مهامك أو إنتاجيتك.",
+    "هاي! جاهز أساعدك في جدولك أو تقدمك وقت ما تحب.",
+    "أهلاً بيك! عايز تعرف إيه عن إنتاجيتك النهاردة؟",
+]
+_THANKS_REPLIES_EN: list[str] = [
     "You're welcome! Let me know if you want to dig into anything else.",
     "Anytime! Happy to help with your planning.",
     "Glad I could help. 🙂",
 ]
-_FAREWELL_REPLIES: list[str] = [
+_THANKS_REPLIES_AR: list[str] = [
+    "العفو! قولي لو عايز نتكلم عن أي حاجة تانية.",
+    "في أي وقت! سعيد إني ساعدتك في التخطيط.",
+    "الحمد لله إني قدرت أساعد. 🙂",
+]
+_FAREWELL_REPLIES_EN: list[str] = [
     "See you later — good luck with your tasks today!",
     "Take care! I'll be here whenever you need me.",
     "Bye for now — go get that to-do list done. 💪",
+]
+_FAREWELL_REPLIES_AR: list[str] = [
+    "أشوفك بعدين — بالتوفيق في مهامك النهاردة!",
+    "خد بالك من نفسك! هكون هنا وقت ما تحتاجني.",
+    "مع السلامة — يلا خلص الليستة بتاعتك. 💪",
 ]
 
 
@@ -189,6 +223,10 @@ def _try_casual_shortcut(user_message: str) -> Optional[str]:
     almost everything — this only ever matches whole, standalone
     small-talk messages, never a question of any kind).
 
+    The reply language matches the language the user actually wrote in,
+    not a random choice — Arabic input always gets an Arabic canned
+    reply, never an English one and vice versa.
+
     Args:
         user_message: The raw message as typed by the user.
 
@@ -198,12 +236,13 @@ def _try_casual_shortcut(user_message: str) -> Optional[str]:
     text = user_message.strip()
     if not text:
         return None
+    arabic = _is_arabic(text)
     if _GREETING_PATTERN.match(text):
-        return random.choice(_GREETING_REPLIES)
+        return random.choice(_GREETING_REPLIES_AR if arabic else _GREETING_REPLIES_EN)
     if _THANKS_PATTERN.match(text):
-        return random.choice(_THANKS_REPLIES)
+        return random.choice(_THANKS_REPLIES_AR if arabic else _THANKS_REPLIES_EN)
     if _FAREWELL_PATTERN.match(text):
-        return random.choice(_FAREWELL_REPLIES)
+        return random.choice(_FAREWELL_REPLIES_AR if arabic else _FAREWELL_REPLIES_EN)
     return None
 
 
@@ -789,7 +828,7 @@ def _classify_and_log_error(exc: Exception, context: str) -> str:
         return "other"
 
 
-_ERROR_MESSAGES = {
+_ERROR_MESSAGES_EN = {
     "permission": (
         "⚠️ The API key appears to be invalid or expired. "
         "Please check your GOOGLE_API_KEY in the .env file."
@@ -806,6 +845,25 @@ _ERROR_MESSAGES = {
         "⚠️ I encountered an issue connecting to the AI service. "
         "Please try again in a moment. If the problem persists, "
         "check that your API key is configured correctly."
+    ),
+}
+_ERROR_MESSAGES_AR = {
+    "permission": (
+        "⚠️ يبدو إن الـ API key غير صالح أو منتهي. "
+        "من فضلك راجع GOOGLE_API_KEY في ملف .env."
+    ),
+    "quota": (
+        "⚠️ وصلنا للحد الأقصى من الطلبات المسموحة على Gemini API. "
+        "استنى لحظة وجرب تاني."
+    ),
+    "blocked": (
+        "معرفتش أعالج الرسالة دي. "
+        "ممكن تجرب تعيد صياغة سؤالك؟"
+    ),
+    "other": (
+        "⚠️ حصلت مشكلة في الاتصال بخدمة الذكاء الاصطناعي. "
+        "جرب تاني بعد شوية. لو المشكلة استمرت، "
+        "تأكد إن الـ API key متظبط صح."
     ),
 }
 
@@ -873,8 +931,9 @@ class ChatbotService:
         """
         if not user_message or not user_message.strip():
             return (
-                "It looks like you sent an empty message. "
-                "How can I help you with your productivity today?"
+                "It looks like you sent an empty message. How can I help "
+                "you with your productivity today? / يبدو إنك بعتّ رسالة "
+                "فاضية، عايز مساعدة في إيه النهاردة؟"
             )
 
         casual_reply = _try_casual_shortcut(user_message)
@@ -888,7 +947,8 @@ class ChatbotService:
 
         except Exception as exc:
             category = _classify_and_log_error(exc, context="send_message")
-            return _ERROR_MESSAGES[category]
+            messages = _ERROR_MESSAGES_AR if _is_arabic(user_message) else _ERROR_MESSAGES_EN
+            return messages[category]
 
     def _handle_function_calls(self, response: Any) -> Any:
         """
@@ -957,10 +1017,14 @@ class ChatbotService:
                 return response.text
             return (
                 "I processed your request but didn't generate a text response. "
-                "Could you try asking again?"
+                "Could you try asking again? / "
+                "معرفتش أطلعلك رد نصي، ممكن تجرب تسأل تاني؟"
             )
         except (AttributeError, IndexError, ValueError):
-            return "I had trouble processing the response. Please try again."
+            return (
+                "I had trouble processing the response. Please try again. / "
+                "حصلت مشكلة في معالجة الرد، جرب تاني."
+            )
 
     def send_message_stream(self, user_message: str):
         """
@@ -1057,12 +1121,13 @@ class ChatbotService:
                         pass
 
         except Exception as exc:
-            yield self._format_error(exc)
+            yield self._format_error(exc, user_message)
 
-    def _format_error(self, exc: Exception) -> str:
+    def _format_error(self, exc: Exception, user_message: str = "") -> str:
         """Format an exception into a user-friendly error message."""
         category = _classify_and_log_error(exc, context="send_message_stream")
-        return _ERROR_MESSAGES[category]
+        messages = _ERROR_MESSAGES_AR if _is_arabic(user_message) else _ERROR_MESSAGES_EN
+        return messages[category]
 
 
 # ─────────────────────────────────────────────────────────────

@@ -1,8 +1,16 @@
+import re
 from typing import Optional
 
 from recommendation import RecommendationEngine, RecommendationOutput
 from database import Database
 from analytics import AnalyticsEngine, AnalyticsFormatter
+
+_ARABIC_CHARS_PATTERN = re.compile(r"[\u0600-\u06FF]")
+
+
+def _detect_language(text: str) -> str:
+    """Return 'ar' if the text contains Arabic script, else 'en'."""
+    return "ar" if _ARABIC_CHARS_PATTERN.search(text) else "en"
 
 
 # ---------------------------------------------------------------------------
@@ -169,12 +177,14 @@ class RecommendationService:
         """
         # 1. Format today's schedule
         schedule_text = self._format_schedule_text_for_plan(plan_id)
+        language = _detect_language(schedule_text)
 
         # 2. Build analytics profile (single DB load, all metrics computed)
         analytics_engine = self._get_analytics_engine()
         profile = analytics_engine.build_profile(
             user_id=user_id,
             window_days=_HISTORY_WINDOW_DAYS,
+            language=language,
         )
 
         # 3. Convert profile into LLM-ready context

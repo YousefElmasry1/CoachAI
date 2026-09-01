@@ -107,7 +107,18 @@ _RECOMMENDATION_SYSTEM_PROMPT: str = (
     "active effort that failed. When it appears often, call this out "
     "explicitly as an over-scheduling pattern. Always distinguish it from "
     "user-reported reasons like 'Distracted', 'Tired', or 'Harder than "
-    "expected', which reflect genuine attempts that didn't go as planned."
+    "expected', which reflect genuine attempts that didn't go as planned.\n"
+    "12. Language: write all output text in the SAME language as the "
+    "user's schedule/historical context (Arabic if they are in Arabic). "
+    "When referring to metrics, use these exact Arabic terms and do NOT "
+    "leave them in English or add English in parentheses:\n"
+    "   - burnout risk -> خطر الإرهاق\n"
+    "   - streak / current streak / longest streak -> سلسلة الإنجاز\n"
+    "   - completion rate -> نسبة الإنجاز\n"
+    "   - productivity score -> مؤشر الإنتاجية\n"
+    "   - consistency score -> مؤشر الانتظام\n"
+    "   - planning accuracy -> دقة التخطيط\n"
+    "   - trend direction -> اتجاه الأداء"
 )
 
 _RECOMMENDATION_USER_PROMPT: str = (
