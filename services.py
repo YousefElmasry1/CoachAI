@@ -34,14 +34,118 @@ _local = threading.local()
 # ─────────────────────────────────────────────────────────────
 # Identity
 #
-# NOTE: Local guest accounts and email/password auth (get_current_user_id,
-# create_guest_user, sign_up, log_in, and the PBKDF2 hashing helpers)
-# have been removed. Firebase Auth now owns identity — the Android app
-# authenticates with Firebase and sends the resulting ID token with
-# every API request. The future FastAPI layer verifies that token
-# (Firebase Admin SDK) and calls Database.get_or_create_user() with the
-# resulting uid; nothing in this Streamlit-era file replaces that flow.
+# Lightweight local identity helpers for the Streamlit frontend.
+# The Android app uses Firebase Auth; the Streamlit demo uses these
+# simple wrappers so the UI works without a Firebase project.
 # ─────────────────────────────────────────────────────────────
+
+
+def get_current_user_id():
+    """Return the active user_id from Streamlit session state,
+    falling back to DEFAULT_USER_ID for single-user / demo mode."""
+    return st.session_state.get("user_id") or DEFAULT_USER_ID
+
+
+def create_guest_user(display_name: str) -> Optional[int]:
+    """Create an isolated guest account with a random UUID-based id.
+
+    Returns the new user_id (str) or None on failure.
+    """
+    try:
+        db = get_database()
+        guest_uid = f"guest_{uuid.uuid4().hex[:12]}"
+        user_id = db.create_user(
+            user_id=guest_uid,
+            email=f"{guest_uid}@guest.local",
+            display_name=display_name,
+        )
+        return user_id
+    except Exception:
+        return None
+
+
+_PBKDF2_ITERATIONS: int = 260_000
+
+
+def _hash_password(password: str) -> str:
+    """Hash a plaintext password into a 'salt$hash' string for storage."""
+    import hashlib
+
+    salt = uuid.uuid4().hex
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt.encode("utf-8"), _PBKDF2_ITERATIONS
+    ).hex()
+    return f"{salt}${digest}"
+
+
+def _verify_password(password: str, stored_hash: str) -> bool:
+    """Check a plaintext password against a 'salt$hash' string from the DB."""
+    import hashlib
+    import hmac
+
+    try:
+        salt, digest = stored_hash.split("$", 1)
+    except (ValueError, AttributeError):
+        return False
+    candidate = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt.encode("utf-8"), _PBKDF2_ITERATIONS
+    ).hex()
+    return hmac.compare_digest(candidate, digest)
+
+
+def sign_up(email: str, password: str, display_name: str) -> tuple:
+    """Register a new account with email + password.
+
+    Returns (user_id, None) on success, or (None, error_message) on failure.
+    """
+    email = (email or "").strip().lower()
+    display_name = (display_name or "").strip()
+    if not email or "@" not in email:
+        return None, "Please enter a valid email."
+    if len(password or "") < 6:
+        return None, "Password must be at least 6 characters."
+    if not display_name:
+        return None, "Please enter your name."
+
+    try:
+        db = get_database()
+        existing = db.get_user_by_email(email)
+        if existing is not None:
+            return None, "An account with this email already exists."
+
+        uid = f"local_{uuid.uuid4().hex[:12]}"
+        user_id = db.create_user(
+            user_id=uid,
+            email=email,
+            display_name=display_name,
+        )
+        # Store the password hash in the user row
+        pw_hash = _hash_password(password)
+        db.execute(
+            "UPDATE users SET password_hash = ? WHERE user_id = ?",
+            (pw_hash, user_id),
+        )
+        db.connection.commit()
+        return user_id, None
+    except Exception as e:
+        return None, f"Sign-up failed: {e}"
+
+
+def log_in(email: str, password: str) -> tuple:
+    """Verify email + password against an existing account.
+
+    Returns (user_id, display_name) on success, or (None, error_message)
+    on failure.
+    """
+    cleaned_email = (email or "").strip().lower()
+    if not cleaned_email or not password:
+        return None, "Please enter your email and password."
+
+    db = get_database()
+    row = db.get_user_by_email(cleaned_email)
+    if row is None or not _verify_password(password, row["password_hash"]):
+        return None, "Incorrect email or password."
+    return row["user_id"], row["display_name"]
 
 
 # ─────────────────────────────────────────────────────────────

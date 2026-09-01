@@ -375,6 +375,17 @@ class Database:
         self._maybe_migrate_task_timer_fields()
         self._maybe_migrate_task_pause_count()
         self._maybe_migrate_task_pause_duration_fields()
+        self._maybe_migrate_user_password_hash()
+
+    def _maybe_migrate_user_password_hash(self) -> None:
+        """Add ``password_hash`` column to ``users`` if missing."""
+        cursor = self.connection.execute(text("PRAGMA table_info(users)"))
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        if "password_hash" not in existing_columns:
+            self.connection.execute(
+                text("ALTER TABLE users ADD COLUMN password_hash TEXT")
+            )
+            self.connection.commit()
 
     def _maybe_migrate_started_at(self) -> None:
         """

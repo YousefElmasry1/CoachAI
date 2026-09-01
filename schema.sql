@@ -13,6 +13,7 @@ CREATE TABLE users (
     email TEXT NOT NULL UNIQUE,
     display_name TEXT NOT NULL,
     timezone TEXT NOT NULL DEFAULT 'UTC',
+    password_hash TEXT,
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
