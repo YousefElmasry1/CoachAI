@@ -27,6 +27,7 @@ from typing import Any, Optional
 import streamlit as st
 
 from config import DEFAULT_ANALYTICS_WINDOW, DEFAULT_USER_ID
+from text_matching import detect_language
 
 _local = threading.local()
 
@@ -46,7 +47,7 @@ def get_current_user_id():
     return st.session_state.get("user_id") or DEFAULT_USER_ID
 
 
-def create_guest_user(display_name: str) -> Optional[int]:
+def create_guest_user(display_name: str) -> Optional[str]:
     """Create an isolated guest account with a random UUID-based id.
 
     Returns the new user_id (str) or None on failure.
@@ -143,9 +144,10 @@ def log_in(email: str, password: str) -> tuple:
 
     db = get_database()
     row = db.get_user_by_email(cleaned_email)
-    if row is None or not _verify_password(password, row["password_hash"]):
+    if row is None or not row["password_hash"] or not _verify_password(password, row["password_hash"]):
         return None, "Incorrect email or password."
     return row["user_id"], row["display_name"]
+
 
 
 # ─────────────────────────────────────────────────────────────
@@ -242,7 +244,7 @@ def transcribe_voice_note(audio_bytes: bytes, mime_type: str = "audio/wav") -> s
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_analytics_profile(
-    user_id: int = DEFAULT_USER_ID,
+    user_id: str = DEFAULT_USER_ID,
     window_days: int = DEFAULT_ANALYTICS_WINDOW,
     language: str = "en",
 ) -> Any:
@@ -257,7 +259,7 @@ def load_analytics_profile(
 
 
 def load_analytics_dashboard(
-    user_id: int = DEFAULT_USER_ID,
+    user_id: str = DEFAULT_USER_ID,
     window_days: int = DEFAULT_ANALYTICS_WINDOW,
 ) -> dict[str, Any]:
     """Load analytics formatted for dashboard consumption."""
@@ -267,7 +269,7 @@ def load_analytics_dashboard(
 
 
 def load_analytics_summary(
-    user_id: int = DEFAULT_USER_ID,
+    user_id: str = DEFAULT_USER_ID,
     window_days: int = DEFAULT_ANALYTICS_WINDOW,
 ) -> str:
     """Load a short text summary of analytics."""
@@ -278,7 +280,7 @@ def load_analytics_summary(
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_pause_matrix(
-    user_id: int = DEFAULT_USER_ID,
+    user_id: str = DEFAULT_USER_ID,
     window_days: int = DEFAULT_ANALYTICS_WINDOW,
 ) -> list[dict]:
     """
@@ -309,7 +311,7 @@ def load_pause_matrix(
 # User Data
 # ─────────────────────────────────────────────────────────────
 
-def load_user(user_id: int = DEFAULT_USER_ID) -> dict:
+def load_user(user_id: str = DEFAULT_USER_ID) -> dict:
     """Load user information as a dict. Returns empty dict if not found."""
     db = get_database()
     row = db.get_user(user_id)
@@ -318,7 +320,7 @@ def load_user(user_id: int = DEFAULT_USER_ID) -> dict:
     return dict(row)
 
 
-def load_user_profile(user_id: int = DEFAULT_USER_ID) -> dict:
+def load_user_profile(user_id: str = DEFAULT_USER_ID) -> dict:
     """Load the user's cached profile from user_profiles table."""
     db = get_database()
     row = db.get_profile(user_id)
@@ -327,7 +329,7 @@ def load_user_profile(user_id: int = DEFAULT_USER_ID) -> dict:
     return dict(row)
 
 
-def load_user_badges(user_id: int = DEFAULT_USER_ID) -> list[dict]:
+def load_user_badges(user_id: str = DEFAULT_USER_ID) -> list[dict]:
     """Load badges earned by the user."""
     db = get_database()
     rows = db.get_user_badges(user_id)
@@ -341,7 +343,7 @@ def load_all_badges() -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def load_categories(user_id: int = DEFAULT_USER_ID) -> list[dict]:
+def load_categories(user_id: str = DEFAULT_USER_ID) -> list[dict]:
     """Load user's categories."""
     db = get_database()
     rows = db.get_categories(user_id)
@@ -352,7 +354,7 @@ def load_categories(user_id: int = DEFAULT_USER_ID) -> list[dict]:
 # Plan & Task Data
 # ─────────────────────────────────────────────────────────────
 
-def load_today_plan(user_id: int = DEFAULT_USER_ID) -> Optional[dict]:
+def load_today_plan(user_id: str = DEFAULT_USER_ID) -> Optional[dict]:
     """Load today's plan as a dict, or None if no plan exists."""
     db = get_database()
     row = db.get_today_plan(user_id)
@@ -368,7 +370,7 @@ def load_plan_tasks(plan_id: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def load_today_tasks(user_id: int = DEFAULT_USER_ID) -> list[dict]:
+def load_today_tasks(user_id: str = DEFAULT_USER_ID) -> list[dict]:
     """Load today's tasks. Returns empty list if no plan."""
     plan = load_today_plan(user_id)
     if plan is None:
@@ -377,7 +379,7 @@ def load_today_tasks(user_id: int = DEFAULT_USER_ID) -> list[dict]:
 
 
 def load_recent_plans(
-    user_id: int = DEFAULT_USER_ID,
+    user_id: str = DEFAULT_USER_ID,
     days: int = 30,
 ) -> list[dict]:
     """Load recent plans with their tasks."""
@@ -585,7 +587,7 @@ def finish_task_with_timer(
         return False
 
 
-def close_out_stale_tasks(user_id: int = DEFAULT_USER_ID) -> int:
+def close_out_stale_tasks(user_id: str = DEFAULT_USER_ID) -> int:
     """
     Auto-fail any pending/in_progress task left over from a past day,
     so tasks never sit unresolved forever and analytics always sees a
@@ -608,7 +610,7 @@ def close_out_stale_tasks(user_id: int = DEFAULT_USER_ID) -> int:
 # AI Coach (Recommendations)
 # ─────────────────────────────────────────────────────────────
 
-def load_recommendations_today(user_id: int = DEFAULT_USER_ID) -> Any:
+def load_recommendations_today(user_id: str = DEFAULT_USER_ID) -> Any:
     """
     Get AI coaching recommendations for today.
 
@@ -716,7 +718,7 @@ def load_plan(plan_id: int) -> Optional[dict]:
 
 def create_today_plan(
     raw_input: str,
-    user_id: int = DEFAULT_USER_ID,
+    user_id: str = DEFAULT_USER_ID,
 ) -> Optional[int]:
     """
     Create today's plan container for a user.
@@ -738,7 +740,7 @@ def create_today_plan(
 
 def generate_today_plan(
     raw_input: str,
-    user_id: int = DEFAULT_USER_ID,
+    user_id: str = DEFAULT_USER_ID,
 ) -> dict[str, Any]:
     """
     Turn a free-form description of the day into structured, categorized
@@ -755,7 +757,7 @@ def generate_today_plan(
     return service.generate_and_save_plan(raw_input=raw_input, user_id=user_id)
 
 
-def draft_today_plan(raw_input: str, user_id: int = DEFAULT_USER_ID) -> Any:
+def draft_today_plan(raw_input: str, user_id: str = DEFAULT_USER_ID) -> Any:
     """
     Ask the AI Planner to draft structured tasks WITHOUT saving them.
 
@@ -779,7 +781,7 @@ def draft_today_plan(raw_input: str, user_id: int = DEFAULT_USER_ID) -> Any:
 def save_planner_draft(
     plan_output: Any,
     raw_input: str,
-    user_id: int = DEFAULT_USER_ID,
+    user_id: str = DEFAULT_USER_ID,
 ) -> dict[str, Any]:
     """
     Persist a DayPlanOutput previously returned by draft_today_plan().
@@ -805,7 +807,7 @@ def draft_plan_total_minutes(plan_output: Any) -> int:
 
 def check_capacity_for_today(
     additional_minutes: int,
-    user_id: int = DEFAULT_USER_ID,
+    user_id: str = DEFAULT_USER_ID,
 ) -> dict[str, Any]:
     """
     Check whether adding `additional_minutes` of newly planned/drafted
@@ -918,7 +920,7 @@ def add_break_to_plan(
     plan_id: int,
     start_time: time,
     duration_minutes: int,
-    title: str = "Break",
+    title: Optional[str] = None,
 ) -> Optional[int]:
     """
     Add a break to a plan as a fixed-time task (is_break=1).
@@ -927,12 +929,20 @@ def add_break_to_plan(
         plan_id: The plan to add the break to.
         start_time: When the break starts.
         duration_minutes: How long the break lasts.
-        title: Display title (defaults to "Break").
+        title: Display title. If not given, defaults to "Break" or
+            "استراحة" depending on the language of this plan's
+            raw_input, so a break added without an explicit title
+            still matches the language the user is writing in rather
+            than always defaulting to English.
 
     Returns:
         The new task_id, or None on error.
     """
     db = get_database()
+    if title is None:
+        plan = db.get_plan_by_id(plan_id)
+        plan_text = plan["raw_input"] if plan is not None else ""
+        title = "استراحة" if detect_language(plan_text) == "ar" else "Break"
     try:
         existing = db.get_tasks_by_plan(plan_id)
         order_index = len(existing)
@@ -990,7 +1000,7 @@ def complete_break(task_id: int) -> bool:
     return update_task_status(task_id, status="completed")
 
 
-def defer_task_to_tomorrow(task_id: int, user_id: int = DEFAULT_USER_ID) -> bool:
+def defer_task_to_tomorrow(task_id: int, user_id: str = DEFAULT_USER_ID) -> bool:
     """
     Move a task from its current plan to the user's plan for tomorrow,
     creating tomorrow's plan container if it doesn't exist yet.
@@ -1078,7 +1088,7 @@ def save_draft_tasks_to_plan(tasks: list, plan_id: int) -> int:
     return saved
 
 
-def defer_draft_tasks_to_tomorrow(tasks: list, user_id: int = DEFAULT_USER_ID) -> int:
+def defer_draft_tasks_to_tomorrow(tasks: list, user_id: str = DEFAULT_USER_ID) -> int:
     """
     Create real task rows for TOMORROW from a list of not-yet-saved
     drafted task objects — the counterpart to defer_task_to_tomorrow()
@@ -1212,7 +1222,7 @@ def get_last_scheduling_conflicts() -> list:
 def run_scheduler_for_today(
     work_day_start,
     breaks: Optional[list[tuple]] = None,
-    user_id: int = DEFAULT_USER_ID,
+    user_id: str = DEFAULT_USER_ID,
 ) -> list:
     """Convenience wrapper: schedule today's plan for a user."""
     plan = load_today_plan(user_id)
@@ -1269,7 +1279,7 @@ def _get_google_client(user_id: int):
     return client
 
 
-def is_google_calendar_connected(user_id: int = DEFAULT_USER_ID) -> bool:
+def is_google_calendar_connected(user_id: str = DEFAULT_USER_ID) -> bool:
     """Check if the user has stored Google Calendar OAuth tokens."""
     db = get_database()
     return db.get_google_tokens(user_id) is not None
@@ -1286,7 +1296,7 @@ def get_google_auth_url() -> str:
 
 def connect_google_calendar(
     auth_code: str,
-    user_id: int = DEFAULT_USER_ID,
+    user_id: str = DEFAULT_USER_ID,
 ) -> bool:
     """Exchange OAuth code for tokens and store them."""
     from google_calendar import GoogleCalendarClient, GoogleCalendarError
@@ -1322,7 +1332,7 @@ def connect_google_calendar(
         return False
 
 
-def disconnect_google_calendar(user_id: int = DEFAULT_USER_ID) -> None:
+def disconnect_google_calendar(user_id: str = DEFAULT_USER_ID) -> None:
     """Remove tokens, selected calendars, and all synced events."""
     db = get_database()
     db.delete_all_google_calendar_events(user_id)
@@ -1331,7 +1341,7 @@ def disconnect_google_calendar(user_id: int = DEFAULT_USER_ID) -> None:
 
 
 def fetch_google_calendars(
-    user_id: int = DEFAULT_USER_ID,
+    user_id: str = DEFAULT_USER_ID,
 ) -> list[dict]:
     """Fetch available calendars from Google API."""
     from google_calendar import GoogleCalendarError
@@ -1365,7 +1375,7 @@ def save_selected_calendars(
 
 
 def get_selected_calendars(
-    user_id: int = DEFAULT_USER_ID,
+    user_id: str = DEFAULT_USER_ID,
 ) -> list[dict]:
     """Load persisted calendar selections."""
     db = get_database()
@@ -1382,7 +1392,7 @@ def get_selected_calendars(
 
 
 def sync_google_calendar(
-    user_id: int = DEFAULT_USER_ID,
+    user_id: str = DEFAULT_USER_ID,
 ) -> dict:
     """
     Fetch events from selected calendars for today, upsert into DB,
@@ -1441,7 +1451,7 @@ def sync_google_calendar(
 
 
 def find_task_conflicts_with_google_events(
-    user_id: int = DEFAULT_USER_ID,
+    user_id: str = DEFAULT_USER_ID,
 ) -> list[dict]:
     """
     Find already-scheduled tasks in today's plan whose time overlaps a
@@ -1479,7 +1489,7 @@ def find_task_conflicts_with_google_events(
 
 
 def get_google_calendar_events_today(
-    user_id: int = DEFAULT_USER_ID,
+    user_id: str = DEFAULT_USER_ID,
 ) -> list[dict]:
     """Load today's synced Google Calendar events from DB."""
     db = get_database()
@@ -1498,7 +1508,7 @@ def get_google_calendar_events_today(
 
 
 def get_google_calendar_blocked_slots(
-    user_id: int = DEFAULT_USER_ID,
+    user_id: str = DEFAULT_USER_ID,
 ) -> list[tuple]:
     """
     Convert today's Google Calendar events into (start_time, end_time)
@@ -1536,7 +1546,7 @@ def get_google_calendar_blocked_slots(
 
 
 def get_last_sync_time(
-    user_id: int = DEFAULT_USER_ID,
+    user_id: str = DEFAULT_USER_ID,
 ) -> Optional[str]:
     """Return the most recent last_synced_at from google_calendar_events."""
     db = get_database()
@@ -1553,7 +1563,7 @@ def get_last_sync_time(
 
 def export_task_to_google_calendar(
     task_id: int,
-    user_id: int = DEFAULT_USER_ID,
+    user_id: str = DEFAULT_USER_ID,
 ) -> bool:
     """Create or update a Google Calendar event for a scheduled task."""
     from google_calendar import GoogleCalendarError
@@ -1605,7 +1615,7 @@ def export_task_to_google_calendar(
 
 
 def export_all_scheduled_tasks(
-    user_id: int = DEFAULT_USER_ID,
+    user_id: str = DEFAULT_USER_ID,
 ) -> dict:
     """Export all scheduled tasks from today's plan to Google Calendar."""
     plan = load_today_plan(user_id)
@@ -1627,7 +1637,7 @@ def export_all_scheduled_tasks(
     return {"exported": exported, "errors": errors}
 
 
-def get_stale_export_count(user_id: int = DEFAULT_USER_ID) -> int:
+def get_stale_export_count(user_id: str = DEFAULT_USER_ID) -> int:
     """
     Count today's tasks whose Google Calendar event no longer matches
     their current scheduled time — i.e. they were exported once, then

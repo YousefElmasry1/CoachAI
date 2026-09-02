@@ -27,6 +27,7 @@ from typing import Any, Optional
 from planner import PlannerEngine, DayPlanOutput, TaskOutput
 from database import Database
 from config import CHART_COLORS
+from text_matching import normalize_for_matching, is_break_term
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -110,16 +111,20 @@ class PlannerService:
 
     def _load_existing_categories(self, user_id: int) -> dict[str, int]:
         """
-        Load the user's existing categories as a case-insensitive lookup.
+        Load the user's existing categories as a normalized lookup.
 
         Args:
             user_id: The category owner.
 
         Returns:
-            Dict mapping lowercased category name -> category_id.
+            Dict mapping normalize_for_matching(name) -> category_id.
+            Normalization (not just .lower()) so Arabic categories that
+            differ only by diacritics or alef/teh-marbuta spelling
+            variants (e.g. "أعمال" vs "اعمال") are treated as the same
+            category rather than silently duplicated.
         """
         rows = self.db.get_categories(user_id)
-        return {str(row["name"]).strip().lower(): int(row["category_id"]) for row in rows}
+        return {normalize_for_matching(row["name"]): int(row["category_id"]) for row in rows}
 
     def _resolve_category_id(
         self,
@@ -138,8 +143,8 @@ class PlannerService:
         Args:
             task: The AI-generated task, with category_name and the
                 is_new_category / suggested_category_color hints.
-            category_lookup: Case-insensitive name -> category_id map,
-                pre-loaded from the database.
+            category_lookup: normalize_for_matching(name) -> category_id
+                map, pre-loaded from the database.
             user_id: The category owner.
 
         Returns:
@@ -149,7 +154,7 @@ class PlannerService:
         if not name:
             return None
 
-        key = name.lower()
+        key = normalize_for_matching(name)
         if key in category_lookup:
             return category_lookup[key]
 
@@ -181,13 +186,14 @@ class PlannerService:
         being treated as an ordinary task with Complete/Fail actions.
 
         The Planner's system prompt (rules 9 and 10 in planner.py)
-        instructs the AI to ALWAYS use category_name 'Break' — with or
-        without a concrete clock time — for anything the user describes
-        as a break, rest, lunch, or meal period. That's the one reliable
-        signal available here; matching on the task's title instead
-        would miss AI-generated breaks with a different wording, and
-        break case-insensitively/whitespace-insensitively since the AI
-        won't always capitalise it exactly the same way twice.
+        instructs the AI to ALWAYS use category_name 'Break' (or its
+        Arabic equivalent, when the user is writing in Arabic — see
+        is_break_term()) — with or without a concrete clock time — for
+        anything the user describes as a break, rest, lunch, or meal
+        period. That's the one reliable signal available here; matching
+        on the task's title instead would miss AI-generated breaks with
+        a different wording, and this must be case/diacritic-insensitive
+        since the AI won't always spell it exactly the same way twice.
 
         Args:
             task: A drafted TaskOutput from the Planner.
@@ -195,7 +201,7 @@ class PlannerService:
         Returns:
             True if this task should be persisted as a break.
         """
-        return (task.category_name or "").strip().lower() == "break"
+        return is_break_term((task.category_name or "").strip())
 
     @staticmethod
     def _compute_fixed_end(fixed_start: str, estimated_minutes: int) -> Optional[str]:
@@ -375,4 +381,4 @@ class PlannerService:
         plan_output = self.draft_plan(raw_input=raw_input, user_id=user_id)
         return self.save_plan(
             plan_output=plan_output, raw_input=raw_input, user_id=user_id,
-        ) 
+        )

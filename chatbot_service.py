@@ -22,6 +22,8 @@ from typing import Any, Optional
 
 from dotenv import load_dotenv
 
+from text_matching import normalize_for_matching
+
 load_dotenv()
 
 # ─────────────────────────────────────────────────────────────
@@ -684,7 +686,7 @@ def _impl_get_similar_tasks(user_id: int, task_keyword: str) -> dict:
     if not task_keyword or not task_keyword.strip():
         return {"error": "Please provide a keyword to search for."}
 
-    keyword = task_keyword.strip().lower()
+    keyword = normalize_for_matching(task_keyword)
     since_date = date.today() - timedelta(days=90)
 
     db = get_database()
@@ -694,10 +696,10 @@ def _impl_get_similar_tasks(user_id: int, task_keyword: str) -> dict:
 
     matching = []
     for r in rows:
-        title = (r["title"] or "").lower()
+        title = normalize_for_matching(r["title"] or "")
         desc = ""
         try:
-            desc = (r["description"] or "").lower()
+            desc = normalize_for_matching(r["description"] or "")
         except (KeyError, TypeError):
             pass
         if keyword in title or keyword in desc:

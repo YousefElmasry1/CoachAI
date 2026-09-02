@@ -38,6 +38,7 @@ from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 from database import Database
+from text_matching import normalize_for_matching
 from insight_templates import (
     render_pattern,
     render_insight,
@@ -2848,10 +2849,23 @@ class HabitCalculator:
     Edge Cases: No matching categories → score = 0.
     """
 
-    # Keyword matchers for common habit types
-    _STUDY_KEYWORDS = {"study", "studying", "learn", "learning", "lecture", "homework", "exam", "revision"}
-    _WORKOUT_KEYWORDS = {"workout", "exercise", "gym", "fitness", "run", "running", "sport", "training"}
-    _READING_KEYWORDS = {"read", "reading", "book", "literature"}
+    # Keyword matchers for common habit types. Normalized at class-body
+    # execution time so they always compare correctly against
+    # normalize_for_matching(category_name)/normalize_for_matching(title)
+    # in _activity_habit(), regardless of diacritics or alef-form
+    # spelling in either the keyword list below or the user's data.
+    _STUDY_KEYWORDS = {normalize_for_matching(k) for k in {
+        "study", "studying", "learn", "learning", "lecture", "homework", "exam", "revision",
+        "مذاكرة", "دراسة", "تعلم", "محاضرة", "واجب", "امتحان", "مراجعة",
+    }}
+    _WORKOUT_KEYWORDS = {normalize_for_matching(k) for k in {
+        "workout", "exercise", "gym", "fitness", "run", "running", "sport", "training",
+        "تمرين", "رياضة", "جيم", "جري", "تدريب", "لياقة",
+    }}
+    _READING_KEYWORDS = {normalize_for_matching(k) for k in {
+        "read", "reading", "book", "literature",
+        "قراءة", "كتاب", "أدب",
+    }}
 
     def compute(self, stats: IntermediateStats) -> HabitScores:
         if stats.total_tasks == 0:
@@ -2900,8 +2914,8 @@ class HabitCalculator:
         matching = [
             t for t in stats.all_snapshots
             if (
-                t.category_name.lower() in keywords
-                or any(kw in t.title.lower() for kw in keywords)
+                normalize_for_matching(t.category_name) in keywords
+                or any(kw in normalize_for_matching(t.title) for kw in keywords)
             )
         ]
         if not matching:
