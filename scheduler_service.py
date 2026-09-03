@@ -26,8 +26,139 @@ Usage:
 from datetime import date, time
 from typing import Optional
 
-from scheduler import Scheduler, ScheduledTask, SchedulingPreferences
+from scheduler import (
+    Scheduler, ScheduledTask, SchedulingPreferences,
+    SchedulingConflict, FixedTaskConflict,
+)
 from database import Database
+
+
+# ---------------------------------------------------------------------------
+# Persisted conflict detection (no scheduler run required)
+# ---------------------------------------------------------------------------
+#
+# Scheduler.schedule() only records last_conflicts as a side effect of
+# actually running, and that result lives on the (transient) service
+# instance for the rest of the process — nowhere in the database. So a
+# break that was left conflicting with a fixed task in an earlier
+# session (or by a different page/flow) shows no warning at all on a
+# fresh page load, until something happens to call the scheduler again.
+# This mirrors the exact same break-vs-fixed-task overlap check inline,
+# but reads straight off the already-saved scheduled_start/scheduled_end
+# columns, so it reflects the real current state on every render —
+# no scheduler run required.
+
+def _row_get(row, key: str, default=None):
+    """Read an optional column from a sqlite3.Row or plain dict."""
+    if isinstance(row, dict):
+        return row.get(key, default)
+    if key in row.keys():
+        return row[key]
+    return default
+
+
+def _parse_hhmm(value) -> Optional[time]:
+    """Parse an 'HH:MM' string from the database into a time object."""
+    if not value:
+        return None
+    try:
+        parts = str(value).split(":")
+        return time(int(parts[0]), int(parts[1]))
+    except (ValueError, IndexError):
+        return None
+
+
+def detect_persisted_break_conflicts(rows: list) -> list[SchedulingConflict]:
+    """
+    Detect break-vs-fixed-task conflicts directly from persisted task rows.
+
+    Args:
+        rows: task rows (sqlite3.Row or dict) such as those returned by
+            Database.get_tasks_by_plan() / services.load_plan_tasks().
+            Only rows with is_fixed_time set and both scheduled_start and
+            scheduled_end populated are considered — anything else has no
+            fixed, comparable time window yet.
+
+    Returns:
+        A list of SchedulingConflict objects (empty if none). Neither a
+        break nor a fixed-time task is ever auto-moved, so an overlap
+        here can't be silently resolved — it's meant to be surfaced to
+        the user with the same "move before / move after / remove"
+        choice the live scheduler run offers.
+    """
+    breaks: list[tuple[time, time, str]] = []
+    fixed: list[tuple[time, time, str]] = []
+
+    for row in rows:
+        if not _row_get(row, "is_fixed_time", 0):
+            continue
+        start = _parse_hhmm(_row_get(row, "scheduled_start"))
+        end = _parse_hhmm(_row_get(row, "scheduled_end"))
+        if start is None or end is None:
+            continue
+        title = str(_row_get(row, "title", ""))
+        if _row_get(row, "is_break", 0):
+            breaks.append((start, end, title))
+        else:
+            fixed.append((start, end, title))
+
+    conflicts: list[SchedulingConflict] = []
+    for break_start, break_end, _break_title in breaks:
+        for fixed_start, fixed_end, fixed_title in fixed:
+            if break_start < fixed_end and break_end > fixed_start:
+                conflicts.append(SchedulingConflict(
+                    break_start=break_start,
+                    break_end=break_end,
+                    fixed_task_title=fixed_title,
+                    fixed_task_start=fixed_start,
+                    fixed_task_end=fixed_end,
+                ))
+    return conflicts
+
+
+def detect_persisted_fixed_task_conflicts(rows: list) -> list[FixedTaskConflict]:
+    """
+    Detect fixed-task-vs-fixed-task conflicts directly from persisted
+    task rows — the counterpart to detect_persisted_break_conflicts()
+    for two ordinary (non-break) fixed-time tasks that overlap each
+    other (e.g. two imported calendar events both pinned to the same
+    hour). Same "no scheduler run required" reasoning applies: this
+    reads straight off scheduled_start/scheduled_end, so a stale
+    overlap from an earlier session is never silently hidden.
+
+    Args:
+        rows: task rows (sqlite3.Row or dict), same shape as
+            detect_persisted_break_conflicts().
+
+    Returns:
+        A list of FixedTaskConflict objects (empty if none). Each pair
+        is only reported once (i < j).
+    """
+    fixed: list[tuple[time, time, str]] = []
+    for row in rows:
+        if not _row_get(row, "is_fixed_time", 0) or _row_get(row, "is_break", 0):
+            continue
+        start = _parse_hhmm(_row_get(row, "scheduled_start"))
+        end = _parse_hhmm(_row_get(row, "scheduled_end"))
+        if start is None or end is None:
+            continue
+        fixed.append((start, end, str(_row_get(row, "title", ""))))
+
+    conflicts: list[FixedTaskConflict] = []
+    for i in range(len(fixed)):
+        a_start, a_end, a_title = fixed[i]
+        for j in range(i + 1, len(fixed)):
+            b_start, b_end, b_title = fixed[j]
+            if a_start < b_end and a_end > b_start:
+                conflicts.append(FixedTaskConflict(
+                    task_a_title=a_title,
+                    task_a_start=a_start,
+                    task_a_end=a_end,
+                    task_b_title=b_title,
+                    task_b_start=b_start,
+                    task_b_end=b_end,
+                ))
+    return conflicts
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +196,10 @@ class SchedulerService:
         # Neither side can be auto-moved, so callers can surface this
         # list to the user as a "couldn't auto-resolve" warning.
         self.last_conflicts: list = []
+        # FixedTaskConflict objects (fixed-time task vs. fixed-time
+        # task) from the same run — same "can't auto-resolve" story,
+        # just between two ordinary tasks instead of a break and a task.
+        self.last_fixed_conflicts: list = []
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -270,6 +405,7 @@ class SchedulerService:
         scheduler = self._resolve_scheduler(preferences)
         scheduled: list[ScheduledTask] = scheduler.schedule(tasks, plan_date=plan_date)
         self.last_conflicts = getattr(scheduler, "last_conflicts", [])
+        self.last_fixed_conflicts = getattr(scheduler, "last_fixed_conflicts", [])
 
         # ------------------------------------------------------------------
         # Step 5: Persist time slots back to the database

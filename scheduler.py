@@ -104,6 +104,23 @@ class SchedulingConflict:
     fixed_task_end: time
 
 
+@dataclass
+class FixedTaskConflict:
+    """
+    Reports two ordinary (non-break) fixed-time tasks whose windows
+    overlap — e.g. two calendar-style commitments both pinned to
+    10:00-11:00. Same underlying problem as SchedulingConflict (both
+    sides are immovable, so it can't be silently resolved), just
+    between two regular tasks instead of a break and a task.
+    """
+    task_a_title: str
+    task_a_start: time
+    task_a_end: time
+    task_b_title: str
+    task_b_start: time
+    task_b_end: time
+
+
 # ---------------------------------------------------------------------------
 # Scheduler
 # ---------------------------------------------------------------------------
@@ -318,6 +335,31 @@ class Scheduler:
                         fixed_task_title=fixed_st.title,
                         fixed_task_start=fixed_st.fixed_start,
                         fixed_task_end=self._datetime_to_time(fixed_end_dt),
+                    ))
+
+        # ------------------------------------------------------------------
+        # Detect fixed-task <-> fixed-task conflicts (two ordinary,
+        # non-break commitments overlapping each other — e.g. two
+        # imported calendar events both pinned to the same hour).
+        # Same reasoning as above: neither side can move, so this can't
+        # be auto-resolved either. Each pair is only checked once
+        # (i < j), and a fixed task that's already flagged against
+        # another one can still appear in a second pair too, if it
+        # genuinely overlaps more than one other fixed task.
+        # ------------------------------------------------------------------
+        self.last_fixed_conflicts: list[FixedTaskConflict] = []
+        for i in range(len(regular_fixed_windows)):
+            a_start_dt, a_end_dt, a_st = regular_fixed_windows[i]
+            for j in range(i + 1, len(regular_fixed_windows)):
+                b_start_dt, b_end_dt, b_st = regular_fixed_windows[j]
+                if a_start_dt < b_end_dt and a_end_dt > b_start_dt:
+                    self.last_fixed_conflicts.append(FixedTaskConflict(
+                        task_a_title=a_st.title,
+                        task_a_start=a_st.fixed_start,
+                        task_a_end=self._datetime_to_time(a_end_dt),
+                        task_b_title=b_st.title,
+                        task_b_start=b_st.fixed_start,
+                        task_b_end=self._datetime_to_time(b_end_dt),
                     ))
 
         scheduled: list[ScheduledTask] = []

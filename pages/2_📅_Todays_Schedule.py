@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import random
 from datetime import date, datetime, time, timedelta, timezone
+from typing import Optional
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -52,6 +53,10 @@ from services import (
     load_pause_matrix,
     run_scheduler_for_today,
     get_last_scheduling_conflicts,
+    get_persisted_scheduling_conflicts,
+    get_last_fixed_task_conflicts,
+    get_persisted_fixed_task_conflicts,
+    reschedule_fixed_task,
     get_last_scheduler_error,
     add_break_to_plan,
     reschedule_break,
@@ -62,6 +67,7 @@ from services import (
     sync_google_calendar,
     get_last_sync_time,
     get_google_calendar_events_today,
+    import_calendar_event_as_task,
     get_selected_calendars,
     export_all_scheduled_tasks,
     get_stale_export_count,
@@ -904,6 +910,22 @@ categories = load_categories(user_id=user_id)
 category_lookup = {c["category_id"]: c for c in categories}
 is_scheduled = any(t.get("scheduled_start") for t in tasks)
 
+# Surface any break-vs-fixed-task conflict already saved in the database,
+# even if nobody has run the scheduler yet *this session* — otherwise a
+# conflict left over from an earlier visit (or created some other way)
+# renders silently, like Math/Break both sitting at 2:00 PM with no
+# warning. Button actions below (_run_and_track_conflicts) refresh this
+# same key after a live scheduler run, so it always reflects the latest
+# state either way.
+CONFLICTS_KEY = "_scheduling_conflicts"
+st.session_state[CONFLICTS_KEY] = get_persisted_scheduling_conflicts(user_id=user_id)
+
+# Same idea, but for two ordinary fixed-time tasks overlapping each
+# other (e.g. two imported calendar events both pinned to 10:00-11:00)
+# instead of a break vs. a fixed task.
+FIXED_CONFLICTS_KEY = "_fixed_task_conflicts"
+st.session_state[FIXED_CONFLICTS_KEY] = get_persisted_fixed_task_conflicts(user_id=user_id)
+
 
 # ─────────────────────────────────────────────────────────────
 # Schedule Summary Row
@@ -973,13 +995,23 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
         st.caption("No breaks added yet — the scheduler will run without one.")
 
     # ── Conflict state (survives st.rerun, unlike a plain st.warning) ──
-    # Defined here (before the Add-break button) so adding a break can
-    # trigger an immediate re-schedule + conflict check, instead of
-    # silently sitting there until the user separately presses "Run
-    # Scheduler" — that gap was exactly why a break overlapping a fixed
-    # task, or a flexible task left at its now-stale time, showed no
-    # warning at all until a second manual click.
-    CONFLICTS_KEY = "_scheduling_conflicts"
+    # CONFLICTS_KEY itself is set once above (right after tasks load) from
+    # what's actually persisted, so a conflict from an earlier session is
+    # never hidden. The helpers below just refresh it after a live
+    # scheduler run or a resolution action, so it stays in sync.
+
+    # A high-priority flexible task getting pushed back by a new break is
+    # NOT a conflict (the scheduler resolves it fine on its own — see
+    # _best_gap_filler) but it's still worth flagging, since it can
+    # silently shove something important to later in the day. Unlike
+    # CONFLICTS_KEY this is intentionally session-only and NOT reseeded
+    # from the database on every load: it only makes sense right after
+    # the specific "Add" click that caused it, since Undo needs the
+    # "before" snapshot taken at that same moment.
+    DELAY_WARNING_THRESHOLD_MINUTES = 60
+    DELAY_WARNING_KEY = "_break_delay_warning"
+    LAST_BREAK_ADDED_KEY = "_last_break_added_id"
+    st.session_state.setdefault(DELAY_WARNING_KEY, [])
 
     def _shift_time(t: time, delta_minutes: int) -> time:
         return (datetime.combine(date.today(), t) + timedelta(minutes=delta_minutes)).time()
@@ -988,6 +1020,7 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
         with st.spinner("Assigning time slots..."):
             scheduled = run_scheduler_for_today(work_day_start=work_start, user_id=user_id)
         st.session_state[CONFLICTS_KEY] = get_last_scheduling_conflicts() if scheduled else []
+        st.session_state[FIXED_CONFLICTS_KEY] = get_last_fixed_task_conflicts() if scheduled else []
         return scheduled
 
     def _find_break_task(break_start_t: time, duration_minutes: int) -> dict | None:
@@ -1001,6 +1034,65 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
                 return b
         return None
 
+    def _find_fixed_task(title: str, start_t: time, duration_minutes: int) -> dict | None:
+        """Match a FixedTaskConflict side back to its DB row — same
+        idea as _find_break_task, but also keyed on title since two
+        *different* fixed tasks can share the same start time (that's
+        exactly the conflict being resolved)."""
+        target = start_t.strftime("%H:%M")
+        for t in tasks:
+            if (
+                t.get("is_fixed_time")
+                and not t.get("is_break")
+                and t.get("title") == title
+                and str(t.get("scheduled_start"))[:5] == target
+                and int(t.get("estimated_minutes") or 0) == duration_minutes
+            ):
+                return t
+        return None
+
+    def _find_high_priority_delays(
+        before: dict[int, Optional[str]],
+        after: list[dict],
+        threshold_minutes: int = DELAY_WARNING_THRESHOLD_MINUTES,
+    ) -> list[dict]:
+        """
+        Compare each high-priority (priority 1–2), non-break, non-fixed
+        task's scheduled_start before vs. after a schedule change and
+        return the ones pushed back by more than threshold_minutes.
+        Only flags a *later* start (a task moving earlier is never a
+        problem worth a warning).
+        """
+
+        def _to_minutes(hhmm) -> Optional[int]:
+            if not hhmm:
+                return None
+            try:
+                h, m = str(hhmm)[:5].split(":")
+                return int(h) * 60 + int(m)
+            except (ValueError, IndexError):
+                return None
+
+        delays = []
+        for t in after:
+            if t.get("is_break") or t.get("is_fixed_time"):
+                continue
+            if int(t.get("priority") or 5) > 2:
+                continue
+            old_minutes = _to_minutes(before.get(t["task_id"]))
+            new_minutes = _to_minutes(t.get("scheduled_start"))
+            if old_minutes is None or new_minutes is None:
+                continue
+            delta = new_minutes - old_minutes
+            if delta >= threshold_minutes:
+                delays.append({
+                    "title": t.get("title"),
+                    "old_start": before[t["task_id"]],
+                    "new_start": t.get("scheduled_start"),
+                    "delta_minutes": delta,
+                })
+        return delays
+
     add_cols = st.columns([2, 2, 1])
     with add_cols[0]:
         new_break_start = st.time_input("Starts at", value=time(12, 0), key="new_break_start")
@@ -1011,13 +1103,25 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
     with add_cols[2]:
         st.markdown("<div style='height:1.8rem;'></div>", unsafe_allow_html=True)
         if st.button("➕ Add", key="add_break_btn", use_container_width=True):
+            # Snapshot pre-add start times so we can (a) detect a
+            # high-priority delay caused by THIS break, and (b) restore
+            # the exact prior schedule if the user hits Undo.
+            before_starts = {t["task_id"]: t.get("scheduled_start") for t in tasks}
             new_break_id = add_break_to_plan(plan["plan_id"], new_break_start, int(new_break_minutes))
             if new_break_id:
                 _run_and_track_conflicts()
                 if st.session_state.get(CONFLICTS_KEY):
+                    st.session_state[DELAY_WARNING_KEY] = []
                     st.toast("Break added — but it overlaps a fixed task, see below.", icon="⚠️")
                 else:
-                    st.toast("Break added and slotted into your schedule ☕", icon="✅")
+                    refreshed_tasks = load_today_tasks(user_id=user_id)
+                    delays = _find_high_priority_delays(before_starts, refreshed_tasks)
+                    st.session_state[DELAY_WARNING_KEY] = delays
+                    st.session_state[LAST_BREAK_ADDED_KEY] = new_break_id
+                    if delays:
+                        st.toast("Break added — but it pushed back a high-priority task.", icon="⚠️")
+                    else:
+                        st.toast("Break added and slotted into your schedule ☕", icon="✅")
                 st.rerun()
             else:
                 st.error("Couldn't add the break. Try again.")
@@ -1078,6 +1182,100 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
                 if row is not None and delete_task(row["task_id"]):
                     _run_and_track_conflicts()
                     st.rerun()
+
+    # ── Persistent fixed-task-vs-fixed-task conflict banner ──
+    # Two ordinary (non-break) fixed-time tasks overlapping each other
+    # — e.g. two imported calendar events both pinned to 10:00-11:00.
+    # Same "neither side can move" story as the break banner above,
+    # resolved with a move-either-direction / remove-either choice —
+    # unlike the break banner, there's no "the break" side to anchor a
+    # before/after move against, so BOTH directions need to be offered
+    # (move A after B, or move B after A); either task could reasonably
+    # be the one that moves.
+    for f_idx, fc in enumerate(st.session_state.get(FIXED_CONFLICTS_KEY) or []):
+        a_duration = int(
+            (datetime.combine(date.today(), fc.task_a_end)
+             - datetime.combine(date.today(), fc.task_a_start)).total_seconds() // 60
+        )
+        b_duration = int(
+            (datetime.combine(date.today(), fc.task_b_end)
+             - datetime.combine(date.today(), fc.task_b_start)).total_seconds() // 60
+        )
+        st.warning(
+            f"⚠️ **'{fc.task_a_title}'** "
+            f"({format_time_12h(fc.task_a_start.strftime('%H:%M'))} – "
+            f"{format_time_12h(fc.task_a_end.strftime('%H:%M'))}) overlaps "
+            f"**'{fc.task_b_title}'** "
+            f"({format_time_12h(fc.task_b_start.strftime('%H:%M'))} – "
+            f"{format_time_12h(fc.task_b_end.strftime('%H:%M'))}). "
+            f"Both were left at their original times — neither is a break, "
+            f"so the scheduler can't tell which one should move."
+        )
+        fx_move_cols = st.columns(2)
+        with fx_move_cols[0]:
+            if st.button(
+                f"➡️ Move '{fc.task_a_title}' after '{fc.task_b_title}'",
+                key=f"fixed_conflict_move_a_{f_idx}", use_container_width=True,
+            ):
+                row = _find_fixed_task(fc.task_a_title, fc.task_a_start, a_duration)
+                if row is not None and reschedule_fixed_task(row["task_id"], fc.task_b_end):
+                    _run_and_track_conflicts()
+                    st.rerun()
+        with fx_move_cols[1]:
+            if st.button(
+                f"➡️ Move '{fc.task_b_title}' after '{fc.task_a_title}'",
+                key=f"fixed_conflict_move_b_{f_idx}", use_container_width=True,
+            ):
+                row = _find_fixed_task(fc.task_b_title, fc.task_b_start, b_duration)
+                if row is not None and reschedule_fixed_task(row["task_id"], fc.task_a_end):
+                    _run_and_track_conflicts()
+                    st.rerun()
+        fx_remove_cols = st.columns(2)
+        with fx_remove_cols[0]:
+            if st.button(
+                f"🗑️ Remove '{fc.task_a_title}'",
+                key=f"fixed_conflict_remove_a_{f_idx}", use_container_width=True,
+            ):
+                row = _find_fixed_task(fc.task_a_title, fc.task_a_start, a_duration)
+                if row is not None and delete_task(row["task_id"]):
+                    _run_and_track_conflicts()
+                    st.rerun()
+        with fx_remove_cols[1]:
+            if st.button(
+                f"🗑️ Remove '{fc.task_b_title}'",
+                key=f"fixed_conflict_remove_b_{f_idx}", use_container_width=True,
+            ):
+                row = _find_fixed_task(fc.task_b_title, fc.task_b_start, b_duration)
+                if row is not None and delete_task(row["task_id"]):
+                    _run_and_track_conflicts()
+                    st.rerun()
+
+    # ── Delay warning: break pushed back a high-priority task ──
+    # Not a conflict (the scheduler placed everything fine on its own),
+    # just a heads-up + a one-click way back to how it was.
+    delay_warnings = st.session_state.get(DELAY_WARNING_KEY) or []
+    if delay_warnings:
+        delay_lines = "; ".join(
+            f"**'{d['title']}'** {format_time_12h(d['old_start'])} → {format_time_12h(d['new_start'])}"
+            for d in delay_warnings
+        )
+        st.warning(f"⚠️ This break pushed back a high-priority task: {delay_lines}.")
+        warn_cols = st.columns([2, 1])
+        with warn_cols[0]:
+            if st.button("↩️ Undo — remove this break", key="undo_break_delay", use_container_width=True):
+                last_break_id = st.session_state.get(LAST_BREAK_ADDED_KEY)
+                if last_break_id and delete_task(last_break_id):
+                    st.session_state[DELAY_WARNING_KEY] = []
+                    st.session_state[LAST_BREAK_ADDED_KEY] = None
+                    _run_and_track_conflicts()
+                    st.toast("Break removed — schedule restored.", icon="↩️")
+                    st.rerun()
+                else:
+                    st.error("Couldn't undo — the break may have already been changed.")
+        with warn_cols[1]:
+            if st.button("Keep it", key="dismiss_break_delay", use_container_width=True):
+                st.session_state[DELAY_WARNING_KEY] = []
+                st.rerun()
 
     # ── Export to Google Calendar ──
     if is_google_calendar_connected(user_id) and is_scheduled:
@@ -1141,23 +1339,47 @@ else:
                 _selected_cals = get_selected_calendars(user_id)
                 _cal_colors = {c["calendar_id"]: c.get("color", "#4285F4") for c in _selected_cals}
                 _cal_names = {c["calendar_id"]: c.get("calendar_name", "") for c in _selected_cals}
+                # Events already turned into a task (via Import as Task,
+                # or previously exported the other way) — matched by
+                # google_event_id, which every real task row carries once
+                # it's linked to a calendar event either direction.
+                _imported_event_ids = {
+                    t.get("google_event_id") for t in tasks if t.get("google_event_id")
+                }
 
                 with st.expander(f"📅 Google Calendar ({len(_gcal_events)} event{'s' if len(_gcal_events) != 1 else ''})", expanded=False):
-                    for ev in _gcal_events:
+                    for _ev_idx, ev in enumerate(_gcal_events):
                         _ev_color = _cal_colors.get(ev.get("calendar_id"), "#4285F4")
                         _ev_cal_name = _cal_names.get(ev.get("calendar_id"), "")
-                        st.markdown(
-                            f"<div style='display:flex; align-items:center; gap:10px; "
-                            f"padding:6px 10px; margin-bottom:4px; "
-                            f"border-left:3px solid {_ev_color}; "
-                            f"background:var(--bg-card); border-radius:4px;'>"
-                            f"<span style='font-weight:600; color:var(--text-primary);'>"
-                            f"{ev.get('start_time', '?')} – {ev.get('end_time', '?')}</span>"
-                            f"<span style='color:var(--text-secondary);'>{ev.get('title', '(No title)')}</span>"
-                            f"<span style='font-size:0.75rem; color:var(--text-muted); margin-left:auto;'>{_ev_cal_name}</span>"
-                            f"</div>",
-                            unsafe_allow_html=True,
-                        )
+                        _ev_row_cols = st.columns([5, 1.3])
+                        with _ev_row_cols[0]:
+                            st.markdown(
+                                f"<div style='display:flex; align-items:center; gap:10px; "
+                                f"padding:6px 10px; margin-bottom:4px; "
+                                f"border-left:3px solid {_ev_color}; "
+                                f"background:var(--bg-card); border-radius:4px;'>"
+                                f"<span style='font-weight:600; color:var(--text-primary);'>"
+                                f"{ev.get('start_time', '?')} – {ev.get('end_time', '?')}</span>"
+                                f"<span style='color:var(--text-secondary);'>{ev.get('title', '(No title)')}</span>"
+                                f"<span style='font-size:0.75rem; color:var(--text-muted); margin-left:auto;'>{_ev_cal_name}</span>"
+                                f"</div>",
+                                unsafe_allow_html=True,
+                            )
+                        with _ev_row_cols[1]:
+                            if ev.get("google_event_id") in _imported_event_ids:
+                                st.caption("✅ Imported")
+                            else:
+                                if st.button(
+                                    "➕ Import as Task",
+                                    key=f"import_gcal_event_{_ev_idx}",
+                                    use_container_width=True,
+                                ):
+                                    new_task_id = import_calendar_event_as_task(plan["plan_id"], ev)
+                                    if new_task_id:
+                                        st.toast(f"Imported '{ev.get('title')}' as a task.", icon="📥")
+                                        st.rerun()
+                                    else:
+                                        st.error("Couldn't import this event as a task.")
 
     with dist_col:
         st.markdown("#### 🥯 Task Distribution")

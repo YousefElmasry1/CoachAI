@@ -320,6 +320,28 @@ def load_user(user_id: str = DEFAULT_USER_ID) -> dict:
     return dict(row)
 
 
+def set_user_timezone(user_id: str, tz_name: str) -> bool:
+    """Update the user's stored IANA timezone (users.timezone column).
+
+    Used by the Settings page's manual timezone picker — a temporary
+    stand-in until the mobile app can set this automatically. Affects
+    the greeting's time-of-day and analytics like the Focus Pattern
+    Matrix, both of which read timezone off load_user().
+
+    Returns True on success, False on error.
+    """
+    try:
+        db = get_database()
+        db.execute(
+            "UPDATE users SET timezone = ? WHERE user_id = ?",
+            (tz_name, user_id),
+        )
+        db.connection.commit()
+        return True
+    except Exception:
+        return False
+
+
 def load_user_profile(user_id: str = DEFAULT_USER_ID) -> dict:
     """Load the user's cached profile from user_profiles table."""
     db = get_database()
@@ -1219,6 +1241,85 @@ def get_last_scheduling_conflicts() -> list:
     return getattr(service, "last_conflicts", [])
 
 
+def get_persisted_scheduling_conflicts(user_id: str = DEFAULT_USER_ID) -> list:
+    """Return break-vs-fixed-task conflicts straight from what's already
+    saved in the database for today's plan.
+
+    Unlike get_last_scheduling_conflicts(), this does NOT require the
+    scheduler to have run in this session — so it also catches a
+    conflict left over from an earlier session or a different page
+    (e.g. a break added yesterday whose overlap was never resolved).
+    Call this on every page load so a stale, unresolved conflict is
+    never silently hidden just because nobody happened to press
+    "Run Scheduler" this time.
+
+    Returns:
+        A list of SchedulingConflict objects (empty if none).
+    """
+    from scheduler_service import detect_persisted_break_conflicts
+    tasks = load_today_tasks(user_id=user_id)
+    return detect_persisted_break_conflicts(tasks)
+
+
+def get_last_fixed_task_conflicts() -> list:
+    """Return fixed-task-vs-fixed-task conflicts (two ordinary,
+    non-break tasks overlapping each other) from the most recent
+    run_scheduler_for_plan() / run_scheduler_for_today() call.
+
+    Counterpart to get_last_scheduling_conflicts() for two ordinary
+    fixed-time tasks instead of a break and a task — e.g. two imported
+    calendar events both pinned to 10:00-11:00.
+
+    Returns:
+        A list of FixedTaskConflict objects (empty if none, or if the
+        scheduler has not run yet this session).
+    """
+    service = get_scheduler_service()
+    return getattr(service, "last_fixed_conflicts", [])
+
+
+def get_persisted_fixed_task_conflicts(user_id: str = DEFAULT_USER_ID) -> list:
+    """Return fixed-task-vs-fixed-task conflicts straight from what's
+    already saved in the database for today's plan — the
+    fixed-vs-fixed counterpart to get_persisted_scheduling_conflicts().
+    Does NOT require the scheduler to have run this session.
+
+    Returns:
+        A list of FixedTaskConflict objects (empty if none).
+    """
+    from scheduler_service import detect_persisted_fixed_task_conflicts
+    tasks = load_today_tasks(user_id=user_id)
+    return detect_persisted_fixed_task_conflicts(tasks)
+
+
+def reschedule_fixed_task(task_id: int, new_start_time: time) -> bool:
+    """
+    Shift any fixed-time task (break or not) to a new start time,
+    keeping its original duration. Generalises reschedule_break() to
+    ordinary fixed-time tasks too, for resolving a fixed-vs-fixed
+    conflict (e.g. "move Task B to right after Task A").
+
+    Returns True on success, False on error.
+    """
+    db = get_database()
+    try:
+        task = db.get_task(task_id)
+        if task is None:
+            return False
+        duration = int(task["estimated_minutes"])
+        new_end_time = (
+            datetime.combine(date.today(), new_start_time) + timedelta(minutes=duration)
+        ).time()
+        db.update_task(
+            task_id,
+            scheduled_start=new_start_time.strftime("%H:%M"),
+            scheduled_end=new_end_time.strftime("%H:%M"),
+        )
+        return True
+    except Exception:
+        return False
+
+
 def run_scheduler_for_today(
     work_day_start,
     breaks: Optional[list[tuple]] = None,
@@ -1505,6 +1606,80 @@ def get_google_calendar_events_today(
         }
         for row in rows
     ]
+
+
+def import_calendar_event_as_task(
+    plan_id: int,
+    event: dict,
+    priority: int = 3,
+) -> Optional[int]:
+    """
+    Create a real, fixed-time task from a synced Google Calendar event
+    ("Import as Task").
+
+    A synced event otherwise only ever acts as an invisible obstacle:
+    get_google_calendar_blocked_slots() feeds it to the Scheduler as a
+    blocked_slots entry so other tasks route around it, but it never
+    shows up in Tasks/the Timeline and can't be started, completed, or
+    tracked like anything else the user is actually doing. This is what
+    lets the user opt an event into being a real task instead.
+
+    The new task's google_event_id is set to the event's own id. That
+    does double duty: get_google_calendar_blocked_slots() already skips
+    any event whose id matches a task's google_event_id (originally so
+    an exported task's own event isn't fed back as an obstacle against
+    itself) — here it means once imported, the event is no longer ALSO
+    counted as a separate blocked slot fighting its own task. It also
+    means a later "Export to Google Calendar" on this task updates the
+    same event instead of creating a duplicate.
+
+    Args:
+        plan_id: The plan to add the task to.
+        event: A dict as returned by get_google_calendar_events_today()
+            — needs title, start_time ('HH:MM'), end_time ('HH:MM'),
+            and google_event_id.
+        priority: Priority for the new task (default 3 = Medium) —
+            calendar events carry no priority signal of their own.
+
+    Returns:
+        The new task_id, or None on failure — including if this event
+        was already imported (checked via google_event_id, so calling
+        this twice on the same event is safe and never creates a
+        duplicate task).
+    """
+    db = get_database()
+    try:
+        start_str = str(event.get("start_time") or "")[:5]
+        end_str = str(event.get("end_time") or "")[:5]
+        start_t = datetime.strptime(start_str, "%H:%M")
+        end_t = datetime.strptime(end_str, "%H:%M")
+        duration = int((end_t - start_t).total_seconds() // 60)
+        if duration <= 0:
+            return None
+
+        target_event_id = event.get("google_event_id")
+        existing = db.get_tasks_by_plan(plan_id)
+        for row in existing:
+            row_event_id = row["google_event_id"] if "google_event_id" in row.keys() else None
+            if row_event_id and target_event_id and row_event_id == target_event_id:
+                return None  # already imported
+
+        order_index = len(existing)
+        task_id = db.add_task(
+            plan_id=plan_id,
+            title=str(event.get("title") or "Untitled event"),
+            priority=priority,
+            estimated_minutes=duration,
+            scheduled_start=start_str,
+            scheduled_end=end_str,
+            order_index=order_index,
+            is_fixed_time=True,
+        )
+        db.update_task_google_event_id(task_id, target_event_id)
+        load_analytics_profile.clear()
+        return task_id
+    except Exception:
+        return None
 
 
 def get_google_calendar_blocked_slots(
