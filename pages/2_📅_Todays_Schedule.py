@@ -1406,37 +1406,54 @@ st.markdown("<div style='height:1.2rem;'></div>", unsafe_allow_html=True)
 # Standalone data source (load_pause_matrix in services.py) meant to
 # be reusable by other analytics/AI Coach prompts too — this is just
 # the simplest possible surface for it here on Today's Schedule.
+#
+# A (category, time-of-day) bucket built from only 1-2 tasks isn't a
+# "pattern" yet — it's a single data point dressed up as one, and
+# showing it alongside a bucket with real signal buries the one row
+# that actually matters in noise. Mirrors how RescueTime/Toggl-style
+# tools handle this in practice: wait for enough of a baseline before
+# surfacing an insight, rather than showing a low-confidence one.
 # ─────────────────────────────────────────────────────────────
+
+FOCUS_PATTERN_MIN_TASKS = 3
 
 _pause_matrix = load_pause_matrix(user_id=user_id)
 if _pause_matrix:
+    _bucket_order = ["Morning", "Afternoon", "Evening", "Night", "Unknown"]
+    _sorted_matrix = sorted(
+        [r for r in _pause_matrix if r["task_count"] >= FOCUS_PATTERN_MIN_TASKS],
+        key=lambda r: (
+            r["category"],
+            _bucket_order.index(r["time_bucket"]) if r["time_bucket"] in _bucket_order else 99,
+        ),
+    )
     with st.expander("📊 Focus Pattern Matrix (category × time of day)", expanded=False):
-        st.caption(
-            "How many times you've paused tasks, broken down by category "
-            "and when you started them. A category with a high pause "
-            "count at a specific time of day is a pattern worth acting on "
-            "— e.g. move it to a time slot where it rarely gets paused."
-        )
-        _bucket_order = ["Morning", "Afternoon", "Evening", "Night", "Unknown"]
-        _sorted_matrix = sorted(
-            _pause_matrix,
-            key=lambda r: (
-                r["category"],
-                _bucket_order.index(r["time_bucket"]) if r["time_bucket"] in _bucket_order else 99,
-            ),
-        )
-        _mx_cols = st.columns([2, 2, 1, 1, 1, 1])
-        for col, label in zip(_mx_cols, ["Category", "Time of day", "Tasks", "Paused", "Avg/task", "Avg pause"]):
-            col.markdown(f"**{label}**")
-        for row in _sorted_matrix:
-            _r_cols = st.columns([2, 2, 1, 1, 1, 1])
-            _r_cols[0].write(row["category"])
-            _r_cols[1].write(row["time_bucket"])
-            _r_cols[2].write(row["task_count"])
-            highlight = "⚠️ " if row["avg_pauses_per_task"] >= 1.5 else ""
-            _r_cols[3].write(f"{highlight}{row['total_pauses']}")
-            _r_cols[4].write(f"{row['avg_pauses_per_task']:.1f}")
-            _r_cols[5].write(format_duration(round(row["avg_pause_duration_seconds"] / 60)))
+        if _sorted_matrix:
+            st.caption(
+                "How many times you've paused tasks, broken down by category "
+                "and when you started them. A category with a high pause "
+                "count at a specific time of day is a pattern worth acting on "
+                "— e.g. move it to a time slot where it rarely gets paused."
+            )
+            _mx_cols = st.columns([2, 2, 1, 1, 1, 1])
+            for col, label in zip(_mx_cols, ["Category", "Time of day", "Tasks", "Paused", "Avg/task", "Avg pause"]):
+                col.markdown(f"**{label}**")
+            for row in _sorted_matrix:
+                _r_cols = st.columns([2, 2, 1, 1, 1, 1])
+                _r_cols[0].write(row["category"])
+                _r_cols[1].write(row["time_bucket"])
+                _r_cols[2].write(row["task_count"])
+                highlight = "⚠️ " if row["avg_pauses_per_task"] >= 1.5 else ""
+                _r_cols[3].write(f"{highlight}{row['total_pauses']}")
+                _r_cols[4].write(f"{row['avg_pauses_per_task']:.1f}")
+                _r_cols[5].write(format_duration(round(row["avg_pause_duration_seconds"] / 60)))
+        else:
+            st.caption(
+                f"Not enough data yet — patterns need at least "
+                f"{FOCUS_PATTERN_MIN_TASKS} tasks started in the same "
+                f"category and time of day before they mean anything. "
+                f"Keep using the task timer and this will fill in."
+            )
 
 st.markdown("<div style='height:0.6rem;'></div>", unsafe_allow_html=True)
 
