@@ -47,7 +47,7 @@ logger.setLevel(logging.INFO)
 # Constants
 # ─────────────────────────────────────────────────────────────
 
-_MODEL_NAME: str = "gemini-3.6-flash"
+_MODEL_NAME: str = "gemini-3.8-flash"
 
 _SYSTEM_PROMPT: str = """\
 You are **CoachAI Assistant**, an AI productivity coach built into the CoachAI application.

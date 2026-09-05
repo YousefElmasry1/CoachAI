@@ -48,7 +48,7 @@ genai.configure(api_key=_GOOGLE_API_KEY)
 
 # Same model family used by planner.py / recommendation.py, for one
 # consistent Gemini version across the whole app.
-_MODEL_NAME: str = "gemini-3.6-flash"
+_MODEL_NAME: str = "gemini-3.8-flash"
 
 _TRANSCRIBE_PROMPT: str = (
     "You are an automatic speech recognition (ASR) engine, not an AI "

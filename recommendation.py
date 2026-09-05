@@ -138,7 +138,7 @@ _RECOMMENDATION_USER_PROMPT: str = (
 class RecommendationEngine:
 
 
-    _MODEL_NAME: str = "gemini-3.6-flash"
+    _MODEL_NAME: str = "gemini-3.8-flash"
     _TEMPERATURE: float = 0.2
     _MAX_RETRIES: int = 2
 
