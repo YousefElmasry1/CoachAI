@@ -969,6 +969,21 @@ class Database:
             (email,),
         )
 
+    def get_all_user_ids(self) -> list[str]:
+        """
+        Retrieve every user_id in the system.
+
+        Used by the daily stale-task cleanup job, which has to run
+        once for each user rather than for a single logged-in session
+        — unlike Streamlit's per-session ``maybe_close_out_stale_tasks``,
+        a backend-wide scheduler has no single "current user".
+
+        Returns:
+            All user_id values, in no particular order.
+        """
+        rows = self.fetch_all("SELECT user_id FROM users")
+        return [row["user_id"] for row in rows]
+
     # =====================================================================
     # PLANS
     # =====================================================================
@@ -1498,6 +1513,64 @@ class Database:
         )
         self.commit()
 
+    @staticmethod
+    def _stale_task_actual_minutes(
+        task: Optional[dict], plan_date_str: str
+    ) -> Optional[int]:
+        """
+        Work out actual_minutes for an in_progress task being auto-closed
+        by close_out_stale_tasks, without ever crediting time past the
+        end of the task's own plan day (23:59:59) or time spent paused.
+
+        - If the timer's active segment is still running
+          (timer_segment_started_at set), add only up to end-of-day for
+          that segment on top of whatever's already banked in
+          timer_accumulated_seconds.
+        - If the timer is paused (or was never started via the
+          pause/resume UI at all — e.g. a "break"), use whatever's
+          already banked, falling back to a plain started_at diff
+          (also capped) when there's no timer data at all.
+
+        Returns None when there's nothing to compute from, so the
+        caller falls back to update_task_status's own estimated_minutes
+        fallback.
+        """
+        if task is None:
+            return None
+
+        end_of_day = datetime.strptime(plan_date_str, "%Y-%m-%d").replace(
+            hour=23, minute=59, second=59
+        )
+        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        cap = min(now_utc, end_of_day)
+
+        accumulated_seconds = int(task.get("timer_accumulated_seconds") or 0)
+        segment_started_raw = task.get("timer_segment_started_at")
+
+        if segment_started_raw:
+            try:
+                segment_started = datetime.fromisoformat(str(segment_started_raw))
+                extra_seconds = max(0, (cap - segment_started).total_seconds())
+                return max(1, round((accumulated_seconds + extra_seconds) / 60))
+            except (ValueError, TypeError):
+                pass
+
+        if accumulated_seconds > 0:
+            return max(1, round(accumulated_seconds / 60))
+
+        # No timer data at all — e.g. a "break", or in_progress set some
+        # other way. Fall back to started_at, still capped at end-of-day.
+        started_at_raw = task.get("started_at")
+        if started_at_raw:
+            try:
+                started_dt = datetime.fromisoformat(str(started_at_raw))
+                elapsed_seconds = max(0, (cap - started_dt).total_seconds())
+                return max(1, round(elapsed_seconds / 60))
+            except (ValueError, TypeError):
+                pass
+
+        return None
+
     def close_out_stale_tasks(self, user_id: str) -> int:
         """
         Auto-close any task left ``pending``/``in_progress`` on a
@@ -1508,9 +1581,11 @@ class Database:
           ``failed`` with ``actual_minutes = 0`` — there's no real
           timer data to report since it was never touched.
         - A task that was started but never finished (``in_progress``)
-          is marked ``failed`` via ``update_task_status``, which reuses
-          the normal timer logic to compute real elapsed minutes from
-          ``started_at``.
+          is marked ``failed`` with ``actual_minutes`` computed by
+          ``_stale_task_actual_minutes``: pause-aware, and capped at
+          23:59:59 of the task's *own* plan day — never at "whenever
+          this cleanup happened to run", which could be many hours (or
+          days) after the plan day actually ended.
 
         Both get ``failure_reason = 'Ran out of time'`` — a signal the
         AI Coach can use to notice overcommitment patterns (e.g. "you
@@ -1525,7 +1600,7 @@ class Database:
         today = date.today().isoformat()
         stale = self.fetch_all(
             """
-            SELECT tasks.task_id, tasks.status
+            SELECT tasks.task_id, tasks.status, plans.plan_date AS plan_date
             FROM tasks
             JOIN plans ON plans.plan_id = tasks.plan_id
             WHERE plans.user_id = ?
@@ -1552,9 +1627,17 @@ class Database:
                     """,
                     (now_utc_str, now_utc_str, row["task_id"]),
                 )
-            else:  # in_progress — let the timer logic compute real elapsed time
+            else:  # in_progress — compute real elapsed time ourselves,
+                # respecting any paused stretches and capping at the end
+                # of the task's own plan day (not "whenever this cleanup
+                # happens to run", which could be many hours later).
+                task = self.get_task(row["task_id"])
+                capped_minutes = self._stale_task_actual_minutes(
+                    task, str(row["plan_date"])
+                )
                 self.update_task_status(
-                    row["task_id"], status="failed", failure_reason="Ran out of time"
+                    row["task_id"], status="failed", failure_reason="Ran out of time",
+                    actual_minutes=capped_minutes,
                 )
 
         self.commit()
