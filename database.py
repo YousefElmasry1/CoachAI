@@ -17,6 +17,19 @@ from sqlalchemy import (
 from sqlalchemy.engine import Connection, CursorResult, Engine
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
+from timezone_utils import get_user_timezone, safe_zoneinfo, local_hour_from_utc_string, user_today
+
+
+class OwnershipError(Exception):
+    """
+    Raised whenever a caller tries to read or mutate a plan/task that
+    either doesn't exist or doesn't belong to the given user_id.
+
+    Deliberately does not distinguish "not found" from "not yours" in
+    its message -- leaking that distinction back to a caller is itself
+    a (minor) information disclosure about which raw ids are valid.
+    """
+
 
 # ---------------------------------------------------------------------------
 # Schema — dialect-agnostic table definitions
@@ -407,78 +420,77 @@ class Database:
         (Postgres CHECK constraints CAN be altered in place with ALTER
         TABLE ... DROP/ADD CONSTRAINT, so this rebuild dance won't be
         needed there at all).
+
+        IMPORTANT: this used to hard-code the column list as it existed
+        the day this migration was written, so on any database where
+        other migrations (is_fixed_time, is_break, timer fields,
+        google_event_id, google_exported_at, ...) had already run, this
+        rebuild silently dropped every one of those columns and their
+        data. It now discovers the table's CURRENT full set of columns
+        at runtime and carries every single one of them over untouched,
+        only editing the ``failure_reason`` CHECK's allowed-value list
+        in place. It is also idempotent: the early-return above already
+        makes a second run a no-op, and the CREATE TABLE below always
+        reflects whatever columns exist right now, so it's safe however
+        many times it runs or in whatever order relative to the other
+        migrations.
         """
         cursor = self.connection.execute(
             text("SELECT sql FROM sqlite_master WHERE type='table' AND name='tasks'")
         )
         row = cursor.fetchone()
         if row is None or row[0] is None or "Ran out of time" in row[0]:
-            return  # Already up to date (or table doesn't exist yet)
+            return  # Already up to date, or table doesn't exist yet.
+
+        old_ddl: str = row[0]
+
+        # Discover every column that exists on the table RIGHT NOW,
+        # whatever earlier/later migrations have already added, instead
+        # of assuming a fixed, potentially stale list.
+        info_rows = self.connection.execute(text("PRAGMA table_info(tasks)")).fetchall()
+        if not info_rows:
+            return
+        columns = [info_row[1] for info_row in info_rows]
+        col_list_sql = ", ".join(columns)
+
+        # Only rewrite the failure_reason CHECK's allowed-value list.
+        # Every other column definition, type, default, other CHECK
+        # constraint, and foreign key in the original DDL text is
+        # carried over completely unchanged.
+        new_ddl, n_subs = re.subn(
+            r"CHECK\s*\(\s*failure_reason\s+IN\s*\([^)]*\)\s*\)",
+            "CHECK (failure_reason IN ("
+            "'Harder than expected','Distracted','Tired',"
+            "'Unexpected event','Changed priorities','Ran out of time'))",
+            old_ddl,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        if n_subs == 0:
+            # Defensive: the constraint didn't look like we expected.
+            # Don't blindly rebuild the table and risk losing data --
+            # bail out safely and leave the table as-is.
+            return
+
+        new_ddl = re.sub(
+            r"CREATE TABLE\s+tasks\b", "CREATE TABLE tasks_new", new_ddl, count=1, flags=re.IGNORECASE
+        )
 
         raw = self._raw_dbapi()
         raw.execute("PRAGMA foreign_keys = OFF")
         try:
             raw.execute("BEGIN")
-            raw.execute("ALTER TABLE tasks RENAME TO tasks_old")
+            raw.execute(new_ddl)
             raw.execute(
-                """
-                CREATE TABLE tasks (
-                    task_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    plan_id INTEGER NOT NULL,
-                    category_id INTEGER,
-                    title TEXT NOT NULL,
-                    description TEXT,
-                    priority INTEGER NOT NULL DEFAULT 3
-                        CHECK (priority BETWEEN 1 AND 5),
-                    estimated_minutes INTEGER NOT NULL DEFAULT 30
-                        CHECK (estimated_minutes >= 0),
-                    scheduled_start TIME,
-                    scheduled_end TIME,
-                    order_index INTEGER NOT NULL DEFAULT 0,
-                    status TEXT NOT NULL DEFAULT 'pending'
-                        CHECK (status IN ('pending', 'in_progress', 'completed', 'failed')),
-                    failure_reason TEXT
-                        CHECK (failure_reason IN (
-                            'Harder than expected',
-                            'Distracted',
-                            'Tired',
-                            'Unexpected event',
-                            'Changed priorities',
-                            'Ran out of time'
-                        )),
-                    actual_minutes INTEGER
-                        CHECK (actual_minutes >= 0),
-                    started_at DATETIME,
-                    completed_at DATETIME,
-                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-
-                    FOREIGN KEY (plan_id) REFERENCES plans(plan_id) ON DELETE CASCADE,
-                    FOREIGN KEY (category_id) REFERENCES categories(category_id) ON DELETE SET NULL
-                )
-                """
+                f"INSERT INTO tasks_new ({col_list_sql}) "
+                f"SELECT {col_list_sql} FROM tasks"
             )
-            raw.execute(
-                """
-                INSERT INTO tasks (
-                    task_id, plan_id, category_id, title, description, priority,
-                    estimated_minutes, scheduled_start, scheduled_end, order_index,
-                    status, failure_reason, actual_minutes, started_at, completed_at,
-                    created_at, updated_at
-                )
-                SELECT
-                    task_id, plan_id, category_id, title, description, priority,
-                    estimated_minutes, scheduled_start, scheduled_end, order_index,
-                    status, failure_reason, actual_minutes, started_at, completed_at,
-                    created_at, updated_at
-                FROM tasks_old
-                """
-            )
-            raw.execute("DROP TABLE tasks_old")
-            raw.execute("CREATE INDEX idx_tasks_plan_id ON tasks(plan_id)")
-            raw.execute("CREATE INDEX idx_tasks_category_id ON tasks(category_id)")
-            raw.execute("CREATE INDEX idx_tasks_status ON tasks(status)")
-            raw.execute("CREATE INDEX idx_tasks_plan_status ON tasks(plan_id, status)")
+            raw.execute("DROP TABLE tasks")
+            raw.execute("ALTER TABLE tasks_new RENAME TO tasks")
+            raw.execute("CREATE INDEX IF NOT EXISTS idx_tasks_plan_id ON tasks(plan_id)")
+            raw.execute("CREATE INDEX IF NOT EXISTS idx_tasks_category_id ON tasks(category_id)")
+            raw.execute("CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)")
+            raw.execute("CREATE INDEX IF NOT EXISTS idx_tasks_plan_status ON tasks(plan_id, status)")
             raw.commit()
         except Exception:
             raw.rollback()
@@ -715,19 +727,60 @@ class Database:
         tuple of values) into SQLAlchemy's dialect-agnostic named-param
         style, so the exact same SQL string works against SQLite or
         Postgres without every call site needing to change.
+
+        This walks the SQL character-by-character and only treats a
+        bare ``?`` as a placeholder when it is OUTSIDE a quoted string
+        literal (single-quoted ``'...'``, double-quoted ``"..."``, since
+        SQLite allows either for string literals). A literal ``?``
+        inside a quoted string (e.g. ``WHERE title = 'Done?'``) is left
+        untouched and passed straight through instead of being mistaken
+        for a bind parameter. A doubled quote (``''`` / `""`) inside a
+        literal — the standard SQL escape for a literal quote character
+        — is handled so it doesn't prematurely end the string.
         """
         if not parameters:
             return text(sql), {}
 
         counter = count(1)
         param_names: list[str] = []
+        out: list[str] = []
 
-        def _replace(_match: "re.Match[str]") -> str:
-            name = f"p{next(counter)}"
-            param_names.append(name)
-            return f":{name}"
+        i = 0
+        n = len(sql)
+        quote_char: Optional[str] = None
+        while i < n:
+            ch = sql[i]
+            if quote_char is not None:
+                out.append(ch)
+                if ch == quote_char:
+                    # A doubled quote is an escaped literal quote, not
+                    # the end of the string -- consume both characters
+                    # and stay inside the string.
+                    if i + 1 < n and sql[i + 1] == quote_char:
+                        out.append(sql[i + 1])
+                        i += 2
+                        continue
+                    quote_char = None
+                i += 1
+                continue
 
-        named_sql = re.sub(r"\?", _replace, sql)
+            if ch in ("'", '"'):
+                quote_char = ch
+                out.append(ch)
+                i += 1
+                continue
+
+            if ch == "?":
+                name = f"p{next(counter)}"
+                param_names.append(name)
+                out.append(f":{name}")
+                i += 1
+                continue
+
+            out.append(ch)
+            i += 1
+
+        named_sql = "".join(out)
         param_dict = {name: value for name, value in zip(param_names, parameters)}
         return text(named_sql), param_dict
 
@@ -1025,7 +1078,9 @@ class Database:
 
     def get_today_plan(self, user_id: str) -> Optional[sqlite3.Row]:
         """
-        Fetch the active plan for today (system local date).
+        Fetch the active plan for today, IN THE USER'S OWN TIMEZONE (not
+        the server's) -- otherwise a user near a day boundary can be
+        shown yesterday's/tomorrow's plan instead of their own "today".
 
         Args:
             user_id: Owner of the plan.
@@ -1033,7 +1088,7 @@ class Database:
         Returns:
             Plan row, or ``None`` if no plan exists for today.
         """
-        today = date.today().isoformat()
+        today = user_today(self, user_id).isoformat()
         return self.fetch_one(
             """
             SELECT * FROM plans
@@ -1064,19 +1119,23 @@ class Database:
             (user_id, plan_date.isoformat()),
         )
 
-    def get_plan_by_id(self, plan_id: int) -> Optional[sqlite3.Row]:
+    def get_plan_by_id(self, plan_id: int, user_id: str) -> Optional[sqlite3.Row]:
         """
-        Fetch a plan by its primary key.
+        Fetch a plan by its primary key, scoped to its owner.
 
         Args:
             plan_id: Plan primary key.
+            user_id: The caller's user_id. The plan is only returned if
+                it actually belongs to this user -- never trust a raw
+                plan_id alone, since it's just an incrementing integer
+                and every other user's plan is equally guessable.
 
         Returns:
-            Plan row, or ``None`` if not found.
+            Plan row, or ``None`` if not found OR not owned by user_id.
         """
         return self.fetch_one(
-            "SELECT * FROM plans WHERE plan_id = ?",
-            (plan_id,),
+            "SELECT * FROM plans WHERE plan_id = ? AND user_id = ?",
+            (plan_id, user_id),
         )
 
     def get_recent_plans(
@@ -1108,18 +1167,30 @@ class Database:
         query += " ORDER BY plan_date DESC, plan_id DESC"
         return self.fetch_all(query, tuple(params))
 
-    def update_plan_status(self, plan_id: int, status: str) -> None:
+    def update_plan_status(self, plan_id: int, user_id: str, status: str) -> None:
         """
         Update the status of a plan.
 
         Args:
             plan_id: Target plan.
+            user_id: The caller's user_id -- the update is scoped to a
+                plan actually owned by this user, in the same statement,
+                so there's no separate check-then-act race.
             status: New status value.
+
+        Raises:
+            OwnershipError: If plan_id doesn't exist or isn't owned by
+                user_id (no row matched, so nothing was updated).
         """
-        self.execute(
-            "UPDATE plans SET status = ? WHERE plan_id = ?",
-            (status, plan_id),
+        result = self.execute(
+            "UPDATE plans SET status = ? WHERE plan_id = ? AND user_id = ?",
+            (status, plan_id, user_id),
         )
+        if result.rowcount == 0:
+            self.connection.rollback()
+            raise OwnershipError(
+                f"Plan {plan_id} not found or not owned by user {user_id!r}."
+            )
         self.commit()
 
     # =====================================================================
@@ -1129,6 +1200,7 @@ class Database:
     def add_task(
         self,
         plan_id: int,
+        user_id: str,
         title: str,
         category_id: Optional[int] = None,
         description: Optional[str] = None,
@@ -1145,6 +1217,10 @@ class Database:
 
         Args:
             plan_id: Parent plan.
+            user_id: The caller's user_id. The insert is rejected unless
+                plan_id actually belongs to this user -- otherwise any
+                caller could attach tasks to another user's plan just by
+                guessing a plan_id.
             title: Task name (AI-extracted).
             category_id: Optional category classification.
             description: Optional extra context.
@@ -1167,7 +1243,20 @@ class Database:
 
         Returns:
             The newly created ``task_id``.
+
+        Raises:
+            OwnershipError: If plan_id doesn't exist or isn't owned by
+                user_id.
         """
+        owner_row = self.fetch_one(
+            "SELECT plan_id FROM plans WHERE plan_id = ? AND user_id = ?",
+            (plan_id, user_id),
+        )
+        if owner_row is None:
+            raise OwnershipError(
+                f"Plan {plan_id} not found or not owned by user {user_id!r}."
+            )
+
         task_id = self._insert_and_get_id(
             """
             INSERT INTO tasks (
@@ -1195,26 +1284,30 @@ class Database:
         self.commit()
         return task_id
 
-    def update_task(
+    def _update_task_no_commit(
         self,
         task_id: int,
+        user_id: str,
         **kwargs: Any,
     ) -> None:
         """
-        Update one or more columns on a task.
+        Same as update_task(), but does NOT commit (or roll back) on its
+        own -- the caller is responsible for wrapping one or more calls
+        to this in a single `with self.transaction():` block and letting
+        that commit everything together, or roll everything back
+        together if any one of them raises. Used by
+        scheduler_service._save_schedule() to make persisting an entire
+        schedule atomic: either every task gets its new time slot, or
+        (on any failure, including an ownership mismatch) none of them
+        do, rather than leaving the schedule half-updated.
 
-        Only columns present in ``kwargs`` are modified. Safe against SQL
-        injection because column names are whitelisted.
-
-        Args:
-            task_id: Target task.
-            **kwargs: Column names and new values.
-                      Allowed keys:
-                      ``title``, ``description``, ``priority``,
-                      ``estimated_minutes``, ``scheduled_start``,
-                      ``scheduled_end``, ``order_index``, ``category_id``,
-                      ``plan_id`` (used to move a task to a different
-                      day's plan, e.g. deferring it to tomorrow).
+        Raises:
+            OwnershipError: If task_id doesn't exist or isn't owned by
+                user_id, or (when moving a task) if the destination
+                plan_id isn't owned by user_id either. Raised WITHOUT
+                rolling back here -- that's the enclosing transaction's
+                job, so earlier calls in the same batch can be undone
+                too.
         """
         allowed = {
             "title",
@@ -1231,62 +1324,149 @@ class Database:
         if not updates:
             return
 
-        set_clause = ", ".join(f"{col} = ?" for col in updates)
-        values = list(updates.values()) + [task_id]
+        if "plan_id" in updates:
+            dest_owner = self.fetch_one(
+                "SELECT plan_id FROM plans WHERE plan_id = ? AND user_id = ?",
+                (updates["plan_id"], user_id),
+            )
+            if dest_owner is None:
+                raise OwnershipError(
+                    f"Destination plan {updates['plan_id']!r} not found or "
+                    f"not owned by user {user_id!r}."
+                )
 
-        self.execute(
-            f"UPDATE tasks SET {set_clause}, updated_at = CURRENT_TIMESTAMP WHERE task_id = ?",
+        set_clause = ", ".join(f"{col} = ?" for col in updates)
+        values = list(updates.values()) + [task_id, user_id]
+
+        result = self.execute(
+            f"""
+            UPDATE tasks SET {set_clause}, updated_at = CURRENT_TIMESTAMP
+            WHERE task_id = ?
+              AND plan_id IN (SELECT plan_id FROM plans WHERE user_id = ?)
+            """,
             tuple(values),
         )
+        if result.rowcount == 0:
+            raise OwnershipError(
+                f"Task {task_id} not found or not owned by user {user_id!r}."
+            )
+
+    def update_task(
+        self,
+        task_id: int,
+        user_id: str,
+        **kwargs: Any,
+    ) -> None:
+        """
+        Update one or more columns on a task.
+
+        Only columns present in ``kwargs`` are modified. Safe against SQL
+        injection because column names are whitelisted.
+
+        Args:
+            task_id: Target task.
+            user_id: The caller's user_id. The update only takes effect
+                if task_id belongs to a plan owned by this user (checked
+                atomically as part of the UPDATE's WHERE clause).
+            **kwargs: Column names and new values.
+                      Allowed keys:
+                      ``title``, ``description``, ``priority``,
+                      ``estimated_minutes``, ``scheduled_start``,
+                      ``scheduled_end``, ``order_index``, ``category_id``,
+                      ``plan_id`` (used to move a task to a different
+                      day's plan, e.g. deferring it to tomorrow -- the
+                      NEW plan_id is also verified as owned by user_id,
+                      so a task can never be moved into someone else's
+                      plan).
+
+        Raises:
+            OwnershipError: If task_id doesn't exist or isn't owned by
+                user_id, or (when moving a task) if the destination
+                plan_id isn't owned by user_id either.
+        """
+        try:
+            self._update_task_no_commit(task_id, user_id, **kwargs)
+        except OwnershipError:
+            self.connection.rollback()
+            raise
         self.commit()
 
-    def delete_task(self, task_id: int) -> None:
+    def delete_task(self, task_id: int, user_id: str) -> None:
         """
         Remove a task permanently.
 
         Args:
             task_id: Task to delete.
+            user_id: The caller's user_id. The delete only takes effect
+                if task_id belongs to a plan owned by this user.
+
+        Raises:
+            OwnershipError: If task_id doesn't exist or isn't owned by
+                user_id.
         """
-        self.execute("DELETE FROM tasks WHERE task_id = ?", (task_id,))
+        result = self.execute(
+            """
+            DELETE FROM tasks
+            WHERE task_id = ?
+              AND plan_id IN (SELECT plan_id FROM plans WHERE user_id = ?)
+            """,
+            (task_id, user_id),
+        )
+        if result.rowcount == 0:
+            self.connection.rollback()
+            raise OwnershipError(
+                f"Task {task_id} not found or not owned by user {user_id!r}."
+            )
         self.commit()
 
-    def get_tasks_by_plan(self, plan_id: int) -> list[sqlite3.Row]:
+    def get_tasks_by_plan(self, plan_id: int, user_id: str) -> list[sqlite3.Row]:
         """
         Retrieve all tasks belonging to a plan, ordered by display index.
 
         Args:
             plan_id: Parent plan.
+            user_id: The caller's user_id. Returns an empty list (same
+                as "plan doesn't exist") if plan_id isn't owned by this
+                user, rather than leaking another user's tasks.
 
         Returns:
             List of task rows.
         """
         return self.fetch_all(
             """
-            SELECT * FROM tasks
-            WHERE plan_id = ?
-            ORDER BY order_index ASC, task_id ASC
+            SELECT t.* FROM tasks t
+            JOIN plans p ON t.plan_id = p.plan_id
+            WHERE t.plan_id = ? AND p.user_id = ?
+            ORDER BY t.order_index ASC, t.task_id ASC
             """,
-            (plan_id,),
+            (plan_id, user_id),
         )
 
-    def get_task(self, task_id: int) -> Optional[sqlite3.Row]:
+    def get_task(self, task_id: int, user_id: str) -> Optional[sqlite3.Row]:
         """
-        Fetch a single task by ID.
+        Fetch a single task by ID, scoped to its owner.
 
         Args:
             task_id: Task primary key.
+            user_id: The caller's user_id. The task is only returned if
+                it belongs to a plan owned by this user.
 
         Returns:
-            Task row, or ``None`` if not found.
+            Task row, or ``None`` if not found OR not owned by user_id.
         """
         return self.fetch_one(
-            "SELECT * FROM tasks WHERE task_id = ?",
-            (task_id,),
+            """
+            SELECT t.* FROM tasks t
+            JOIN plans p ON t.plan_id = p.plan_id
+            WHERE t.task_id = ? AND p.user_id = ?
+            """,
+            (task_id, user_id),
         )
 
     def set_task_timer_state(
         self,
         task_id: int,
+        user_id: str,
         accumulated_seconds: int,
         segment_started_at: Optional[str],
         paused_at: Optional[str],
@@ -1302,6 +1482,8 @@ class Database:
 
         Args:
             task_id: Target task.
+            user_id: The caller's user_id. The update only takes effect
+                if task_id belongs to a plan owned by this user.
             accumulated_seconds: Total active seconds banked from every
                 completed run segment (excludes the current one).
             segment_started_at: ``YYYY-MM-DD HH:MM:SS`` UTC timestamp
@@ -1312,8 +1494,12 @@ class Database:
             total_paused_seconds: Cumulative duration of every FINISHED
                 pause (the currently-open one, if any, is on top of
                 this at read time, not included here yet).
+
+        Raises:
+            OwnershipError: If task_id doesn't exist or isn't owned by
+                user_id.
         """
-        self.execute(
+        result = self.execute(
             """
             UPDATE tasks
             SET timer_accumulated_seconds = ?,
@@ -1322,18 +1508,38 @@ class Database:
                 timer_total_paused_seconds = ?,
                 updated_at = CURRENT_TIMESTAMP
             WHERE task_id = ?
+              AND plan_id IN (SELECT plan_id FROM plans WHERE user_id = ?)
             """,
-            (accumulated_seconds, segment_started_at, paused_at, total_paused_seconds, task_id),
+            (accumulated_seconds, segment_started_at, paused_at, total_paused_seconds, task_id, user_id),
         )
+        if result.rowcount == 0:
+            self.connection.rollback()
+            raise OwnershipError(
+                f"Task {task_id} not found or not owned by user {user_id!r}."
+            )
         self.commit()
 
-    def increment_task_pause_count(self, task_id: int) -> None:
-        """Bump a task's pause_count by 1 (called once per Pause click)."""
-        self.execute(
-            "UPDATE tasks SET pause_count = pause_count + 1, "
-            "updated_at = CURRENT_TIMESTAMP WHERE task_id = ?",
-            (task_id,),
+    def increment_task_pause_count(self, task_id: int, user_id: str) -> None:
+        """Bump a task's pause_count by 1 (called once per Pause click).
+
+        Raises:
+            OwnershipError: If task_id doesn't exist or isn't owned by
+                user_id.
+        """
+        result = self.execute(
+            """
+            UPDATE tasks SET pause_count = pause_count + 1,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE task_id = ?
+              AND plan_id IN (SELECT plan_id FROM plans WHERE user_id = ?)
+            """,
+            (task_id, user_id),
         )
+        if result.rowcount == 0:
+            self.connection.rollback()
+            raise OwnershipError(
+                f"Task {task_id} not found or not owned by user {user_id!r}."
+            )
         self.commit()
 
     def get_pause_matrix(
@@ -1388,10 +1594,16 @@ class Database:
             (user_id, since_date),
         )
 
+        tz_name = get_user_timezone(self, user_id)
+
         def _bucket(started_at_raw) -> str:
-            try:
-                hour = datetime.fromisoformat(str(started_at_raw)).hour
-            except (ValueError, TypeError):
+            # started_at is stored as a naive UTC timestamp -- bucket by
+            # the HOUR IN THE USER'S OWN TIMEZONE, not whatever hour the
+            # raw UTC string happens to show. Taking .hour directly off
+            # the UTC string here used to put a user's evening tasks
+            # into the wrong bucket for anyone not physically in UTC.
+            hour = local_hour_from_utc_string(started_at_raw, tz_name)
+            if hour is None:
                 return "Unknown"
             if 5 <= hour < 12:
                 return "Morning"
@@ -1440,6 +1652,7 @@ class Database:
     def update_task_status(
         self,
         task_id: int,
+        user_id: str,
         status: str,
         failure_reason: Optional[str] = None,
         actual_minutes: Optional[int] = None,
@@ -1460,32 +1673,44 @@ class Database:
 
         Args:
             task_id: Target task.
+            user_id: The caller's user_id. The update only takes effect
+                if task_id belongs to a plan owned by this user.
             status: New status ('in_progress', 'completed', or 'failed').
             failure_reason: Required when status is 'failed'.
             actual_minutes: Optional explicit override for actual
                 duration. Leave unset to let the timer compute it.
+
+        Raises:
+            OwnershipError: If task_id doesn't exist or isn't owned by
+                user_id.
         """
         now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
         now_utc_str = now_utc.strftime("%Y-%m-%d %H:%M:%S")
 
         if status == "in_progress":
-            self.execute(
+            result = self.execute(
                 """
                 UPDATE tasks
                 SET status = ?,
                     started_at = COALESCE(started_at, ?),
                     updated_at = ?
                 WHERE task_id = ?
+                  AND plan_id IN (SELECT plan_id FROM plans WHERE user_id = ?)
                 """,
-                (status, now_utc_str, now_utc_str, task_id),
+                (status, now_utc_str, now_utc_str, task_id, user_id),
             )
+            if result.rowcount == 0:
+                self.connection.rollback()
+                raise OwnershipError(
+                    f"Task {task_id} not found or not owned by user {user_id!r}."
+                )
             self.commit()
             return
 
         completed_at = now_utc_str if status in ("completed", "failed") else None
 
         if status in ("completed", "failed") and actual_minutes is None:
-            task = self.get_task(task_id)
+            task = self.get_task(task_id, user_id)
             started_at_raw = task["started_at"] if task is not None else None
             if started_at_raw:
                 try:
@@ -1499,7 +1724,7 @@ class Database:
                 # timer data exists, so fall back to the estimate.
                 actual_minutes = task["estimated_minutes"]
 
-        self.execute(
+        result = self.execute(
             """
             UPDATE tasks
             SET status = ?,
@@ -1508,19 +1733,26 @@ class Database:
                 completed_at = ?,
                 updated_at = ?
             WHERE task_id = ?
+              AND plan_id IN (SELECT plan_id FROM plans WHERE user_id = ?)
             """,
-            (status, failure_reason, actual_minutes, completed_at, now_utc_str, task_id),
+            (status, failure_reason, actual_minutes, completed_at, now_utc_str, task_id, user_id),
         )
+        if result.rowcount == 0:
+            self.connection.rollback()
+            raise OwnershipError(
+                f"Task {task_id} not found or not owned by user {user_id!r}."
+            )
         self.commit()
 
     @staticmethod
     def _stale_task_actual_minutes(
-        task: Optional[dict], plan_date_str: str
+        task: Optional[dict], plan_date_str: str, tz_name: str = "UTC"
     ) -> Optional[int]:
         """
         Work out actual_minutes for an in_progress task being auto-closed
         by close_out_stale_tasks, without ever crediting time past the
-        end of the task's own plan day (23:59:59) or time spent paused.
+        end of the task's own plan day (23:59:59, IN THE USER'S OWN
+        TIMEZONE) or time spent paused.
 
         - If the timer's active segment is still running
           (timer_segment_started_at set), add only up to end-of-day for
@@ -1531,6 +1763,15 @@ class Database:
           already banked, falling back to a plain started_at diff
           (also capped) when there's no timer data at all.
 
+        Args:
+            task: The stale task row.
+            plan_date_str: The task's plan's ``plan_date`` (ISO date),
+                interpreted as a LOCAL calendar date in ``tz_name``.
+            tz_name: The plan owner's IANA timezone. All timer/started_at
+                values are naive UTC in storage; this is what lets us
+                compute the correct UTC instant for "end of THIS user's
+                day" instead of assuming the server's local timezone.
+
         Returns None when there's nothing to compute from, so the
         caller falls back to update_task_status's own estimated_minutes
         fallback.
@@ -1538,9 +1779,15 @@ class Database:
         if task is None:
             return None
 
-        end_of_day = datetime.strptime(plan_date_str, "%Y-%m-%d").replace(
-            hour=23, minute=59, second=59
-        )
+        plan_local_date = datetime.strptime(plan_date_str, "%Y-%m-%d").date()
+        tz = safe_zoneinfo(tz_name)
+        # The UTC instant corresponding to 23:59:59 local time on the
+        # plan's own date -- NOT a naive 23:59:59, which silently
+        # assumes the server's local timezone equals the user's.
+        end_of_day_local = datetime.combine(
+            plan_local_date, datetime.max.time().replace(microsecond=0)
+        ).replace(tzinfo=tz)
+        end_of_day = end_of_day_local.astimezone(timezone.utc).replace(tzinfo=None)
         now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
         cap = min(now_utc, end_of_day)
 
@@ -1583,9 +1830,9 @@ class Database:
         - A task that was started but never finished (``in_progress``)
           is marked ``failed`` with ``actual_minutes`` computed by
           ``_stale_task_actual_minutes``: pause-aware, and capped at
-          23:59:59 of the task's *own* plan day — never at "whenever
-          this cleanup happened to run", which could be many hours (or
-          days) after the plan day actually ended.
+          23:59:59 of the task's *own* plan day in THIS USER'S timezone
+          — never the server's local timezone, and never at "whenever
+          this cleanup happened to run".
 
         Both get ``failure_reason = 'Ran out of time'`` — a signal the
         AI Coach can use to notice overcommitment patterns (e.g. "you
@@ -1597,7 +1844,8 @@ class Database:
         Returns:
             The number of tasks that were closed out.
         """
-        today = date.today().isoformat()
+        tz_name = get_user_timezone(self, user_id)
+        today = user_today(self, user_id).isoformat()
         stale = self.fetch_all(
             """
             SELECT tasks.task_id, tasks.status, plans.plan_date AS plan_date
@@ -1629,14 +1877,15 @@ class Database:
                 )
             else:  # in_progress — compute real elapsed time ourselves,
                 # respecting any paused stretches and capping at the end
-                # of the task's own plan day (not "whenever this cleanup
-                # happens to run", which could be many hours later).
-                task = self.get_task(row["task_id"])
+                # of the task's own plan day (in the user's timezone,
+                # not "whenever this cleanup happens to run", which
+                # could be many hours later).
+                task = self.get_task(row["task_id"], user_id)
                 capped_minutes = self._stale_task_actual_minutes(
-                    task, str(row["plan_date"])
+                    task, str(row["plan_date"]), tz_name
                 )
                 self.update_task_status(
-                    row["task_id"], status="failed", failure_reason="Ran out of time",
+                    row["task_id"], user_id, status="failed", failure_reason="Ran out of time",
                     actual_minutes=capped_minutes,
                 )
 
@@ -2112,7 +2361,7 @@ class Database:
         self.commit()
         return event_id
 
-    def mark_task_exported(self, task_id: int) -> None:
+    def mark_task_exported(self, task_id: int, user_id: str) -> None:
         """
         Stamp a task as freshly exported to Google Calendar (its
         scheduled_start/scheduled_end at this exact moment are now
@@ -2124,14 +2373,29 @@ class Database:
 
         Args:
             task_id: The task that was just (re-)exported.
+            user_id: The caller's user_id. The update only takes effect
+                if task_id belongs to a plan owned by this user.
+
+        Raises:
+            OwnershipError: If task_id doesn't exist or isn't owned by
+                user_id.
         """
-        self.execute(
-            "UPDATE tasks SET google_exported_at = CURRENT_TIMESTAMP WHERE task_id = ?",
-            (task_id,),
+        result = self.execute(
+            """
+            UPDATE tasks SET google_exported_at = CURRENT_TIMESTAMP
+            WHERE task_id = ?
+              AND plan_id IN (SELECT plan_id FROM plans WHERE user_id = ?)
+            """,
+            (task_id, user_id),
         )
+        if result.rowcount == 0:
+            self.connection.rollback()
+            raise OwnershipError(
+                f"Task {task_id} not found or not owned by user {user_id!r}."
+            )
         self.commit()
 
-    def get_stale_google_exports(self, plan_id: int) -> list[dict]:
+    def get_stale_google_exports(self, plan_id: int, user_id: str) -> list[dict]:
         """
         Find tasks in a plan that were exported to Google Calendar at
         some point, but whose scheduled_start/scheduled_end has changed
@@ -2143,6 +2407,9 @@ class Database:
 
         Args:
             plan_id: The plan to check.
+            user_id: The caller's user_id. Returns an empty list (same
+                as "plan doesn't exist") if plan_id isn't owned by this
+                user.
 
         Returns:
             List of task rows whose Google Calendar event no longer
@@ -2150,16 +2417,18 @@ class Database:
         """
         return self.fetch_all(
             """
-            SELECT * FROM tasks
-            WHERE plan_id = ?
-              AND google_event_id IS NOT NULL
+            SELECT t.* FROM tasks t
+            JOIN plans p ON t.plan_id = p.plan_id
+            WHERE t.plan_id = ?
+              AND p.user_id = ?
+              AND t.google_event_id IS NOT NULL
               AND (
-                    google_exported_at IS NULL
-                    OR updated_at > google_exported_at
+                    t.google_exported_at IS NULL
+                    OR t.updated_at > t.google_exported_at
                   )
-            ORDER BY order_index ASC, task_id ASC
+            ORDER BY t.order_index ASC, t.task_id ASC
             """,
-            (plan_id,),
+            (plan_id, user_id),
         )
 
     def get_google_calendar_events(
@@ -2232,31 +2501,51 @@ class Database:
     def update_task_google_event_id(
         self,
         task_id: int,
+        user_id: str,
         google_event_id: Optional[str],
     ) -> None:
         """Set the Google Calendar event ID for a newly-exported task,
-        and stamp it as freshly exported (see mark_task_exported)."""
-        self.execute(
+        and stamp it as freshly exported (see mark_task_exported).
+
+        Raises:
+            OwnershipError: If task_id doesn't exist or isn't owned by
+                user_id.
+        """
+        result = self.execute(
             """
             UPDATE tasks
             SET google_event_id = ?, google_exported_at = CURRENT_TIMESTAMP,
                 updated_at = CURRENT_TIMESTAMP
             WHERE task_id = ?
+              AND plan_id IN (SELECT plan_id FROM plans WHERE user_id = ?)
             """,
-            (google_event_id, task_id),
+            (google_event_id, task_id, user_id),
         )
+        if result.rowcount == 0:
+            self.connection.rollback()
+            raise OwnershipError(
+                f"Task {task_id} not found or not owned by user {user_id!r}."
+            )
         self.commit()
 
     def get_tasks_with_google_event_id(
         self,
         plan_id: int,
+        user_id: str,
     ) -> list[sqlite3.Row]:
-        """Fetch tasks that have been exported to Google Calendar."""
+        """Fetch tasks that have been exported to Google Calendar.
+
+        Args:
+            plan_id: The plan to check.
+            user_id: The caller's user_id. Returns an empty list if
+                plan_id isn't owned by this user.
+        """
         return self.fetch_all(
             """
-            SELECT * FROM tasks
-            WHERE plan_id = ? AND google_event_id IS NOT NULL
-            ORDER BY order_index ASC
+            SELECT t.* FROM tasks t
+            JOIN plans p ON t.plan_id = p.plan_id
+            WHERE t.plan_id = ? AND p.user_id = ? AND t.google_event_id IS NOT NULL
+            ORDER BY t.order_index ASC
             """,
-            (plan_id,),
+            (plan_id, user_id),
         )

@@ -26,7 +26,12 @@ APP_DESCRIPTION: str = (
 # Default User (for demo / single-user mode)
 # ─────────────────────────────────────────────────────────────
 
-DEFAULT_USER_ID: int = 1
+# user_id is TEXT/String end-to-end (SQLite schema, SQLAlchemy models,
+# Postgres compatibility, and guest accounts which use UUID-based
+# strings like "guest_ab12cd34ef56") -- never an int. Keep this a str
+# so the demo/single-user default is the exact same type real users
+# and guest UUIDs already are everywhere else in the app.
+DEFAULT_USER_ID: str = "1"
 DEFAULT_ANALYTICS_WINDOW: int = 30  # days
 
 # ─────────────────────────────────────────────────────────────

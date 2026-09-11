@@ -70,7 +70,7 @@ with tab_today:
             st.markdown(
                 f"""
                 <div class="insight-card">
-                    <p>📅 <strong>{date.today().strftime('%B %d, %Y')}</strong> — {len(tasks_today)} task(s) planned.</p>
+                    <p>📅 <strong>{date.fromisoformat(str(today_plan["plan_date"])).strftime('%B %d, %Y')}</strong> — {len(tasks_today)} task(s) planned.</p>
                 </div>
                 """,
                 unsafe_allow_html=True,
@@ -112,7 +112,7 @@ if target_plan_id is not None:
             if use_today_shortcut:
                 result = load_recommendations_today(user_id=user_id)
             else:
-                result = load_recommendations_for_plan(target_plan_id)
+                result = load_recommendations_for_plan(target_plan_id, user_id=user_id)
             st.session_state.last_recommendation = result
             st.session_state.last_recommendation_plan_id = target_plan_id
             status.update(label="✅ Coaching report ready", state="complete", expanded=False)

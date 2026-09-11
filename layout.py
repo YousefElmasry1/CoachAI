@@ -19,6 +19,7 @@ from services import (
     close_out_stale_tasks,
     connect_google_calendar,
     create_guest_user,
+    get_current_local_date,
     get_current_user_id,
     get_database_status,
     get_system_info,
@@ -220,17 +221,17 @@ def ensure_authenticated() -> None:
 
 def maybe_close_out_stale_tasks() -> None:
     """
-    Once per Streamlit session (and at most once per calendar day),
-    auto-fail any task left pending/in_progress from a past day so it
-    never sits unresolved forever. Cheap to skip on every rerun via a
-    session_state guard instead of hitting the database every time.
+    Once per Streamlit session (and at most once per LOCAL calendar day,
+    in the user's own timezone), auto-fail any task left pending/
+    in_progress from a past day so it never sits unresolved forever.
+    Cheap to skip on every rerun via a session_state guard instead of
+    hitting the database every time.
     """
-    from datetime import date
-
-    today_str = date.today().isoformat()
+    user_id = get_current_user_id()
+    today_str = get_current_local_date(user_id).isoformat()
     if st.session_state.get("_stale_tasks_closed_date") == today_str:
         return
-    close_out_stale_tasks(user_id=get_current_user_id())
+    close_out_stale_tasks(user_id=user_id)
     st.session_state["_stale_tasks_closed_date"] = today_str
 
 

@@ -28,6 +28,7 @@ import streamlit as st
 
 from config import DEFAULT_ANALYTICS_WINDOW, DEFAULT_USER_ID
 from text_matching import detect_language
+from timezone_utils import user_today, user_now, get_user_timezone, safe_zoneinfo
 
 _local = threading.local()
 
@@ -303,7 +304,7 @@ def load_pause_matrix(
         the user has no started tasks in the window.
     """
     db = get_database()
-    since = date.today() - timedelta(days=window_days)
+    since = user_today(db, user_id) - timedelta(days=window_days)
     return db.get_pause_matrix(user_id=user_id, since_date=since.isoformat())
 
 
@@ -376,6 +377,18 @@ def load_categories(user_id: str = DEFAULT_USER_ID) -> list[dict]:
 # Plan & Task Data
 # ─────────────────────────────────────────────────────────────
 
+def get_current_local_date(user_id: str = DEFAULT_USER_ID):
+    """
+    Today's calendar date IN THE USER'S OWN TIMEZONE. Exposed as a thin
+    services.py wrapper around timezone_utils.user_today() so callers
+    outside services.py (e.g. layout.py, which never imports backend
+    logic directly) never have to reach for a bare date.today() -- which
+    would silently use the server's timezone instead of the user's.
+    """
+    db = get_database()
+    return user_today(db, user_id)
+
+
 def load_today_plan(user_id: str = DEFAULT_USER_ID) -> Optional[dict]:
     """Load today's plan as a dict, or None if no plan exists."""
     db = get_database()
@@ -385,10 +398,15 @@ def load_today_plan(user_id: str = DEFAULT_USER_ID) -> Optional[dict]:
     return dict(row)
 
 
-def load_plan_tasks(plan_id: int) -> list[dict]:
-    """Load all tasks for a plan as a list of dicts."""
+def load_plan_tasks(plan_id: int, user_id: str = DEFAULT_USER_ID) -> list[dict]:
+    """Load all tasks for a plan as a list of dicts.
+
+    Scoped to user_id: returns an empty list (same as "plan doesn't
+    exist") if plan_id isn't actually owned by this user, rather than
+    ever returning another user's tasks.
+    """
     db = get_database()
-    rows = db.get_tasks_by_plan(plan_id)
+    rows = db.get_tasks_by_plan(plan_id, user_id)
     return [dict(r) for r in rows]
 
 
@@ -397,7 +415,7 @@ def load_today_tasks(user_id: str = DEFAULT_USER_ID) -> list[dict]:
     plan = load_today_plan(user_id)
     if plan is None:
         return []
-    return load_plan_tasks(plan["plan_id"])
+    return load_plan_tasks(plan["plan_id"], user_id)
 
 
 def load_recent_plans(
@@ -406,12 +424,12 @@ def load_recent_plans(
 ) -> list[dict]:
     """Load recent plans with their tasks."""
     db = get_database()
-    since = date.today() - timedelta(days=days)
+    since = user_today(db, user_id) - timedelta(days=days)
     rows = db.get_recent_plans(user_id=user_id, since_date=since)
     plans = []
     for row in rows:
         plan = dict(row)
-        plan["tasks"] = load_plan_tasks(plan["plan_id"])
+        plan["tasks"] = load_plan_tasks(plan["plan_id"], user_id)
         plans.append(plan)
     return plans
 
@@ -425,16 +443,19 @@ def update_task_status(
     status: str,
     failure_reason: Optional[str] = None,
     actual_minutes: Optional[int] = None,
+    user_id: str = DEFAULT_USER_ID,
 ) -> bool:
     """
     Update a task's status and clear relevant caches.
 
-    Returns True on success, False on error.
+    Returns True on success, False on error (including if task_id
+    doesn't exist or isn't owned by user_id).
     """
     try:
         db = get_database()
         db.update_task_status(
             task_id=task_id,
+            user_id=user_id,
             status=status,
             failure_reason=failure_reason,
             actual_minutes=actual_minutes,
@@ -506,13 +527,16 @@ def is_task_timer_paused(task: dict) -> bool:
     return task.get("status") == "in_progress" and not task.get("timer_segment_started_at")
 
 
-def start_task_timer(task_id: int) -> bool:
-    """Start a task's timer for the first time (pending -> in_progress)."""
+def start_task_timer(task_id: int, user_id: str = DEFAULT_USER_ID) -> bool:
+    """Start a task's timer for the first time (pending -> in_progress).
+
+    Returns False if task_id doesn't exist or isn't owned by user_id.
+    """
     try:
         db = get_database()
-        db.update_task_status(task_id, status="in_progress")  # stamps started_at once
+        db.update_task_status(task_id, user_id, status="in_progress")  # stamps started_at once
         db.set_task_timer_state(
-            task_id, accumulated_seconds=0, segment_started_at=_utc_now_str(),
+            task_id, user_id, accumulated_seconds=0, segment_started_at=_utc_now_str(),
             paused_at=None, total_paused_seconds=0,
         )
         return True
@@ -520,38 +544,43 @@ def start_task_timer(task_id: int) -> bool:
         return False
 
 
-def pause_task_timer(task_id: int) -> bool:
+def pause_task_timer(task_id: int, user_id: str = DEFAULT_USER_ID) -> bool:
     """Pause a running task's timer: banks the elapsed active segment,
     starts the pause clock (paused_at), and bumps pause_count (feeds
-    get_pause_matrix / load_pause_matrix)."""
+    get_pause_matrix / load_pause_matrix).
+
+    Returns False if task_id doesn't exist or isn't owned by user_id.
+    """
     try:
         db = get_database()
-        task = db.get_task(task_id)
+        task = db.get_task(task_id, user_id)
         if task is None:
             return False
         task_dict = dict(task)
         elapsed = get_task_elapsed_seconds(task_dict)
         db.set_task_timer_state(
-            task_id, accumulated_seconds=elapsed, segment_started_at=None,
+            task_id, user_id, accumulated_seconds=elapsed, segment_started_at=None,
             paused_at=_utc_now_str(),
             total_paused_seconds=int(task_dict.get("timer_total_paused_seconds") or 0),
         )
-        db.increment_task_pause_count(task_id)
+        db.increment_task_pause_count(task_id, user_id)
         load_pause_matrix.clear()
         return True
     except Exception:
         return False
 
 
-def resume_task_timer(task_id: int) -> bool:
+def resume_task_timer(task_id: int, user_id: str = DEFAULT_USER_ID) -> bool:
     """
     Resume a paused task's timer: folds however long that pause just
     lasted into timer_total_paused_seconds (so it's never lost), then
     starts a new active segment.
+
+    Returns False if task_id doesn't exist or isn't owned by user_id.
     """
     try:
         db = get_database()
-        task = db.get_task(task_id)
+        task = db.get_task(task_id, user_id)
         if task is None:
             return False
         task_dict = dict(task)
@@ -559,7 +588,7 @@ def resume_task_timer(task_id: int) -> bool:
         total_paused = get_task_paused_seconds(task_dict)
         accumulated = int(task_dict.get("timer_accumulated_seconds") or 0)
         db.set_task_timer_state(
-            task_id, accumulated_seconds=accumulated, segment_started_at=_utc_now_str(),
+            task_id, user_id, accumulated_seconds=accumulated, segment_started_at=_utc_now_str(),
             paused_at=None, total_paused_seconds=total_paused,
         )
         return True
@@ -571,6 +600,7 @@ def finish_task_with_timer(
     task_id: int,
     status: str,
     failure_reason: Optional[str] = None,
+    user_id: str = DEFAULT_USER_ID,
 ) -> bool:
     """
     Mark a task completed/failed, using its real accumulated timer
@@ -583,10 +613,12 @@ def finish_task_with_timer(
 
     Falls back to letting update_task_status compute actual_minutes
     the old way if the task was never started (no timer data at all).
+
+    Returns False if task_id doesn't exist or isn't owned by user_id.
     """
     try:
         db = get_database()
-        task = db.get_task(task_id)
+        task = db.get_task(task_id, user_id)
         actual_minutes = None
         if task is not None:
             task_dict = dict(task)
@@ -598,12 +630,12 @@ def finish_task_with_timer(
             # completed/failed task never shows a "still running" or
             # "still paused" timer if re-read later.
             db.set_task_timer_state(
-                task_id, accumulated_seconds=elapsed_seconds, segment_started_at=None,
+                task_id, user_id, accumulated_seconds=elapsed_seconds, segment_started_at=None,
                 paused_at=None, total_paused_seconds=total_paused,
             )
         return update_task_status(
             task_id, status=status, failure_reason=failure_reason,
-            actual_minutes=actual_minutes,
+            actual_minutes=actual_minutes, user_id=user_id,
         )
     except Exception:
         return False
@@ -642,10 +674,13 @@ def load_recommendations_today(user_id: str = DEFAULT_USER_ID) -> Any:
     return service.get_recommendations_for_today(user_id=user_id)
 
 
-def load_recommendations_for_plan(plan_id: int) -> Any:
-    """Get AI coaching recommendations for a specific plan."""
+def load_recommendations_for_plan(plan_id: int, user_id: str = DEFAULT_USER_ID) -> Any:
+    """Get AI coaching recommendations for a specific plan.
+
+    Raises ValueError if plan_id doesn't exist or isn't owned by user_id.
+    """
     service = get_recommendation_service()
-    return service.get_recommendations_for_plan(plan_id=plan_id)
+    return service.get_recommendations_for_plan(plan_id=plan_id, user_id=user_id)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -724,10 +759,11 @@ def _format_file_size(size_bytes: int) -> str:
 # Plan Lookup
 # ─────────────────────────────────────────────────────────────
 
-def load_plan(plan_id: int) -> Optional[dict]:
-    """Load a single plan by id as a dict, or None if not found."""
+def load_plan(plan_id: int, user_id: str = DEFAULT_USER_ID) -> Optional[dict]:
+    """Load a single plan by id as a dict, or None if not found or not
+    owned by user_id."""
     db = get_database()
-    row = db.get_plan_by_id(plan_id)
+    row = db.get_plan_by_id(plan_id, user_id)
     if row is None:
         return None
     return dict(row)
@@ -752,7 +788,7 @@ def create_today_plan(
     try:
         plan_id = db.create_plan(
             user_id=user_id,
-            plan_date=date.today(),
+            plan_date=user_today(db, user_id),
             raw_input=raw_input or "Created from the CoachAI dashboard.",
         )
         return plan_id
@@ -899,12 +935,15 @@ def add_task_to_plan(
     priority: int = 3,
     estimated_minutes: int = 30,
     order_index: int = 0,
+    user_id: str = DEFAULT_USER_ID,
 ) -> Optional[int]:
-    """Add a task to a plan. Returns the new task_id, or None on failure."""
+    """Add a task to a plan. Returns the new task_id, or None on failure
+    (including if plan_id isn't owned by user_id)."""
     db = get_database()
     try:
         return db.add_task(
             plan_id=plan_id,
+            user_id=user_id,
             title=title,
             category_id=category_id,
             description=description,
@@ -916,11 +955,12 @@ def add_task_to_plan(
         return None
 
 
-def delete_task(task_id: int) -> bool:
-    """Delete a task. Returns True on success, False on error."""
+def delete_task(task_id: int, user_id: str = DEFAULT_USER_ID) -> bool:
+    """Delete a task. Returns True on success, False on error (including
+    if task_id doesn't exist or isn't owned by user_id)."""
     db = get_database()
     try:
-        db.delete_task(task_id)
+        db.delete_task(task_id, user_id)
         return True
     except Exception:
         return False
@@ -943,6 +983,7 @@ def add_break_to_plan(
     start_time: time,
     duration_minutes: int,
     title: Optional[str] = None,
+    user_id: str = DEFAULT_USER_ID,
 ) -> Optional[int]:
     """
     Add a break to a plan as a fixed-time task (is_break=1).
@@ -956,23 +997,27 @@ def add_break_to_plan(
             raw_input, so a break added without an explicit title
             still matches the language the user is writing in rather
             than always defaulting to English.
+        user_id: The caller's user_id. plan_id must be owned by this
+            user.
 
     Returns:
-        The new task_id, or None on error.
+        The new task_id, or None on error (including if plan_id isn't
+        owned by user_id).
     """
     db = get_database()
     if title is None:
-        plan = db.get_plan_by_id(plan_id)
+        plan = db.get_plan_by_id(plan_id, user_id)
         plan_text = plan["raw_input"] if plan is not None else ""
         title = "استراحة" if detect_language(plan_text) == "ar" else "Break"
     try:
-        existing = db.get_tasks_by_plan(plan_id)
+        existing = db.get_tasks_by_plan(plan_id, user_id)
         order_index = len(existing)
         end_time = (
             datetime.combine(date.today(), start_time) + timedelta(minutes=duration_minutes)
         ).time()
         return db.add_task(
             plan_id=plan_id,
+            user_id=user_id,
             title=title,
             priority=1,
             estimated_minutes=duration_minutes,
@@ -986,16 +1031,17 @@ def add_break_to_plan(
         return None
 
 
-def reschedule_break(task_id: int, new_start_time: time) -> bool:
+def reschedule_break(task_id: int, new_start_time: time, user_id: str = DEFAULT_USER_ID) -> bool:
     """
     Shift a break to a new start time, keeping its original duration.
     Used by the conflict-resolution actions ("move before/after task").
 
-    Returns True on success, False on error.
+    Returns True on success, False on error (including if task_id
+    doesn't exist or isn't owned by user_id).
     """
     db = get_database()
     try:
-        task = db.get_task(task_id)
+        task = db.get_task(task_id, user_id)
         if task is None:
             return False
         duration = int(task["estimated_minutes"])
@@ -1004,6 +1050,7 @@ def reschedule_break(task_id: int, new_start_time: time) -> bool:
         ).time()
         db.update_task(
             task_id,
+            user_id,
             scheduled_start=new_start_time.strftime("%H:%M"),
             scheduled_end=new_end_time.strftime("%H:%M"),
         )
@@ -1012,14 +1059,14 @@ def reschedule_break(task_id: int, new_start_time: time) -> bool:
         return False
 
 
-def start_break(task_id: int) -> bool:
+def start_break(task_id: int, user_id: str = DEFAULT_USER_ID) -> bool:
     """Mark a break as started (stamps started_at, like any task timer)."""
-    return update_task_status(task_id, status="in_progress")
+    return update_task_status(task_id, status="in_progress", user_id=user_id)
 
 
-def complete_break(task_id: int) -> bool:
+def complete_break(task_id: int, user_id: str = DEFAULT_USER_ID) -> bool:
     """Mark a break as finished."""
-    return update_task_status(task_id, status="completed")
+    return update_task_status(task_id, status="completed", user_id=user_id)
 
 
 def defer_task_to_tomorrow(task_id: int, user_id: str = DEFAULT_USER_ID) -> bool:
@@ -1032,11 +1079,12 @@ def defer_task_to_tomorrow(task_id: int, user_id: str = DEFAULT_USER_ID) -> bool
     Clears any scheduled_start/scheduled_end, since a time slot computed
     for today's schedule doesn't carry over to tomorrow's.
 
-    Returns True on success, False on error.
+    Returns True on success, False on error (including if task_id
+    doesn't exist or isn't owned by user_id).
     """
     db = get_database()
     try:
-        tomorrow = date.today() + timedelta(days=1)
+        tomorrow = user_today(db, user_id) + timedelta(days=1)
         target_plan = db.get_plan_by_date(user_id=user_id, plan_date=tomorrow)
         if target_plan is None:
             plan_id = db.create_plan(
@@ -1047,9 +1095,10 @@ def defer_task_to_tomorrow(task_id: int, user_id: str = DEFAULT_USER_ID) -> bool
         else:
             plan_id = int(target_plan["plan_id"])
 
-        next_order_index = len(db.get_tasks_by_plan(plan_id))
+        next_order_index = len(db.get_tasks_by_plan(plan_id, user_id))
         db.update_task(
             task_id,
+            user_id,
             plan_id=plan_id,
             order_index=next_order_index,
             scheduled_start=None,
@@ -1061,7 +1110,7 @@ def defer_task_to_tomorrow(task_id: int, user_id: str = DEFAULT_USER_ID) -> bool
         return False
 
 
-def save_draft_tasks_to_plan(tasks: list, plan_id: int) -> int:
+def save_draft_tasks_to_plan(tasks: list, plan_id: int, user_id: str = DEFAULT_USER_ID) -> int:
     """
     Persist a list of not-yet-saved drafted task objects (from a
     planner DayPlanOutput, e.g. `plan_output.tasks`) as real rows on an
@@ -1073,6 +1122,8 @@ def save_draft_tasks_to_plan(tasks: list, plan_id: int) -> int:
             fixed_start are read via getattr with sane fallbacks, so this
             works whether `tasks` holds Pydantic objects or plain dicts).
         plan_id: The plan to attach them to.
+        user_id: The caller's user_id. plan_id must be owned by this
+            user, or nothing is saved.
 
     Returns:
         How many tasks were successfully saved.
@@ -1085,7 +1136,7 @@ def save_draft_tasks_to_plan(tasks: list, plan_id: int) -> int:
         return default
 
     db = get_database()
-    existing_count = len(db.get_tasks_by_plan(plan_id))
+    existing_count = len(db.get_tasks_by_plan(plan_id, user_id))
     saved = 0
     for i, t in enumerate(tasks):
         try:
@@ -1093,6 +1144,7 @@ def save_draft_tasks_to_plan(tasks: list, plan_id: int) -> int:
             fixed_start = _get(t, "fixed_start", None)
             db.add_task(
                 plan_id=plan_id,
+                user_id=user_id,
                 title=str(_get(t, "title", "Untitled")),
                 description=str(_get(t, "description", "") or ""),
                 priority=int(_get(t, "priority", 3)),
@@ -1128,7 +1180,7 @@ def defer_draft_tasks_to_tomorrow(tasks: list, user_id: str = DEFAULT_USER_ID) -
     if not tasks:
         return 0
     db = get_database()
-    tomorrow = date.today() + timedelta(days=1)
+    tomorrow = user_today(db, user_id) + timedelta(days=1)
     target_plan = db.get_plan_by_date(user_id=user_id, plan_date=tomorrow)
     if target_plan is None:
         plan_id = db.create_plan(
@@ -1138,11 +1190,11 @@ def defer_draft_tasks_to_tomorrow(tasks: list, user_id: str = DEFAULT_USER_ID) -
         )
     else:
         plan_id = int(target_plan["plan_id"])
-    return save_draft_tasks_to_plan(tasks, plan_id)
+    return save_draft_tasks_to_plan(tasks, plan_id, user_id)
 
 
 def create_category(
-    user_id: int,
+    user_id: str,
     name: str,
     color: str = "#3B82F6",
 ) -> Optional[int]:
@@ -1166,6 +1218,7 @@ def run_scheduler_for_plan(
     work_day_start,
     breaks: Optional[list[tuple]] = None,
     blocked_slots: Optional[list[tuple]] = None,
+    user_id: str = DEFAULT_USER_ID,
 ) -> list:
     """
     Run the deterministic Scheduler against an existing plan and persist
@@ -1177,6 +1230,8 @@ def run_scheduler_for_plan(
         breaks: Optional list of ``(start_time, duration_minutes)`` tuples.
         blocked_slots: Optional list of ``(start_time, end_time)`` tuples
             from Google Calendar events.
+        user_id: The caller's user_id. plan_id must be owned by this
+            user, or scheduling fails (result: []).
 
     Returns:
         The list of ScheduledTask objects, or [] on failure.
@@ -1195,6 +1250,7 @@ def run_scheduler_for_plan(
     try:
         result = service.schedule_plan(
             plan_id=plan_id,
+            user_id=user_id,
             preferences=preferences,
             blocked_slots=blocked_slots,
         )
@@ -1292,18 +1348,19 @@ def get_persisted_fixed_task_conflicts(user_id: str = DEFAULT_USER_ID) -> list:
     return detect_persisted_fixed_task_conflicts(tasks)
 
 
-def reschedule_fixed_task(task_id: int, new_start_time: time) -> bool:
+def reschedule_fixed_task(task_id: int, new_start_time: time, user_id: str = DEFAULT_USER_ID) -> bool:
     """
     Shift any fixed-time task (break or not) to a new start time,
     keeping its original duration. Generalises reschedule_break() to
     ordinary fixed-time tasks too, for resolving a fixed-vs-fixed
     conflict (e.g. "move Task B to right after Task A").
 
-    Returns True on success, False on error.
+    Returns True on success, False on error (including if task_id
+    doesn't exist or isn't owned by user_id).
     """
     db = get_database()
     try:
-        task = db.get_task(task_id)
+        task = db.get_task(task_id, user_id)
         if task is None:
             return False
         duration = int(task["estimated_minutes"])
@@ -1312,6 +1369,7 @@ def reschedule_fixed_task(task_id: int, new_start_time: time) -> bool:
         ).time()
         db.update_task(
             task_id,
+            user_id,
             scheduled_start=new_start_time.strftime("%H:%M"),
             scheduled_end=new_end_time.strftime("%H:%M"),
         )
@@ -1335,6 +1393,7 @@ def run_scheduler_for_today(
         work_day_start=work_day_start,
         breaks=breaks,
         blocked_slots=blocked,
+        user_id=user_id,
     )
 
 
@@ -1343,7 +1402,7 @@ def run_scheduler_for_today(
 # ─────────────────────────────────────────────────────────────
 
 
-def _get_google_client(user_id: int):
+def _get_google_client(user_id: str):
     """
     Build a GoogleCalendarClient for the given user, refreshing
     the access token if expired.  Returns None if the user has
@@ -1457,7 +1516,7 @@ def fetch_google_calendars(
 
 
 def save_selected_calendars(
-    user_id: int,
+    user_id: str,
     selections: list[dict],
 ) -> None:
     """
@@ -1510,13 +1569,14 @@ def sync_google_calendar(
     if not selected_ids:
         return {"synced_count": 0, "error": "No calendars selected"}
 
-    today = date.today()
+    tz_name = get_user_timezone(db, user_id)
+    today = user_today(db, user_id)
     today_str = today.isoformat()
     total_synced = 0
 
     try:
         for cal_id in selected_ids:
-            events = client.fetch_events(cal_id, today_str)
+            events = client.fetch_events(cal_id, today_str, timezone=tz_name)
             synced_ids = []
             for ev in events:
                 db.upsert_google_calendar_event(
@@ -1572,7 +1632,7 @@ def find_task_conflicts_with_google_events(
         return []
 
     conflicts = []
-    for task in db.get_tasks_by_plan(plan["plan_id"]):
+    for task in db.get_tasks_by_plan(plan["plan_id"], user_id):
         if not task["scheduled_start"] or not task["scheduled_end"]:
             continue
         t_start = dt_time.fromisoformat(task["scheduled_start"])
@@ -1592,9 +1652,14 @@ def find_task_conflicts_with_google_events(
 def get_google_calendar_events_today(
     user_id: str = DEFAULT_USER_ID,
 ) -> list[dict]:
-    """Load today's synced Google Calendar events from DB."""
+    """Load today's synced Google Calendar events from DB.
+
+    "Today" is resolved in the USER'S OWN timezone, not the server's --
+    a user near a day boundary must see the same events they'd see
+    opening Google Calendar itself on their own device.
+    """
     db = get_database()
-    today_str = date.today().isoformat()
+    today_str = user_today(db, user_id).isoformat()
     rows = db.get_google_calendar_events(user_id, today_str)
     return [
         {
@@ -1612,6 +1677,7 @@ def import_calendar_event_as_task(
     plan_id: int,
     event: dict,
     priority: int = 3,
+    user_id: str = DEFAULT_USER_ID,
 ) -> Optional[int]:
     """
     Create a real, fixed-time task from a synced Google Calendar event
@@ -1640,12 +1706,14 @@ def import_calendar_event_as_task(
             and google_event_id.
         priority: Priority for the new task (default 3 = Medium) —
             calendar events carry no priority signal of their own.
+        user_id: The caller's user_id. plan_id must be owned by this
+            user.
 
     Returns:
         The new task_id, or None on failure — including if this event
         was already imported (checked via google_event_id, so calling
         this twice on the same event is safe and never creates a
-        duplicate task).
+        duplicate task), or if plan_id isn't owned by user_id.
     """
     db = get_database()
     try:
@@ -1658,7 +1726,7 @@ def import_calendar_event_as_task(
             return None
 
         target_event_id = event.get("google_event_id")
-        existing = db.get_tasks_by_plan(plan_id)
+        existing = db.get_tasks_by_plan(plan_id, user_id)
         for row in existing:
             row_event_id = row["google_event_id"] if "google_event_id" in row.keys() else None
             if row_event_id and target_event_id and row_event_id == target_event_id:
@@ -1667,6 +1735,7 @@ def import_calendar_event_as_task(
         order_index = len(existing)
         task_id = db.add_task(
             plan_id=plan_id,
+            user_id=user_id,
             title=str(event.get("title") or "Untitled event"),
             priority=priority,
             estimated_minutes=duration,
@@ -1675,7 +1744,7 @@ def import_calendar_event_as_task(
             order_index=order_index,
             is_fixed_time=True,
         )
-        db.update_task_google_event_id(task_id, target_event_id)
+        db.update_task_google_event_id(task_id, user_id, target_event_id)
         load_analytics_profile.clear()
         return task_id
     except Exception:
@@ -1701,7 +1770,7 @@ def get_google_calendar_blocked_slots(
     own_event_ids = set()
     plan = db.get_today_plan(user_id)
     if plan is not None:
-        for t in db.get_tasks_by_plan(plan["plan_id"]):
+        for t in db.get_tasks_by_plan(plan["plan_id"], user_id):
             eid = t["google_event_id"] if "google_event_id" in t.keys() else None
             if eid:
                 own_event_ids.add(eid)
@@ -1736,11 +1805,67 @@ def get_last_sync_time(
     return row["last_sync"] if row and row["last_sync"] else None
 
 
+def get_last_sync_minutes_ago(user_id: str = DEFAULT_USER_ID) -> Optional[float]:
+    """
+    Minutes since the last Google Calendar sync, computed entirely in
+    UTC-aware terms (last_synced_at is stored as naive UTC; this compares
+    it against datetime.now(timezone.utc), never the server's naive
+    local datetime.now() -- comparing a naive-UTC timestamp against a
+    naive-local "now" silently breaks by exactly the server's UTC offset).
+
+    Returns None if there's no sync on record yet.
+    """
+    last_sync = get_last_sync_time(user_id)
+    if not last_sync:
+        return None
+    try:
+        sync_dt_utc = datetime.fromisoformat(str(last_sync)).replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+    now_utc = datetime.now(timezone.utc)
+    return (now_utc - sync_dt_utc).total_seconds() / 60.0
+
+
+def get_last_sync_label(user_id: str = DEFAULT_USER_ID) -> Optional[str]:
+    """
+    Human-readable "last synced ..." label, e.g. "3 minutes ago" or a
+    clock time. The clock time (once more than an hour has passed) is
+    rendered in the USER'S OWN timezone -- never a hardcoded offset and
+    never the server's local timezone.
+
+    Returns None if there's no sync on record yet, or the stored
+    timestamp couldn't be parsed.
+    """
+    db = get_database()
+    last_sync = get_last_sync_time(user_id)
+    if not last_sync:
+        return None
+    try:
+        sync_dt_utc = datetime.fromisoformat(str(last_sync))
+    except (ValueError, TypeError):
+        return None
+
+    tz_name = get_user_timezone(db, user_id)
+    sync_dt_local = sync_dt_utc.replace(tzinfo=timezone.utc).astimezone(safe_zoneinfo(tz_name))
+    mins_ago = get_last_sync_minutes_ago(user_id)
+    if mins_ago is None:
+        return None
+    if mins_ago < 1:
+        return "just now"
+    if mins_ago < 60:
+        whole = int(mins_ago)
+        return f"{whole} minute{'s' if whole != 1 else ''} ago"
+    return sync_dt_local.strftime("%I:%M %p")
+
+
 def export_task_to_google_calendar(
     task_id: int,
     user_id: str = DEFAULT_USER_ID,
 ) -> bool:
-    """Create or update a Google Calendar event for a scheduled task."""
+    """Create or update a Google Calendar event for a scheduled task.
+
+    Returns False if task_id doesn't exist or isn't owned by user_id.
+    """
     from google_calendar import GoogleCalendarError
 
     client = _get_google_client(user_id)
@@ -1748,15 +1873,16 @@ def export_task_to_google_calendar(
         return False
 
     db = get_database()
-    task = db.get_task(task_id)
+    task = db.get_task(task_id, user_id)
     if task is None or not task["scheduled_start"] or not task["scheduled_end"]:
         return False
 
-    plan = db.get_plan_by_id(task["plan_id"])
+    plan = db.get_plan_by_id(task["plan_id"], user_id)
     if plan is None:
         return False
 
     plan_date = str(plan["plan_date"])
+    tz_name = get_user_timezone(db, user_id)
 
     try:
         existing_event_id = task["google_event_id"] if "google_event_id" in task.keys() else None
@@ -1769,11 +1895,12 @@ def export_task_to_google_calendar(
                 start_time=task["scheduled_start"],
                 end_time=task["scheduled_end"],
                 event_date=plan_date,
+                timezone=tz_name,
             )
             # google_event_id doesn't change on this path, but the
             # export timestamp still needs to move forward — this is
             # what clears the "stale export" warning after a re-export.
-            db.mark_task_exported(task_id)
+            db.mark_task_exported(task_id, user_id)
         else:
             new_event_id = client.create_event(
                 calendar_id="primary",
@@ -1781,8 +1908,9 @@ def export_task_to_google_calendar(
                 start_time=task["scheduled_start"],
                 end_time=task["scheduled_end"],
                 event_date=plan_date,
+                timezone=tz_name,
             )
-            db.update_task_google_event_id(task_id, new_event_id)
+            db.update_task_google_event_id(task_id, user_id, new_event_id)
 
         return True
     except GoogleCalendarError:
@@ -1798,7 +1926,7 @@ def export_all_scheduled_tasks(
         return {"exported": 0, "error": "No plan for today"}
 
     db = get_database()
-    tasks = db.get_tasks_by_plan(plan["plan_id"])
+    tasks = db.get_tasks_by_plan(plan["plan_id"], user_id)
     exported = 0
     errors = 0
 
@@ -1827,7 +1955,7 @@ def get_stale_export_count(user_id: str = DEFAULT_USER_ID) -> int:
     if plan is None:
         return 0
     db = get_database()
-    return len(db.get_stale_google_exports(plan["plan_id"]))
+    return len(db.get_stale_google_exports(plan["plan_id"], user_id))
 
 
 # ─────────────────────────────────────────────────────────────

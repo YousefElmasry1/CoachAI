@@ -17,6 +17,13 @@ class ScheduledTask:
     scheduled_end: Optional[time] = None
     order_index: int = 0
 
+    # Preserves the database task_id this ScheduledTask was built from,
+    # so persistence (scheduler_service._save_schedule) can update the
+    # exact row it came from instead of relying on list position/order
+    # to line database rows back up with scheduled results -- two tasks
+    # can share the same order_index, but never the same task_id.
+    task_id: Optional[int] = None
+
     # --- Fixed-time task support ---
     is_fixed_time: bool = False
     fixed_start: Optional[time] = None
@@ -58,6 +65,7 @@ class ScheduledTask:
             priority=_get("priority", 3),
             description=_get("description", ""),
             order_index=order_index,
+            task_id=_get("task_id", None),
             is_fixed_time=bool(_get("is_fixed_time", False)),
             fixed_start=cls._parse_hhmm(_get("fixed_start", None)),
             fixed_end=cls._parse_hhmm(_get("fixed_end", None)),

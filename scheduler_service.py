@@ -283,7 +283,10 @@ class SchedulerService:
             List of ScheduledTask objects with scheduling fields unset,
             EXCEPT for fixed-time tasks (is_fixed_time=1), whose existing
             scheduled_start/scheduled_end are carried over as fixed_start/
-            fixed_end so the Scheduler treats them as immovable.
+            fixed_end so the Scheduler treats them as immovable. Each
+            ScheduledTask also carries the originating row's task_id, so
+            results can be persisted back to the exact right row instead
+            of relying on list position/order_index.
         """
         tasks: list[ScheduledTask] = []
         for row in rows:
@@ -302,6 +305,7 @@ class SchedulerService:
                 priority=int(row["priority"]),
                 description=str(self._row_get(row, "description", "") or ""),
                 order_index=int(self._row_get(row, "order_index", 0)),
+                task_id=int(row["task_id"]),
                 is_fixed_time=is_fixed,
                 fixed_start=fixed_start,
                 fixed_end=fixed_end,
@@ -325,43 +329,49 @@ class SchedulerService:
         self,
         scheduled: list[ScheduledTask],
         plan_id: int,
+        user_id: str,
     ) -> None:
         """
         Write scheduled_start and scheduled_end back to the database.
 
-        Uses positional matching between the database rows (returned by
-        get_tasks_by_plan, which orders by order_index ASC, task_id ASC)
-        and the scheduled task list (same original ordering) to pair each
-        ScheduledTask with its correct database row.
+        Matches each ScheduledTask to its database row by ``task_id``
+        (never by list position/order_index -- two tasks can share the
+        same order_index, and positional zip() silently mispairs them
+        the moment the scheduler's output order differs at all from the
+        original query order).
 
-        The entire save is wrapped in a single transaction so that either
-        all task updates succeed or none of them are committed.
+        Wrapped in a single transaction (Database._update_task_no_commit
+        + Database.transaction()) so that persisting a schedule is
+        atomic: if any task update fails partway through -- including an
+        ownership mismatch, which should never happen in practice since
+        every task here was just loaded via get_tasks_by_plan(plan_id,
+        user_id), but is checked again here as defense in depth -- the
+        whole batch is rolled back rather than leaving some tasks with
+        their new time slot and others still on the old one.
 
         Args:
             scheduled: Tasks with populated time slots.
-            plan_id: The parent plan (used to load the corresponding rows).
+            plan_id: The parent plan (used only for the error message
+                below if a ScheduledTask is missing its task_id).
+            user_id: The plan's owner -- every write is scoped through
+                Database._update_task_no_commit's own ownership check.
         """
-        # Load original DB rows — same order used to build ScheduledTasks
-        db_rows = self.db.get_tasks_by_plan(plan_id)
-
-        # Pair each scheduled task with its database row by position
         with self.db.transaction():
-            for row, st in zip(db_rows, scheduled):
-                task_id = int(row["task_id"])
+            for st in scheduled:
+                if st.task_id is None:
+                    raise ValueError(
+                        f"ScheduledTask '{st.title}' has no task_id -- cannot "
+                        f"persist its schedule for plan {plan_id}."
+                    )
 
-                # Format times as HH:MM strings for SQLite TIME column
-                start_str: str = st.scheduled_start.strftime("%H:%M") if st.scheduled_start else None
-                end_str: str = st.scheduled_end.strftime("%H:%M") if st.scheduled_end else None
+                start_str: Optional[str] = st.scheduled_start.strftime("%H:%M") if st.scheduled_start else None
+                end_str: Optional[str] = st.scheduled_end.strftime("%H:%M") if st.scheduled_end else None
 
-                self.db.execute(
-                    """
-                    UPDATE tasks
-                    SET scheduled_start = ?,
-                        scheduled_end = ?,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE task_id = ?
-                    """,
-                    (start_str, end_str, task_id),
+                self.db._update_task_no_commit(
+                    st.task_id,
+                    user_id,
+                    scheduled_start=start_str,
+                    scheduled_end=end_str,
                 )
 
     # ------------------------------------------------------------------
@@ -371,23 +381,28 @@ class SchedulerService:
     def schedule_plan(
         self,
         plan_id: int,
+        user_id: str,
         preferences: SchedulingPreferences,
         blocked_slots: Optional[list[tuple]] = None,
     ) -> list[ScheduledTask]:
-        
+
         # ------------------------------------------------------------------
-        # Step 1: Load the plan and its date
+        # Step 1: Load the plan and its date -- scoped to user_id, so a
+        # plan_id belonging to a different user raises instead of ever
+        # being scheduled/read here.
         # ------------------------------------------------------------------
-        plan = self.db.get_plan_by_id(plan_id)
+        plan = self.db.get_plan_by_id(plan_id, user_id)
         if plan is None:
-            raise ValueError(f"No plan found with plan_id {plan_id}.")
+            raise ValueError(
+                f"No plan found with plan_id {plan_id} for user {user_id!r}."
+            )
 
         plan_date = self._parse_plan_date(plan)
 
         # ------------------------------------------------------------------
         # Step 2: Load tasks for this plan
         # ------------------------------------------------------------------
-        db_rows = self.db.get_tasks_by_plan(plan_id)
+        db_rows = self.db.get_tasks_by_plan(plan_id, user_id)
         if not db_rows:
             return []  # No tasks to schedule
 
@@ -410,13 +425,13 @@ class SchedulerService:
         # ------------------------------------------------------------------
         # Step 5: Persist time slots back to the database
         # ------------------------------------------------------------------
-        self._save_schedule(scheduled, plan_id)
+        self._save_schedule(scheduled, plan_id, user_id)
 
         return scheduled
 
     def schedule_today(
         self,
-        user_id: int,
+        user_id: str,
         preferences: SchedulingPreferences,
         blocked_slots: Optional[list[tuple]] = None,
     ) -> list[ScheduledTask]:
@@ -426,4 +441,6 @@ class SchedulerService:
             raise ValueError(f"No plan found for user {user_id} today.")
 
         plan_id: int = int(plan["plan_id"])
-        return self.schedule_plan(plan_id, preferences=preferences, blocked_slots=blocked_slots)
+        return self.schedule_plan(
+            plan_id, user_id, preferences=preferences, blocked_slots=blocked_slots
+        )

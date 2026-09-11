@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, time
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
@@ -148,17 +149,30 @@ class GoogleCalendarClient:
         except Exception as e:
             raise GoogleCalendarError(f"Failed to list calendars: {e}")
 
-    def fetch_events(self, calendar_id: str, event_date: str) -> list[dict]:
+    @staticmethod
+    def _resolve_tz(timezone: str | None) -> ZoneInfo:
+        """Resolve an IANA timezone name, falling back safely to UTC for
+        an unrecognised/empty name rather than raising."""
+        try:
+            return ZoneInfo(timezone) if timezone else ZoneInfo("UTC")
+        except Exception:
+            return ZoneInfo("UTC")
+
+    def fetch_events(self, calendar_id: str, event_date: str, timezone: str = "UTC") -> list[dict]:
         try:
             service = self._build_service()
-            
+
+            tz = self._resolve_tz(timezone)
             date_obj = datetime.fromisoformat(event_date)
-            start_of_day = date_obj.replace(hour=0, minute=0, second=0, microsecond=0)
-            end_of_day = date_obj.replace(hour=23, minute=59, second=59, microsecond=999999)
-            
-            time_min = start_of_day.isoformat() + 'Z'
-            time_max = end_of_day.isoformat() + 'Z'
-            
+            # The day boundary is defined in the USER'S OWN timezone --
+            # never the server's -- so "today" here means the same
+            # 00:00-23:59:59 the user would see on their own device.
+            start_of_day = date_obj.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=tz)
+            end_of_day = date_obj.replace(hour=23, minute=59, second=59, microsecond=999999, tzinfo=tz)
+
+            time_min = start_of_day.isoformat()
+            time_max = end_of_day.isoformat()
+
             events_result = service.events().list(
                 calendarId=calendar_id,
                 timeMin=time_min,
@@ -174,8 +188,8 @@ class GoogleCalendarClient:
                 if 'dateTime' not in event.get('start', {}):
                     continue
                     
-                start_dt = datetime.fromisoformat(event['start']['dateTime'].replace('Z', '+00:00'))
-                end_dt = datetime.fromisoformat(event['end']['dateTime'].replace('Z', '+00:00'))
+                start_dt = datetime.fromisoformat(event['start']['dateTime'].replace('Z', '+00:00')).astimezone(tz)
+                end_dt = datetime.fromisoformat(event['end']['dateTime'].replace('Z', '+00:00')).astimezone(tz)
                 
                 result.append({
                     "google_event_id": event['id'],
@@ -189,28 +203,34 @@ class GoogleCalendarClient:
         except Exception as e:
             raise GoogleCalendarError(f"Failed to fetch events: {e}")
 
-    def create_event(self, calendar_id: str, title: str, start_time: str, end_time: str, event_date: str) -> str:
+    def create_event(
+        self, calendar_id: str, title: str, start_time: str, end_time: str,
+        event_date: str, timezone: str = "UTC",
+    ) -> str:
         try:
             service = self._build_service()
-            
+
+            tz = self._resolve_tz(timezone)
             date_obj = datetime.fromisoformat(event_date).date()
             start_t = time.fromisoformat(start_time)
             end_t = time.fromisoformat(end_time)
-            
-            # Attach the server's actual local timezone offset instead of
-            # mislabeling these naive local times as UTC — otherwise Google
-            # re-interprets them as UTC and shifts them forward again when
-            # displaying in the user's real timezone.
-            start_dt = datetime.combine(date_obj, start_t).astimezone()
-            end_dt = datetime.combine(date_obj, end_t).astimezone()
+
+            # Attach the USER'S OWN timezone (never the server's local
+            # timezone via a bare .astimezone()) -- otherwise Google
+            # re-interprets these times as the server's zone and shifts
+            # them when displaying in the user's real timezone.
+            start_dt = datetime.combine(date_obj, start_t, tzinfo=tz)
+            end_dt = datetime.combine(date_obj, end_t, tzinfo=tz)
             
             event = {
                 'summary': title,
                 'start': {
                     'dateTime': start_dt.isoformat(),
+                    'timeZone': timezone or "UTC",
                 },
                 'end': {
                     'dateTime': end_dt.isoformat(),
+                    'timeZone': timezone or "UTC",
                 }
             }
             
@@ -219,24 +239,30 @@ class GoogleCalendarClient:
         except Exception as e:
             raise GoogleCalendarError(f"Failed to create event: {e}")
 
-    def update_event(self, calendar_id: str, google_event_id: str, title: str, start_time: str, end_time: str, event_date: str):
+    def update_event(
+        self, calendar_id: str, google_event_id: str, title: str, start_time: str,
+        end_time: str, event_date: str, timezone: str = "UTC",
+    ):
         try:
             service = self._build_service()
-            
+
+            tz = self._resolve_tz(timezone)
             date_obj = datetime.fromisoformat(event_date).date()
             start_t = time.fromisoformat(start_time)
             end_t = time.fromisoformat(end_time)
-            
-            start_dt = datetime.combine(date_obj, start_t).astimezone()
-            end_dt = datetime.combine(date_obj, end_t).astimezone()
+
+            start_dt = datetime.combine(date_obj, start_t, tzinfo=tz)
+            end_dt = datetime.combine(date_obj, end_t, tzinfo=tz)
             
             event = service.events().get(calendarId=calendar_id, eventId=google_event_id).execute()
             event['summary'] = title
             event['start'] = {
                 'dateTime': start_dt.isoformat(),
+                'timeZone': timezone or "UTC",
             }
             event['end'] = {
                 'dateTime': end_dt.isoformat(),
+                'timeZone': timezone or "UTC",
             }
             
             service.events().update(calendarId=calendar_id, eventId=google_event_id, body=event).execute()

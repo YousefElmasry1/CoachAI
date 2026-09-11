@@ -147,7 +147,7 @@ for plan in plans:
             if st.button("✨ Get AI Coaching for This Plan", key=f"hist_coach_{plan_id}"):
                 with st.spinner("Analysing this plan..."):
                     try:
-                        rec = load_recommendations_for_plan(plan_id)
+                        rec = load_recommendations_for_plan(plan_id, user_id=get_current_user_id())
                         st.session_state.history_recs[plan_id] = rec
                         st.rerun()
                     except Exception as e:

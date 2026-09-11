@@ -31,6 +31,8 @@ import statistics
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+
+from timezone_utils import utc_now_naive
 from enum import Enum
 
 from typing import Any, Optional
@@ -251,7 +253,7 @@ class AnalyticsLoader:
 
     def load_snapshots(
         self,
-        user_id: int,
+        user_id: str,
         window_days: int = DEFAULT_WINDOW_DAYS,
     ) -> list[TaskSnapshot]:
         """
@@ -280,7 +282,8 @@ class AnalyticsLoader:
             >>> loader = AnalyticsLoader(db)
             >>> snaps = loader.load_snapshots(user_id=1, window_days=30)
         """
-        since_date = date.today() - timedelta(days=window_days)
+        from timezone_utils import user_today
+        since_date = user_today(self._db, user_id) - timedelta(days=window_days)
         rows = self._db.get_recent_tasks_for_user(
             user_id=user_id,
             since_date=since_date,
@@ -417,10 +420,19 @@ class IntermediateStats:
     # --- All snapshots (for calculators that need raw iteration) ---
     all_snapshots: tuple[TaskSnapshot, ...]
 
+    # --- Reference "today" ---
+    # The plan owner's own local "today" (see AnalyticsEngine.build_profile
+    # / timezone_utils.user_today) that every calculator needing a
+    # recency/"days since" notion of "now" should read from HERE rather
+    # than calling date.today() directly, which would silently use the
+    # server's timezone instead of the user's.
+    today: date
+
 
 def _compute_streaks_from_dates(
     unique_dates: list[str],
     tasks_by_date: dict[str, list[TaskSnapshot]],
+    today: Optional[date] = None,
 ) -> tuple[int, int]:
     """
     Compute current and longest streaks.
@@ -475,9 +487,17 @@ def _compute_streaks_from_dates(
         d += timedelta(days=1)
 
     # If today is beyond last_date by more than 1 day, streak is broken
-    today = date.today()
-    if last_date < today:
-        gap = (today - last_date).days
+    #
+    # `today` should be THE CALLER'S RESOLVED "today" in the plan
+    # owner's own timezone (see AnalyticsEngine.build_profile), never
+    # the server's local date -- otherwise a user whose local day hasn't
+    # rolled over yet (or has already rolled over ahead of the server)
+    # gets an incorrectly broken/unbroken streak right at the boundary.
+    # Falls back to the server's date.today() only when no caller
+    # supplies one (e.g. this function is used directly in a test).
+    resolved_today = today if today is not None else date.today()
+    if last_date < resolved_today:
+        gap = (resolved_today - last_date).days
         if gap > 1:
             current = 0
 
@@ -538,6 +558,7 @@ def _compute_trend_score_from_dates(
 def build_intermediate_stats(
     snapshots: list[TaskSnapshot],
     window_days: int = DEFAULT_WINDOW_DAYS,
+    today: Optional[date] = None,
 ) -> IntermediateStats:
     """
     Build IntermediateStats from a list of TaskSnapshots.
@@ -572,6 +593,7 @@ def build_intermediate_stats(
         0.75
     """
     total = len(snapshots)
+    resolved_today: date = today if today is not None else date.today()
 
     completed: list[TaskSnapshot] = []
     failed: list[TaskSnapshot] = []
@@ -687,7 +709,7 @@ def build_intermediate_stats(
 
     # --- Streaks (computed once, shared by all calculators) ---
     current_streak, longest_streak = _compute_streaks_from_dates(
-        unique_dates_sorted, by_date_dict,
+        unique_dates_sorted, by_date_dict, today=resolved_today,
     )
 
     # --- Trend score (computed once, shared by all calculators) ---
@@ -734,6 +756,7 @@ def build_intermediate_stats(
         trend_score=trend_score,
         active_days=active_days,
         all_snapshots=tuple(snapshots),
+        today=resolved_today,
     )
 
 
@@ -1705,7 +1728,7 @@ class CategoryCalculator:
 
             # Habit score
             habit = self._category_habit_score(
-                tasks, stats.unique_dates, comp_rate,
+                tasks, stats.unique_dates, comp_rate, today=stats.today,
             )
 
             analyses.append(CategoryAnalysis(
@@ -1770,12 +1793,19 @@ class CategoryCalculator:
         tasks: list[TaskSnapshot],
         all_dates: list[str],
         completion_rate: float,
+        today: Optional[date] = None,
     ) -> float:
         """
         Habit score = 100 × frequency × recency × completion_rate.
 
         frequency = unique_dates_with_category / observation_days
         recency   = 1.0 if last use within HABIT_DECAY_DAYS, else decayed
+
+        Args:
+            today: The plan owner's own local "today" (see
+                IntermediateStats.today) used for the recency decay.
+                Falls back to the server's date.today() only when a
+                caller doesn't supply one.
         """
         if not all_dates or not tasks:
             return 0.0
@@ -1783,11 +1813,13 @@ class CategoryCalculator:
         cat_dates = set(t.plan_date for t in tasks)
         frequency = len(cat_dates) / len(all_dates)
 
+        resolved_today = today if today is not None else date.today()
+
         # Recency: days since last use
         last_date_str = max(cat_dates)
         try:
             last_date = date.fromisoformat(last_date_str)
-            days_since = (date.today() - last_date).days
+            days_since = (resolved_today - last_date).days
         except (ValueError, TypeError):
             days_since = 999
 
@@ -2878,7 +2910,7 @@ class HabitCalculator:
             done = sum(1 for t in tasks if t.status == "completed")
             comp_rate = done / total if total > 0 else 0.0
             score = CategoryCalculator._category_habit_score(
-                tasks, stats.unique_dates, comp_rate,
+                tasks, stats.unique_dates, comp_rate, today=stats.today,
             )
             cat_habits[cat] = round(score, 2)
 
@@ -2924,7 +2956,7 @@ class HabitCalculator:
         done = sum(1 for t in matching if t.status == "completed")
         comp_rate = done / len(matching)
         return CategoryCalculator._category_habit_score(
-            matching, stats.unique_dates, comp_rate,
+            matching, stats.unique_dates, comp_rate, today=stats.today,
         )
 
     def _time_habit(
@@ -2943,7 +2975,7 @@ class HabitCalculator:
         done = sum(1 for t in matching if t.status == "completed")
         comp_rate = done / len(matching)
         return CategoryCalculator._category_habit_score(
-            matching, stats.unique_dates, comp_rate,
+            matching, stats.unique_dates, comp_rate, today=stats.today,
         )
 
 
@@ -3293,7 +3325,7 @@ class AnalyticsProfile(BaseModel):
 
     # --- Metadata ---
     generated_at: str = Field(
-        default_factory=lambda: datetime.now().isoformat(),
+        default_factory=lambda: utc_now_naive().isoformat(),
         description="ISO timestamp when this profile was generated.",
     )
     window_days: int = Field(
@@ -3693,11 +3725,12 @@ class AnalyticsEngine:
     """
 
     def __init__(self, db: Database) -> None:
+        self._db = db
         self._loader = AnalyticsLoader(db)
 
     def build_profile(
         self,
-        user_id: int,
+        user_id: str,
         window_days: int = DEFAULT_WINDOW_DAYS,
         language: str = "en",
     ) -> AnalyticsProfile:
@@ -3725,7 +3758,9 @@ class AnalyticsEngine:
         )
 
         # Step 2: Build immutable intermediate stats
-        stats = build_intermediate_stats(snapshots, window_days=window_days)
+        from timezone_utils import user_today
+        today = user_today(self._db, user_id)
+        stats = build_intermediate_stats(snapshots, window_days=window_days, today=today)
 
         # Step 3: Run all calculators
         productivity = ProductivityCalculator().compute(stats)
@@ -3752,7 +3787,7 @@ class AnalyticsEngine:
         )
 
         return AnalyticsProfile(
-            generated_at=datetime.now().isoformat(),
+            generated_at=utc_now_naive().isoformat(),
             window_days=window_days,
             sample_size=stats.total_tasks,
             overall_confidence=overall_confidence,

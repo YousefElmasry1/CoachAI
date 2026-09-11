@@ -66,6 +66,7 @@ from services import (
     is_google_calendar_connected,
     sync_google_calendar,
     get_last_sync_time,
+    get_last_sync_minutes_ago,
     get_google_calendar_events_today,
     import_calendar_event_as_task,
     get_selected_calendars,
@@ -171,13 +172,13 @@ def render_break_card(b: dict) -> None:
             )
         with cols[1]:
             if st.button("🗑️", key=f"break_card_del_{b['task_id']}", use_container_width=True):
-                if delete_task(b["task_id"]):
+                if delete_task(b["task_id"], user_id=user_id):
                     st.toast("Break removed.", icon="🗑️")
                     st.rerun()
 
         if status == "pending":
             if st.button("▶️ Start Break", key=f"break_start_{b['task_id']}", use_container_width=True):
-                if start_break(b["task_id"]):
+                if start_break(b["task_id"], user_id=user_id):
                     st.toast("Break started ☕", icon="▶️")
                     st.rerun()
         elif status == "in_progress":
@@ -194,7 +195,7 @@ def render_break_card(b: dict) -> None:
                     pass
             render_break_countdown(b["task_id"], remaining_seconds, key_suffix=str(b["task_id"]))
             if st.button("✅ Done — continue your day", key=f"break_done_{b['task_id']}", use_container_width=True):
-                if complete_break(b["task_id"]):
+                if complete_break(b["task_id"], user_id=user_id):
                     st.toast("Break complete. Back at it! 💪", icon="✅")
                     st.rerun()
         else:
@@ -298,15 +299,8 @@ user_id = get_current_user_id()
 
 try:
     if is_google_calendar_connected(user_id):
-        from datetime import datetime
-        _last_sync = get_last_sync_time(user_id)
-        _should_sync = True
-        if _last_sync:
-            try:
-                _sync_dt = datetime.fromisoformat(_last_sync)
-                _should_sync = (datetime.now() - _sync_dt).total_seconds() > 900
-            except (ValueError, TypeError):
-                pass
+        _mins_ago = get_last_sync_minutes_ago(user_id)
+        _should_sync = _mins_ago is None or _mins_ago > 15
         if _should_sync:
             sync_google_calendar(user_id)
 except Exception:
@@ -485,7 +479,7 @@ def _render_ai_capacity_warning(key_prefix: str) -> bool:
             else:
                 target_plan_id = plan["plan_id"]
 
-            kept_count = save_draft_tasks_to_plan(fixed + today_flexible, target_plan_id)
+            kept_count = save_draft_tasks_to_plan(fixed + today_flexible, target_plan_id, user_id=user_id)
             deferred_count = defer_draft_tasks_to_tomorrow(tomorrow_flexible, user_id=user_id)
 
             for k in pending.get("also_pop_keys", []):
@@ -661,7 +655,7 @@ def _render_manual_capacity_warning(key_prefix: str) -> bool:
                     "🗑️", key=f"{key_prefix}_dropit_{t['task_id']}",
                     use_container_width=True,
                 ):
-                    if delete_task(t["task_id"]):
+                    if delete_task(t["task_id"], user_id=user_id):
                         st.toast("Removed.", icon="🗑️")
                         st.rerun()
         st.markdown("<div style='height:0.3rem;'></div>", unsafe_allow_html=True)
@@ -700,6 +694,7 @@ def _commit_manual_task(pending: dict) -> None:
                 priority=kwargs["priority"],
                 estimated_minutes=kwargs["estimated_minutes"],
                 order_index=0,
+                user_id=user_id,
             )
             if new_id:
                 st.toast("Plan and first task created! 🎉", icon="✅")
@@ -989,7 +984,7 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
                 )
             with b_cols[1]:
                 if st.button("🗑️", key=f"break_cfg_del_{b['task_id']}", use_container_width=True):
-                    if delete_task(b["task_id"]):
+                    if delete_task(b["task_id"], user_id=user_id):
                         st.rerun()
     else:
         st.caption("No breaks added yet — the scheduler will run without one.")
@@ -1107,7 +1102,7 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
             # high-priority delay caused by THIS break, and (b) restore
             # the exact prior schedule if the user hits Undo.
             before_starts = {t["task_id"]: t.get("scheduled_start") for t in tasks}
-            new_break_id = add_break_to_plan(plan["plan_id"], new_break_start, int(new_break_minutes))
+            new_break_id = add_break_to_plan(plan["plan_id"], new_break_start, int(new_break_minutes), user_id=user_id)
             if new_break_id:
                 _run_and_track_conflicts()
                 if st.session_state.get(CONFLICTS_KEY):
@@ -1165,7 +1160,7 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
                 row = _find_break_task(c.break_start, duration)
                 if row is not None:
                     new_time = _shift_time(c.fixed_task_start, -duration)
-                    if reschedule_break(row["task_id"], new_time):
+                    if reschedule_break(row["task_id"], new_time, user_id=user_id):
                         _run_and_track_conflicts()
                         st.rerun()
         with res_cols[1]:
@@ -1173,13 +1168,13 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
                 row = _find_break_task(c.break_start, duration)
                 if row is not None:
                     new_time = c.fixed_task_end
-                    if reschedule_break(row["task_id"], new_time):
+                    if reschedule_break(row["task_id"], new_time, user_id=user_id):
                         _run_and_track_conflicts()
                         st.rerun()
         with res_cols[2]:
             if st.button("🗑️ Remove this break", key=f"conflict_remove_{idx}", use_container_width=True):
                 row = _find_break_task(c.break_start, duration)
-                if row is not None and delete_task(row["task_id"]):
+                if row is not None and delete_task(row["task_id"], user_id=user_id):
                     _run_and_track_conflicts()
                     st.rerun()
 
@@ -1218,7 +1213,7 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
                 key=f"fixed_conflict_move_a_{f_idx}", use_container_width=True,
             ):
                 row = _find_fixed_task(fc.task_a_title, fc.task_a_start, a_duration)
-                if row is not None and reschedule_fixed_task(row["task_id"], fc.task_b_end):
+                if row is not None and reschedule_fixed_task(row["task_id"], fc.task_b_end, user_id=user_id):
                     _run_and_track_conflicts()
                     st.rerun()
         with fx_move_cols[1]:
@@ -1227,7 +1222,7 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
                 key=f"fixed_conflict_move_b_{f_idx}", use_container_width=True,
             ):
                 row = _find_fixed_task(fc.task_b_title, fc.task_b_start, b_duration)
-                if row is not None and reschedule_fixed_task(row["task_id"], fc.task_a_end):
+                if row is not None and reschedule_fixed_task(row["task_id"], fc.task_a_end, user_id=user_id):
                     _run_and_track_conflicts()
                     st.rerun()
         fx_remove_cols = st.columns(2)
@@ -1237,7 +1232,7 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
                 key=f"fixed_conflict_remove_a_{f_idx}", use_container_width=True,
             ):
                 row = _find_fixed_task(fc.task_a_title, fc.task_a_start, a_duration)
-                if row is not None and delete_task(row["task_id"]):
+                if row is not None and delete_task(row["task_id"], user_id=user_id):
                     _run_and_track_conflicts()
                     st.rerun()
         with fx_remove_cols[1]:
@@ -1246,7 +1241,7 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
                 key=f"fixed_conflict_remove_b_{f_idx}", use_container_width=True,
             ):
                 row = _find_fixed_task(fc.task_b_title, fc.task_b_start, b_duration)
-                if row is not None and delete_task(row["task_id"]):
+                if row is not None and delete_task(row["task_id"], user_id=user_id):
                     _run_and_track_conflicts()
                     st.rerun()
 
@@ -1264,7 +1259,7 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
         with warn_cols[0]:
             if st.button("↩️ Undo — remove this break", key="undo_break_delay", use_container_width=True):
                 last_break_id = st.session_state.get(LAST_BREAK_ADDED_KEY)
-                if last_break_id and delete_task(last_break_id):
+                if last_break_id and delete_task(last_break_id, user_id=user_id):
                     st.session_state[DELAY_WARNING_KEY] = []
                     st.session_state[LAST_BREAK_ADDED_KEY] = None
                     _run_and_track_conflicts()
@@ -1374,7 +1369,7 @@ else:
                                     key=f"import_gcal_event_{_ev_idx}",
                                     use_container_width=True,
                                 ):
-                                    new_task_id = import_calendar_event_as_task(plan["plan_id"], ev)
+                                    new_task_id = import_calendar_event_as_task(plan["plan_id"], ev, user_id=user_id)
                                     if new_task_id:
                                         st.toast(f"Imported '{ev.get('title')}' as a task.", icon="📥")
                                         st.rerun()
@@ -1513,7 +1508,7 @@ for task in tasks_display:
                         st.rerun()
         with top[2]:
             if st.button("🗑️ Delete", key=f"del_{task['task_id']}", use_container_width=True):
-                if delete_task(task["task_id"]):
+                if delete_task(task["task_id"], user_id=user_id):
                     st.toast("Task deleted.", icon="🗑️")
                     st.rerun()
 
@@ -1540,23 +1535,23 @@ for task in tasks_display:
             action_cols = st.columns(3)
             with action_cols[0]:
                 if st.button("✅ Mark Completed", key=f"complete_{task['task_id']}", use_container_width=True):
-                    if finish_task_with_timer(task["task_id"], status="completed"):
+                    if finish_task_with_timer(task["task_id"], status="completed", user_id=user_id):
                         st.toast("Nice work! Task completed.", icon="🎉")
                         st.rerun()
             with action_cols[1]:
                 if status == "pending":
                     if st.button("▶️ Start Task", key=f"start_{task['task_id']}", use_container_width=True):
-                        if start_task_timer(task["task_id"]):
+                        if start_task_timer(task["task_id"], user_id=user_id):
                             st.toast("Timer started ⏱️", icon="▶️")
                             st.rerun()
                 elif not paused:
                     if st.button("⏸️ Pause", key=f"pause_{task['task_id']}", use_container_width=True):
-                        if pause_task_timer(task["task_id"]):
+                        if pause_task_timer(task["task_id"], user_id=user_id):
                             st.toast("Timer paused ⏸️", icon="⏸️")
                             st.rerun()
                 else:
                     if st.button("▶️ Resume", key=f"resume_{task['task_id']}", use_container_width=True):
-                        if resume_task_timer(task["task_id"]):
+                        if resume_task_timer(task["task_id"], user_id=user_id):
                             st.toast("Timer resumed ▶️", icon="▶️")
                             st.rerun()
             with action_cols[2]:
@@ -1565,7 +1560,7 @@ for task in tasks_display:
                         "Why?", FAILURE_REASONS, key=f"reason_{task['task_id']}"
                     )
                     if st.button("Confirm", key=f"fail_{task['task_id']}"):
-                        if finish_task_with_timer(task["task_id"], status="failed", failure_reason=reason):
+                        if finish_task_with_timer(task["task_id"], status="failed", failure_reason=reason, user_id=user_id):
                             st.toast("Logged — your coach will factor this in.", icon="📝")
                             st.rerun()
         else:
@@ -1637,6 +1632,7 @@ with st.expander("➕ Add Tasks to Today's Plan"):
                             "priority": priority,
                             "estimated_minutes": int(minutes),
                             "order_index": len(tasks),
+                            "user_id": user_id,
                         }
                         capacity_info = check_capacity_for_today(
                             int(minutes), user_id=user_id,

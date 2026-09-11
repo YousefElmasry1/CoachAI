@@ -22,8 +22,8 @@ Design notes
 
 from __future__ import annotations
 
-from datetime import datetime, timezone as dt_timezone
-from typing import Optional
+from datetime import date, datetime, timezone as dt_timezone
+from typing import Any, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 DEFAULT_TIMEZONE = "UTC"
@@ -87,3 +87,83 @@ def local_hour_from_utc_string(
         return None
     local_dt = utc_naive_to_local(naive_utc, tz_name)
     return local_dt.hour
+
+
+def utc_now_naive() -> datetime:
+    """
+    The single helper every write path should use to timestamp "now" in
+    the database: a naive datetime representing the current UTC instant
+    (no tzinfo, no trailing 'Z'). Storing naive-but-UTC consistently is
+    what makes ``utc_naive_to_local`` safe to apply uniformly on read —
+    mixing naive-local and naive-UTC values in the same column is what
+    causes silent timezone bugs.
+    """
+    return datetime.now(dt_timezone.utc).replace(tzinfo=None)
+
+
+def get_user_timezone(db: Any, user_id: str) -> str:
+    """
+    Look up a user's stored IANA timezone name, falling back to
+    ``DEFAULT_TIMEZONE`` if the user can't be found or has none set.
+
+    This is the ONE place that should ever read ``users.timezone`` off
+    the database, so every caller (scheduler, analytics, Google
+    Calendar ranges, stale-task cleanup, ...) resolves "the user's
+    timezone" the exact same way instead of each guessing at the
+    server's local timezone.
+
+    Args:
+        db: A Database instance (duck-typed: only needs ``get_user``).
+        user_id: Whose timezone to resolve.
+
+    Returns:
+        An IANA timezone name, e.g. "Africa/Cairo", or "UTC".
+    """
+    try:
+        user = db.get_user(user_id)
+    except Exception:
+        return DEFAULT_TIMEZONE
+    if not user:
+        return DEFAULT_TIMEZONE
+    tz_name = user["timezone"] if "timezone" in user.keys() else None
+    return tz_name or DEFAULT_TIMEZONE
+
+
+def user_now(db: Any, user_id: str) -> datetime:
+    """
+    The current wall-clock moment in a specific user's timezone —
+    NEVER the server's local timezone. Use this (not a bare
+    ``datetime.now()``) anywhere "now, from this user's point of view"
+    is needed: computing "today", the current hour for analytics
+    bucketing, scheduler anchoring, break placement, and Google
+    Calendar day ranges.
+
+    Args:
+        db: A Database instance used to resolve the user's timezone.
+        user_id: Whose "now" to compute.
+
+    Returns:
+        A timezone-aware datetime in the user's IANA timezone.
+    """
+    tz_name = get_user_timezone(db, user_id)
+    return datetime.now(safe_zoneinfo(tz_name))
+
+
+def user_today(db: Any, user_id: str) -> date:
+    """
+    Today's calendar date FROM THE USER'S TIMEZONE, not the server's.
+
+    A user in UTC-5 at 11pm UTC is still on "yesterday" locally; a user
+    in UTC+3 at 10pm UTC is already on "tomorrow" locally. Using the
+    server's ``date.today()`` for either produces the wrong plan_date,
+    the wrong "stale task" cutoff, and the wrong analytics day
+    boundary. Always resolve "today" through this helper instead.
+
+    Args:
+        db: A Database instance used to resolve the user's timezone.
+        user_id: Whose "today" to compute.
+
+    Returns:
+        The user's current local calendar date.
+    """
+    return user_now(db, user_id).date()

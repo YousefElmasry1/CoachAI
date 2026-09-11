@@ -378,7 +378,7 @@ def _build_tool_declarations():
 # Tool Implementations (reusing existing CoachAI services)
 # ─────────────────────────────────────────────────────────────
 
-def _impl_get_today_tasks(user_id: int) -> dict:
+def _impl_get_today_tasks(user_id: str) -> dict:
     """Retrieve today's tasks using existing services."""
     from services import load_today_tasks, load_today_plan, load_categories
 
@@ -434,14 +434,15 @@ def _impl_get_today_tasks(user_id: int) -> dict:
     }
 
 
-def _impl_get_task_history(user_id: int, days: int = 14) -> dict:
+def _impl_get_task_history(user_id: str, days: int = 14) -> dict:
     """Retrieve task history using existing database functions."""
     from services import get_database
+    from timezone_utils import user_today
 
     days = max(1, min(days, 90))
-    since_date = date.today() - timedelta(days=days)
-
     db = get_database()
+    since_date = user_today(db, user_id) - timedelta(days=days)
+
     rows = db.get_recent_tasks_for_user(user_id=user_id, since_date=since_date)
 
     if not rows:
@@ -479,7 +480,7 @@ def _impl_get_task_history(user_id: int, days: int = 14) -> dict:
     }
 
 
-def _impl_get_productivity_summary(user_id: int) -> dict:
+def _impl_get_productivity_summary(user_id: str) -> dict:
     """Retrieve productivity summary using existing analytics engine."""
     from services import load_analytics_profile
     from config import DEFAULT_ANALYTICS_WINDOW
@@ -513,7 +514,7 @@ def _impl_get_productivity_summary(user_id: int) -> dict:
     }
 
 
-def _impl_get_productivity_by_hour(user_id: int) -> dict:
+def _impl_get_productivity_by_hour(user_id: str) -> dict:
     """Retrieve best productivity hour from existing analytics."""
     from services import load_analytics_profile
     from config import DEFAULT_ANALYTICS_WINDOW
@@ -540,7 +541,7 @@ def _impl_get_productivity_by_hour(user_id: int) -> dict:
     }
 
 
-def _impl_get_completion_rate(user_id: int) -> dict:
+def _impl_get_completion_rate(user_id: str) -> dict:
     """Retrieve detailed completion/failure breakdown."""
     from services import load_analytics_profile, get_database
     from config import DEFAULT_ANALYTICS_WINDOW
@@ -553,8 +554,9 @@ def _impl_get_completion_rate(user_id: int) -> dict:
         return {"error": "Could not load analytics."}
 
     # Get failure reason distribution
-    since_date = date.today() - timedelta(days=DEFAULT_ANALYTICS_WINDOW)
     db = get_database()
+    from timezone_utils import user_today
+    since_date = user_today(db, user_id) - timedelta(days=DEFAULT_ANALYTICS_WINDOW)
     failure_rows = db.get_failure_reason_counts(
         user_id=user_id, since_date=since_date,
     )
@@ -575,7 +577,7 @@ def _impl_get_completion_rate(user_id: int) -> dict:
     }
 
 
-def _impl_get_weekly_analysis(user_id: int) -> dict:
+def _impl_get_weekly_analysis(user_id: str) -> dict:
     """Retrieve weekly trends and consistency data."""
     from services import load_analytics_profile
     from config import DEFAULT_ANALYTICS_WINDOW
@@ -623,7 +625,7 @@ def _impl_get_weekly_analysis(user_id: int) -> dict:
     return result
 
 
-def _impl_get_daily_analysis(user_id: int) -> dict:
+def _impl_get_daily_analysis(user_id: str) -> dict:
     """Analyze today's workload vs historical capacity."""
     from services import load_today_tasks, check_capacity_for_today
 
@@ -679,7 +681,7 @@ def _impl_get_daily_analysis(user_id: int) -> dict:
     return result
 
 
-def _impl_get_similar_tasks(user_id: int, task_keyword: str) -> dict:
+def _impl_get_similar_tasks(user_id: str, task_keyword: str) -> dict:
     """Search task history for similar tasks by keyword."""
     from services import get_database
 
@@ -687,9 +689,10 @@ def _impl_get_similar_tasks(user_id: int, task_keyword: str) -> dict:
         return {"error": "Please provide a keyword to search for."}
 
     keyword = normalize_for_matching(task_keyword)
-    since_date = date.today() - timedelta(days=90)
-
     db = get_database()
+    from timezone_utils import user_today
+    since_date = user_today(db, user_id) - timedelta(days=90)
+
     rows = db.get_recent_tasks_for_user(
         user_id=user_id, since_date=since_date,
     )
@@ -763,7 +766,7 @@ _TOOL_DISPATCH: dict[str, Any] = {
 }
 
 
-def _execute_tool(tool_name: str, tool_args: dict, user_id: int) -> str:
+def _execute_tool(tool_name: str, tool_args: dict, user_id: str) -> str:
     """Execute a chatbot tool by name and return the result as a JSON string."""
     handler = _TOOL_DISPATCH.get(tool_name)
     if handler is None:
@@ -882,7 +885,7 @@ class ChatbotService:
 
     _MAX_TOOL_ROUNDS: int = 5  # Safety limit on tool-call loops
 
-    def __init__(self, user_id: int) -> None:
+    def __init__(self, user_id: str) -> None:
         self.user_id = user_id
         self._chat: Any = None
         self._client: Any = None
@@ -902,9 +905,13 @@ class ChatbotService:
 
         self._client = genai.Client(api_key=api_key)
 
-        # Append current date to system prompt for temporal context
+        # Append current date (in the user's own timezone, not the
+        # server's) to the system prompt for temporal context.
+        from services import get_database
+        from timezone_utils import user_today
+        today_str = user_today(get_database(), self.user_id).isoformat()
         system_prompt = (
-            _SYSTEM_PROMPT + f"\n\nToday's date is {date.today().isoformat()}."
+            _SYSTEM_PROMPT + f"\n\nToday's date is {today_str}."
         )
 
         self._config = types.GenerateContentConfig(
@@ -1136,7 +1143,7 @@ class ChatbotService:
 # Public Factory Functions
 # ─────────────────────────────────────────────────────────────
 
-def create_chatbot_service(user_id: int) -> ChatbotService:
+def create_chatbot_service(user_id: str) -> ChatbotService:
     """Create a new ChatbotService instance for the given user."""
     return ChatbotService(user_id=user_id)
 

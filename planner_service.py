@@ -84,7 +84,7 @@ class PlannerService:
         except (KeyError, IndexError):
             return default
 
-    def _get_or_create_today_plan(self, user_id: int, raw_input: str) -> int:
+    def _get_or_create_today_plan(self, user_id: str, raw_input: str) -> int:
         """
         Fetch today's plan for the user, creating one if it doesn't exist.
 
@@ -103,13 +103,14 @@ class PlannerService:
         if existing is not None:
             return int(existing["plan_id"])
 
+        from timezone_utils import user_today
         return self.db.create_plan(
             user_id=user_id,
-            plan_date=date.today(),
+            plan_date=user_today(self.db, user_id),
             raw_input=raw_input,
         )
 
-    def _load_existing_categories(self, user_id: int) -> dict[str, int]:
+    def _load_existing_categories(self, user_id: str) -> dict[str, int]:
         """
         Load the user's existing categories as a normalized lookup.
 
@@ -130,7 +131,7 @@ class PlannerService:
         self,
         task: TaskOutput,
         category_lookup: dict[str, int],
-        user_id: int,
+        user_id: str,
     ) -> Optional[int]:
         """
         Resolve a task's category_name to a category_id, creating a new
@@ -230,7 +231,7 @@ class PlannerService:
     def draft_plan(
         self,
         raw_input: str,
-        user_id: int,
+        user_id: str,
         calendar_events: Optional[list[dict]] = None,
     ) -> DayPlanOutput:
         """
@@ -276,7 +277,7 @@ class PlannerService:
         self,
         plan_output: DayPlanOutput,
         raw_input: str,
-        user_id: int,
+        user_id: str,
     ) -> dict[str, Any]:
         """
         Persist an already-drafted DayPlanOutput (see ``draft_plan``) to
@@ -307,7 +308,7 @@ class PlannerService:
         plan_id = self._get_or_create_today_plan(user_id, cleaned_input)
 
         # 3. Figure out where new tasks should start in display order
-        existing_task_count = len(self.db.get_tasks_by_plan(plan_id))
+        existing_task_count = len(self.db.get_tasks_by_plan(plan_id, user_id))
 
         # 4. Persist each task, resolving/creating categories as we go
         saved_tasks: list[dict[str, Any]] = []
@@ -325,6 +326,7 @@ class PlannerService:
 
             task_id = self.db.add_task(
                 plan_id=plan_id,
+                user_id=user_id,
                 title=task.title,
                 category_id=category_id,
                 description=task.description or None,
@@ -357,7 +359,7 @@ class PlannerService:
     def generate_and_save_plan(
         self,
         raw_input: str,
-        user_id: int,
+        user_id: str,
     ) -> dict[str, Any]:
         """
         Turn free-form text into structured tasks and persist them in

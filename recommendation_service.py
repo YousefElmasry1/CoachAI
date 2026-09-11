@@ -133,20 +133,23 @@ class RecommendationService:
 
         return "\n".join(lines)
 
-    def _format_schedule_text_for_plan(self, plan_id: int) -> str:
+    def _format_schedule_text_for_plan(self, plan_id: int, user_id: str) -> str:
         """
         Load tasks for a plan and format them into schedule text.
 
         Args:
             plan_id: The plan whose tasks to load.
+            user_id: The caller's user_id -- tasks are only loaded if
+                plan_id is owned by this user.
 
         Returns:
             Formatted schedule text.
 
         Raises:
-            ValueError: If the plan has no tasks.
+            ValueError: If the plan has no tasks, doesn't exist, or
+                isn't owned by user_id.
         """
-        tasks = self.db.get_tasks_by_plan(plan_id)
+        tasks = self.db.get_tasks_by_plan(plan_id, user_id)
         if not tasks:
             raise ValueError(f"Plan {plan_id} has no tasks to analyze.")
         return self._format_schedule_text(tasks)
@@ -154,7 +157,7 @@ class RecommendationService:
     def _generate_recommendations(
         self,
         plan_id: int,
-        user_id: int,
+        user_id: str,
     ) -> RecommendationOutput:
         """
         Shared implementation for both public entry points.
@@ -165,18 +168,20 @@ class RecommendationService:
 
         Args:
             plan_id: The plan to analyze as "today's schedule".
-            user_id: The plan's owner, used to build the analytics profile.
+            user_id: The plan's owner, used to build the analytics
+                profile AND to verify plan_id is actually owned by them.
 
         Returns:
             A RecommendationOutput containing coaching feedback informed
             by both today's schedule and the user's analytics profile.
 
         Raises:
-            ValueError: If the plan has no tasks.
+            ValueError: If the plan has no tasks, doesn't exist, or
+                isn't owned by user_id.
             RuntimeError: If the recommendation engine fails.
         """
         # 1. Format today's schedule
-        schedule_text = self._format_schedule_text_for_plan(plan_id)
+        schedule_text = self._format_schedule_text_for_plan(plan_id, user_id)
         language = _detect_language(schedule_text)
 
         # 2. Build analytics profile (single DB load, all metrics computed)
@@ -204,7 +209,7 @@ class RecommendationService:
 
     def get_recommendations_for_today(
         self,
-        user_id: int,
+        user_id: str,
     ) -> RecommendationOutput:
         """
         Load today's scheduled tasks for a user and return AI-generated
@@ -235,6 +240,7 @@ class RecommendationService:
     def get_recommendations_for_plan(
         self,
         plan_id: int,
+        user_id: str,
     ) -> RecommendationOutput:
         """
         Load any plan's scheduled tasks and return AI-generated
@@ -243,17 +249,24 @@ class RecommendationService:
 
         Args:
             plan_id: The plan to analyze.
+            user_id: The caller's user_id. The plan is only analyzed if
+                it's actually owned by this user -- otherwise any caller
+                could pull another user's schedule (and, via the
+                analytics profile, a summary of their historical
+                behavior) just by guessing a plan_id.
 
         Returns:
             A RecommendationOutput containing coaching advice.
 
         Raises:
-            ValueError: If the plan does not exist or has no tasks.
+            ValueError: If the plan does not exist, isn't owned by
+                user_id, or has no tasks.
             RuntimeError: If the recommendation engine fails.
         """
-        plan = self.db.get_plan_by_id(plan_id)
+        plan = self.db.get_plan_by_id(plan_id, user_id)
         if plan is None:
-            raise ValueError(f"No plan found with plan_id {plan_id}.")
+            raise ValueError(
+                f"No plan found with plan_id {plan_id} for user {user_id!r}."
+            )
 
-        user_id: int = int(plan["user_id"])
         return self._generate_recommendations(plan_id=plan_id, user_id=user_id)

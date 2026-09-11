@@ -29,6 +29,7 @@ from services import (
     get_selected_calendars,
     sync_google_calendar,
     get_last_sync_time,
+    get_last_sync_label,
     load_user,
     set_user_timezone,
 )
@@ -170,7 +171,7 @@ with tabs[2]:
 # ═════════════════════════════════════════════════════════════
 with tabs[3]:
     st.markdown("#### Your Categories")
-    categories = load_categories()
+    categories = load_categories(user_id=user_id)
     if categories:
         cols = st.columns(3)
         for i, c in enumerate(categories):
@@ -201,7 +202,7 @@ with tabs[3]:
             if not name.strip():
                 st.error("Please enter a category name.")
             else:
-                cat_id = create_category(user_id=1, name=name.strip(), color=color)
+                cat_id = create_category(user_id=user_id, name=name.strip(), color=color)
                 if cat_id:
                     st.toast(f"Category '{name}' added!", icon="🏷️")
                     st.rerun()
@@ -364,28 +365,9 @@ with tabs[5]:
             # ── State C: Connected with Calendars Selected ──
             st.markdown("#### ✅ Google Calendar Connected")
 
-            last_sync = get_last_sync_time(user_id)
-            if last_sync:
-                from datetime import datetime, timedelta
-                try:
-                    # last_sync is stored as SQLite CURRENT_TIMESTAMP, which
-                    # is always UTC — convert to local time before comparing
-                    # against datetime.now() or displaying it, or both the
-                    # "X minutes ago" math and the clock label come out
-                    # hours off (matches the local UTC+3 offset).
-                    sync_dt_utc = datetime.fromisoformat(last_sync)
-                    sync_dt = sync_dt_utc + timedelta(hours=3)
-                    diff = datetime.now() - sync_dt
-                    mins_ago = int(diff.total_seconds() / 60)
-                    if mins_ago < 1:
-                        sync_label = "just now"
-                    elif mins_ago < 60:
-                        sync_label = f"{mins_ago} minute{'s' if mins_ago != 1 else ''} ago"
-                    else:
-                        sync_label = sync_dt.strftime("%I:%M %p")
-                    st.caption(f"Last synced: {sync_label}")
-                except (ValueError, TypeError):
-                    st.caption(f"Last synced: {last_sync}")
+            sync_label = get_last_sync_label(user_id)
+            if sync_label:
+                st.caption(f"Last synced: {sync_label}")
             else:
                 st.caption("Not yet synced.")
 
