@@ -376,8 +376,8 @@ class IntermediateStats:
 
     # --- Planning ---
     planning_errors: list[float]    # (actual - estimated) / estimated per task
-    avg_planning_error: float       # mean of planning_errors
-    planning_accuracy: float        # 1.0 - abs(avg_planning_error), clamped 0–1
+    avg_planning_error: float       # SIGNED mean of planning_errors (for bias direction)
+    planning_accuracy: float        # 1.0 - mean(abs(planning_errors)), clamped 0–1 (MAPE-based)
 
     # --- Delay ---
     delays: list[float]             # max(0, actual - estimated) per task
@@ -682,7 +682,23 @@ def build_intermediate_stats(
         sum(planning_errors) / len(planning_errors)
         if planning_errors else 0.0
     )
-    planning_accuracy = max(0.0, min(1.0, 1.0 - abs(avg_planning_error)))
+    # planning_accuracy uses the MEAN ABSOLUTE relative error (a MAPE --
+    # Mean Absolute Percentage Error -- since planning_errors are already
+    # relative errors), NOT abs(mean(signed error)). The signed average
+    # lets opposite-direction errors cancel out: a task finishing 100%
+    # over estimate and another finishing 100% under would average to a
+    # "perfect" 0% signed error and be reported as 100% accurate, even
+    # though every single estimate was wildly wrong. Averaging the
+    # magnitudes first means only genuinely accurate estimates (small
+    # |error| in either direction) count towards a high accuracy score.
+    # avg_planning_error itself stays SIGNED and unchanged -- it's used
+    # separately for bias_direction (over- vs under-estimation), which
+    # genuinely needs the sign.
+    avg_abs_planning_error = (
+        sum(abs(e) for e in planning_errors) / len(planning_errors)
+        if planning_errors else 0.0
+    )
+    planning_accuracy = max(0.0, min(1.0, 1.0 - avg_abs_planning_error))
 
     avg_delay = sum(delays) / len(delays) if delays else 0.0
     max_delay = max(delays) if delays else 0.0
@@ -941,7 +957,7 @@ class PlanningResult(BaseModel):
     """Planning accuracy and bias detection."""
     planning_accuracy: float = Field(
         default=0.0,
-        description="1.0 - abs(avg_planning_error), clamped 0–1.",
+        description="1.0 - mean(abs(planning_errors)), clamped 0–1 (MAPE-based).",
     )
     avg_planning_error: float = 0.0
     overestimation_rate: float = Field(
@@ -1614,7 +1630,7 @@ class PlanningCalculator:
         systematic over- or under-estimation.
 
     Formula:
-        planning_accuracy = 1.0 - abs(avg_planning_error)
+        planning_accuracy = 1.0 - mean(abs(e) for e in planning_errors)
         overestimation_rate = count(estimated > actual) / total_with_actual
         underestimation_rate = count(estimated < actual) / total_with_actual
         bias_direction = 'overestimation' if avg_error < -0.1 else
@@ -3026,8 +3042,12 @@ class DurationCalculator:
                         max(0.0, t.actual_minutes - t.estimated_minutes)
                     )
 
+            # Same MAPE-based fix as the top-level planning_accuracy in
+            # summarize_tasks() -- mean of absolute errors, not
+            # abs(mean(signed error)), so opposite-signed errors in the
+            # same bucket can't cancel out into a falsely "perfect" score.
             plan_acc = (
-                max(0.0, min(1.0, 1.0 - abs(sum(errors) / len(errors))))
+                max(0.0, min(1.0, 1.0 - (sum(abs(e) for e in errors) / len(errors))))
                 if errors else 0.0
             )
             avg_delay = sum(bucket_delays) / len(bucket_delays) if bucket_delays else 0.0

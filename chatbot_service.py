@@ -877,6 +877,54 @@ _ERROR_MESSAGES_AR = {
 # Chatbot Service
 # ─────────────────────────────────────────────────────────────
 
+def _dedupe_function_call_parts(parts: list) -> list:
+    """
+    Drop repeated function-call parts, keeping first-seen order.
+
+    Streaming responses (send_message_stream) are collected chunk by
+    chunk, and each chunk's ``content.parts`` is read independently
+    (see the Phase 1/Phase 2 loops below) rather than relying on the
+    stream being strictly delta-only. If the SDK/model ever emits the
+    same function_call more than once across chunks -- e.g. a
+    server-side retry, or a chunk that repeats a part already seen --
+    executing every occurrence would run that tool call (and any side
+    effects) multiple times for what the user experiences as a single
+    request. Two calls are treated as "the same" when their tool name
+    AND arguments match exactly; legitimately calling the same tool
+    twice with different arguments in one turn is untouched.
+    """
+    seen: set[tuple[str, str]] = set()
+    deduped = []
+    for part in parts:
+        fc = getattr(part, "function_call", None)
+        if fc is None:
+            deduped.append(part)
+            continue
+        try:
+            args_key = json.dumps(dict(fc.args) if fc.args else {}, sort_keys=True, default=str)
+        except TypeError:
+            args_key = repr(fc.args)
+        key = (fc.name, args_key)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(part)
+    return deduped
+
+
+def _content_is_function_response(content: Any) -> bool:
+    """
+    True if a google.genai Content turn is a tool-result continuation
+    (a function_response part) rather than something an actual person
+    typed. Used to find safe places to cut the conversation history --
+    cutting must never land between a function_call and its
+    function_response, or the next API call would send a dangling
+    function_call with no matching response and error out.
+    """
+    parts = getattr(content, "parts", None) or []
+    return any(getattr(p, "function_response", None) is not None for p in parts)
+
+
 class ChatbotService:
     """
     Manages a Gemini chat session with function calling for the
@@ -884,6 +932,18 @@ class ChatbotService:
     """
 
     _MAX_TOOL_ROUNDS: int = 5  # Safety limit on tool-call loops
+
+    # How many of the most recent REAL user turns (not counting the
+    # tool-call/tool-response turns that ride along with them) to keep
+    # once the conversation gets long. The google-genai Chat object
+    # resends its ENTIRE internal history on every send_message() call
+    # (Gemini itself is stateless per-request) -- with no cap, a long
+    # session's token usage, latency, and cost all grow without bound,
+    # and can eventually exceed the model's context window outright.
+    # 12 is generous enough to keep real multi-turn context (a user
+    # asking a follow-up question a few messages back still works) while
+    # keeping the resent payload bounded.
+    _MAX_HISTORY_USER_TURNS: int = 12
 
     def __init__(self, user_id: str) -> None:
         self.user_id = user_id
@@ -924,6 +984,36 @@ class ChatbotService:
             config=self._config,
         )
 
+    def _maybe_trim_history(self) -> None:
+        """
+        Cap the chat's internal history once it grows past
+        _MAX_HISTORY_USER_TURNS real user turns, so token usage/latency/
+        cost stop growing with the length of the whole session.
+
+        The system prompt and tool declarations are unaffected -- both
+        live in self._config (system_instruction / tools), which is
+        passed fresh to chats.create() every time, not stored as part
+        of the history being trimmed here. Only truncates on a
+        REAL-user-turn boundary (see _content_is_function_response), so
+        a function_call is never separated from its function_response.
+        """
+        history = self._chat.get_history(curated=True)
+        real_turn_starts = [
+            i for i, content in enumerate(history)
+            if getattr(content, "role", None) == "user"
+            and not _content_is_function_response(content)
+        ]
+        if len(real_turn_starts) <= self._MAX_HISTORY_USER_TURNS:
+            return  # still within budget -- nothing to do
+
+        cutoff = real_turn_starts[-self._MAX_HISTORY_USER_TURNS]
+        trimmed_history = history[cutoff:]
+        self._chat = self._client.chats.create(
+            model=_MODEL_NAME,
+            config=self._config,
+            history=trimmed_history,
+        )
+
     def send_message(self, user_message: str) -> str:
         """
         Send a user message and return the assistant's response.
@@ -952,7 +1042,16 @@ class ChatbotService:
         try:
             response = self._chat.send_message(user_message)
             response = self._handle_function_calls(response)
-            return self._extract_text(response)
+            text = self._extract_text(response)
+            try:
+                self._maybe_trim_history()
+            except Exception:
+                # Trimming is a token/cost optimisation, not something
+                # that should ever take down an otherwise-successful
+                # reply -- worst case the history just grows a bit more
+                # and gets trimmed on the next turn instead.
+                logger.exception("History trim failed; continuing with untrimmed history.")
+            return text
 
         except Exception as exc:
             category = _classify_and_log_error(exc, context="send_message")
@@ -1081,6 +1180,11 @@ class ChatbotService:
                 except (AttributeError, IndexError, TypeError):
                     pass
 
+            # Guard against the same function_call appearing in more
+            # than one collected chunk (see _dedupe_function_call_parts)
+            # before it's ever executed.
+            collected_fc = _dedupe_function_call_parts(collected_fc)
+
             # If we already yielded text and no function calls, we're done
             if not collected_fc:
                 return
@@ -1128,6 +1232,18 @@ class ChatbotService:
                                     fc_parts.append(p)
                     except (AttributeError, IndexError, TypeError):
                         pass
+
+                # Same duplicate-chunk guard as Phase 1, applied before
+                # the next while-iteration would otherwise execute any
+                # repeated call again.
+                fc_parts = _dedupe_function_call_parts(fc_parts)
+
+            try:
+                self._maybe_trim_history()
+            except Exception:
+                # Same reasoning as send_message(): never let a trim
+                # failure surface as a chat error to the user.
+                logger.exception("History trim failed; continuing with untrimmed history.")
 
         except Exception as exc:
             yield self._format_error(exc, user_message)

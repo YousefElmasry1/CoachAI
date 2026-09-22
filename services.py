@@ -422,14 +422,30 @@ def load_recent_plans(
     user_id: str = DEFAULT_USER_ID,
     days: int = 30,
 ) -> list[dict]:
-    """Load recent plans with their tasks."""
+    """Load recent plans with their tasks.
+
+    Fetches every plan's tasks in a single batch query
+    (Database.get_tasks_by_plan_ids) instead of one query per plan --
+    with N recent plans this is 2 queries total (1 for the plans, 1 for
+    every plan's tasks together) rather than 1 + N, so the number of
+    round trips no longer grows with how many plans are in the window.
+    """
     db = get_database()
     since = user_today(db, user_id) - timedelta(days=days)
     rows = db.get_recent_plans(user_id=user_id, since_date=since)
+    if not rows:
+        return []
+
+    plan_ids = [row["plan_id"] for row in rows]
+    task_rows = db.get_tasks_by_plan_ids(plan_ids, user_id)
+    tasks_by_plan: dict[int, list[dict]] = {}
+    for t in task_rows:
+        tasks_by_plan.setdefault(int(t["plan_id"]), []).append(dict(t))
+
     plans = []
     for row in rows:
         plan = dict(row)
-        plan["tasks"] = load_plan_tasks(plan["plan_id"], user_id)
+        plan["tasks"] = tasks_by_plan.get(plan["plan_id"], [])
         plans.append(plan)
     return plans
 
@@ -527,19 +543,33 @@ def is_task_timer_paused(task: dict) -> bool:
     return task.get("status") == "in_progress" and not task.get("timer_segment_started_at")
 
 
+_TIMER_CONFLICT_RETRIES: int = 1  # bounded optimistic-concurrency retry (no locking)
+
+
 def start_task_timer(task_id: int, user_id: str = DEFAULT_USER_ID) -> bool:
     """Start a task's timer for the first time (pending -> in_progress).
 
     Returns False if task_id doesn't exist or isn't owned by user_id.
     """
+    from database import TimerConflictError
+
     try:
         db = get_database()
         db.update_task_status(task_id, user_id, status="in_progress")  # stamps started_at once
-        db.set_task_timer_state(
-            task_id, user_id, accumulated_seconds=0, segment_started_at=_utc_now_str(),
-            paused_at=None, total_paused_seconds=0,
-        )
-        return True
+        for attempt in range(_TIMER_CONFLICT_RETRIES + 1):
+            task = db.get_task(task_id, user_id)
+            version = task.get("timer_version") if task else None
+            try:
+                db.set_task_timer_state(
+                    task_id, user_id, accumulated_seconds=0, segment_started_at=_utc_now_str(),
+                    paused_at=None, total_paused_seconds=0, expected_version=version,
+                )
+                return True
+            except TimerConflictError:
+                if attempt == _TIMER_CONFLICT_RETRIES:
+                    raise
+                continue  # someone else touched the timer between our read and write; retry once
+        return False
     except Exception:
         return False
 
@@ -549,23 +579,39 @@ def pause_task_timer(task_id: int, user_id: str = DEFAULT_USER_ID) -> bool:
     starts the pause clock (paused_at), and bumps pause_count (feeds
     get_pause_matrix / load_pause_matrix).
 
+    Uses optimistic concurrency (Database.set_task_timer_state's
+    expected_version) with one bounded retry: if another request
+    updated this task's timer between our read and our write, we
+    re-read the fresh state and recompute instead of blindly
+    overwriting it and losing the other update's elapsed time.
+
     Returns False if task_id doesn't exist or isn't owned by user_id.
     """
+    from database import TimerConflictError
+
     try:
         db = get_database()
-        task = db.get_task(task_id, user_id)
-        if task is None:
-            return False
-        task_dict = dict(task)
-        elapsed = get_task_elapsed_seconds(task_dict)
-        db.set_task_timer_state(
-            task_id, user_id, accumulated_seconds=elapsed, segment_started_at=None,
-            paused_at=_utc_now_str(),
-            total_paused_seconds=int(task_dict.get("timer_total_paused_seconds") or 0),
-        )
-        db.increment_task_pause_count(task_id, user_id)
-        load_pause_matrix.clear()
-        return True
+        for attempt in range(_TIMER_CONFLICT_RETRIES + 1):
+            task = db.get_task(task_id, user_id)
+            if task is None:
+                return False
+            task_dict = dict(task)
+            elapsed = get_task_elapsed_seconds(task_dict)
+            try:
+                db.set_task_timer_state(
+                    task_id, user_id, accumulated_seconds=elapsed, segment_started_at=None,
+                    paused_at=_utc_now_str(),
+                    total_paused_seconds=int(task_dict.get("timer_total_paused_seconds") or 0),
+                    expected_version=task_dict.get("timer_version"),
+                )
+            except TimerConflictError:
+                if attempt == _TIMER_CONFLICT_RETRIES:
+                    raise
+                continue
+            db.increment_task_pause_count(task_id, user_id)
+            load_pause_matrix.clear()
+            return True
+        return False
     except Exception:
         return False
 
@@ -576,22 +622,36 @@ def resume_task_timer(task_id: int, user_id: str = DEFAULT_USER_ID) -> bool:
     lasted into timer_total_paused_seconds (so it's never lost), then
     starts a new active segment.
 
+    Uses the same optimistic-concurrency + bounded-retry pattern as
+    pause_task_timer (see its docstring) to avoid a lost update if
+    another request touched this task's timer concurrently.
+
     Returns False if task_id doesn't exist or isn't owned by user_id.
     """
+    from database import TimerConflictError
+
     try:
         db = get_database()
-        task = db.get_task(task_id, user_id)
-        if task is None:
-            return False
-        task_dict = dict(task)
-        # Finalise the pause that's ending right now.
-        total_paused = get_task_paused_seconds(task_dict)
-        accumulated = int(task_dict.get("timer_accumulated_seconds") or 0)
-        db.set_task_timer_state(
-            task_id, user_id, accumulated_seconds=accumulated, segment_started_at=_utc_now_str(),
-            paused_at=None, total_paused_seconds=total_paused,
-        )
-        return True
+        for attempt in range(_TIMER_CONFLICT_RETRIES + 1):
+            task = db.get_task(task_id, user_id)
+            if task is None:
+                return False
+            task_dict = dict(task)
+            # Finalise the pause that's ending right now.
+            total_paused = get_task_paused_seconds(task_dict)
+            accumulated = int(task_dict.get("timer_accumulated_seconds") or 0)
+            try:
+                db.set_task_timer_state(
+                    task_id, user_id, accumulated_seconds=accumulated, segment_started_at=_utc_now_str(),
+                    paused_at=None, total_paused_seconds=total_paused,
+                    expected_version=task_dict.get("timer_version"),
+                )
+                return True
+            except TimerConflictError:
+                if attempt == _TIMER_CONFLICT_RETRIES:
+                    raise
+                continue
+        return False
     except Exception:
         return False
 
@@ -614,13 +674,24 @@ def finish_task_with_timer(
     Falls back to letting update_task_status compute actual_minutes
     the old way if the task was never started (no timer data at all).
 
+    Uses the same optimistic-concurrency + bounded-retry pattern as
+    pause_task_timer/resume_task_timer (see pause_task_timer's
+    docstring) when freezing the timer state, so a finish that races
+    with a concurrent pause/resume recomputes from fresh state instead
+    of overwriting it.
+
     Returns False if task_id doesn't exist or isn't owned by user_id.
     """
+    from database import TimerConflictError
+
     try:
         db = get_database()
-        task = db.get_task(task_id, user_id)
         actual_minutes = None
-        if task is not None:
+        for attempt in range(_TIMER_CONFLICT_RETRIES + 1):
+            task = db.get_task(task_id, user_id)
+            if task is None:
+                actual_minutes = None
+                break
             task_dict = dict(task)
             elapsed_seconds = get_task_elapsed_seconds(task_dict)
             total_paused = get_task_paused_seconds(task_dict)
@@ -629,10 +700,17 @@ def finish_task_with_timer(
             # Freeze both the active segment and any open pause, so a
             # completed/failed task never shows a "still running" or
             # "still paused" timer if re-read later.
-            db.set_task_timer_state(
-                task_id, user_id, accumulated_seconds=elapsed_seconds, segment_started_at=None,
-                paused_at=None, total_paused_seconds=total_paused,
-            )
+            try:
+                db.set_task_timer_state(
+                    task_id, user_id, accumulated_seconds=elapsed_seconds, segment_started_at=None,
+                    paused_at=None, total_paused_seconds=total_paused,
+                    expected_version=task_dict.get("timer_version"),
+                )
+                break
+            except TimerConflictError:
+                if attempt == _TIMER_CONFLICT_RETRIES:
+                    raise
+                continue
         return update_task_status(
             task_id, status=status, failure_reason=failure_reason,
             actual_minutes=actual_minutes, user_id=user_id,

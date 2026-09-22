@@ -40,17 +40,24 @@ def run_daily_stale_task_cleanup() -> None:
     from database import Database
 
     db = Database()
-    user_ids = db.get_all_user_ids()
-    total_closed = 0
-    for user_id in user_ids:
-        try:
-            total_closed += db.close_out_stale_tasks(user_id=user_id)
-        except Exception:
-            logger.exception("close_out_stale_tasks failed for user_id=%s", user_id)
-    logger.info(
-        "Daily stale-task cleanup done: %d task(s) closed across %d user(s).",
-        total_closed, len(user_ids),
-    )
+    try:
+        user_ids = db.get_all_user_ids()
+        total_closed = 0
+        for user_id in user_ids:
+            try:
+                total_closed += db.close_out_stale_tasks(user_id=user_id)
+            except Exception:
+                logger.exception("close_out_stale_tasks failed for user_id=%s", user_id)
+        logger.info(
+            "Daily stale-task cleanup done: %d task(s) closed across %d user(s).",
+            total_closed, len(user_ids),
+        )
+    finally:
+        # This Database() is local to this one job run (unlike the
+        # thread-local, kept-open-for-the-thread's-lifetime instance
+        # services.get_database() hands out), so it must close its own
+        # connection when done or every midnight run leaks one.
+        db.close()
 
 
 @asynccontextmanager

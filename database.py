@@ -15,7 +15,7 @@ from sqlalchemy import (
     Index, func,
 )
 from sqlalchemy.engine import Connection, CursorResult, Engine
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import DBAPIError, IntegrityError, SQLAlchemyError
 
 from timezone_utils import get_user_timezone, safe_zoneinfo, local_hour_from_utc_string, user_today
 
@@ -28,6 +28,22 @@ class OwnershipError(Exception):
     Deliberately does not distinguish "not found" from "not yours" in
     its message -- leaking that distinction back to a caller is itself
     a (minor) information disclosure about which raw ids are valid.
+    """
+
+
+class TimerConflictError(Exception):
+    """
+    Raised by Database.set_task_timer_state() when the caller passed an
+    expected_version that no longer matches the row's current
+    timer_version -- i.e. some other request already updated this
+    task's timer state in between this caller's read and its write.
+
+    This is the optimistic-concurrency counterpart to OwnershipError:
+    the task exists and IS owned by this user (that case raises
+    OwnershipError instead), but a concurrent update was lost if this
+    write were allowed to blindly overwrite it. Callers should re-read
+    the task and retry (once) rather than silently dropping the
+    conflicting update.
     """
 
 
@@ -104,6 +120,7 @@ tasks = Table(
     Column("pause_count", Integer, nullable=False, server_default="0"),
     Column("paused_at", DateTime),
     Column("timer_total_paused_seconds", Integer, nullable=False, server_default="0"),
+    Column("timer_version", Integer, nullable=False, server_default="0"),
     Column("created_at", DateTime, nullable=False, server_default=func.current_timestamp()),
     Column("updated_at", DateTime, nullable=False, server_default=func.current_timestamp()),
     Column("google_event_id", String),
@@ -360,6 +377,7 @@ class Database:
             self._maybe_migrate_task_timer_fields()
             self._maybe_migrate_task_pause_count()
             self._maybe_migrate_task_pause_duration_fields()
+            self._maybe_migrate_task_timer_version()
             return  # Schema already applied
 
         schema_path = Path(__file__).with_name(SCHEMA_FILE)
@@ -388,6 +406,7 @@ class Database:
         self._maybe_migrate_task_timer_fields()
         self._maybe_migrate_task_pause_count()
         self._maybe_migrate_task_pause_duration_fields()
+        self._maybe_migrate_task_timer_version()
         self._maybe_migrate_user_password_hash()
 
     def _maybe_migrate_user_password_hash(self) -> None:
@@ -710,6 +729,34 @@ class Database:
             )
             self.connection.commit()
 
+    def _maybe_migrate_task_timer_version(self) -> None:
+        """
+        Add ``timer_version`` to an existing ``tasks`` table if missing.
+
+        An optimistic-concurrency counter bumped by every
+        set_task_timer_state() write. start/pause/resume/finish all
+        follow a read-current-state -> compute-new-state -> write
+        pattern; without a version check, two overlapping calls (e.g.
+        a double-submitted Pause click, or two open tabs) can both read
+        the same starting state and the second write silently clobbers
+        the first, losing whatever elapsed time the first write banked.
+        Passing the version read alongside the rest of the timer state
+        to set_task_timer_state() makes the write conditional: it only
+        applies if nothing else has updated the row in between, and
+        raises TimerConflictError otherwise so the caller can retry
+        against fresh state instead of silently losing time.
+
+        Existing rows default to 0, which is exactly correct -- there's
+        no prior state to be racing against yet.
+        """
+        cursor = self.connection.execute(text("PRAGMA table_info(tasks)"))
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        if "timer_version" not in existing_columns:
+            self.connection.execute(
+                text("ALTER TABLE tasks ADD COLUMN timer_version INTEGER NOT NULL DEFAULT 0")
+            )
+            self.connection.commit()
+
     # ------------------------------------------------------------------
     # Low-level query helpers
     #
@@ -806,6 +853,27 @@ class Database:
         stmt, params = self._to_named(sql, parameters)
         try:
             return self.connection.execute(stmt, params)
+        except DBAPIError as exc:
+            if exc.connection_invalidated:
+                # This Database holds ONE connection for its whole
+                # lifetime (see class docstring / Issue 7 notes) rather
+                # than checking one out per call, so SQLAlchemy's usual
+                # pool-level pool_pre_ping/pool_recycle never gets a
+                # chance to catch a connection that died from under us
+                # (e.g. a Postgres server-side idle timeout, or a
+                # dropped network connection on a long-lived thread).
+                # SQLAlchemy has already marked the connection invalid
+                # at this point; reconnect once and retry this one
+                # statement rather than leaving every future call on
+                # this thread broken until the process restarts.
+                try:
+                    self.connection.close()
+                except SQLAlchemyError:
+                    pass
+                self._connect()
+                return self.connection.execute(stmt, params)
+            self.connection.rollback()
+            raise
         except SQLAlchemyError as exc:
             self.connection.rollback()
             raise exc
@@ -1442,6 +1510,52 @@ class Database:
             (plan_id, user_id),
         )
 
+    def get_tasks_by_plan_ids(
+        self, plan_ids: list[int], user_id: str,
+    ) -> list[sqlite3.Row]:
+        """
+        Batch counterpart to get_tasks_by_plan(): fetch every task for
+        ALL of the given plans in a single round trip, instead of one
+        query per plan (the N+1 pattern services.load_recent_plans()
+        used to have -- 1 query for the plans, then 1 more per plan for
+        that plan's tasks).
+
+        Args:
+            plan_ids: The plans to fetch tasks for. An empty list short-
+                circuits to an empty result with no query at all.
+            user_id: The caller's user_id. Only tasks belonging to a
+                plan owned by this user are returned (same tenant-
+                isolation guarantee as get_tasks_by_plan), so a
+                plan_id belonging to another user silently yields no
+                rows for that id rather than leaking its tasks.
+
+        Returns:
+            Every matching task row, ordered by plan_id (ascending, to
+            make grouping by plan trivial for the caller) then by
+            display index within each plan (order_index ASC, task_id
+            ASC -- the same ordering get_tasks_by_plan uses). Callers
+            should group these by row["plan_id"] themselves; this
+            deliberately doesn't return a dict-of-lists so it stays a
+            plain, cacheable query result like every other fetch_all
+            call in this class.
+        """
+        if not plan_ids:
+            return []
+        # Plain "?" placeholders, one per id -- consistent with every
+        # other query in this class; _to_named() below turns these into
+        # SQLAlchemy's named-param style. SQLite's default bound-
+        # parameter ceiling (~999) is far above any realistic number of
+        # plans in one history window, so no batching/chunking here.
+        placeholders = ",".join(["?"] * len(plan_ids))
+        query = f"""
+            SELECT t.* FROM tasks t
+            JOIN plans p ON t.plan_id = p.plan_id
+            WHERE t.plan_id IN ({placeholders}) AND p.user_id = ?
+            ORDER BY t.plan_id ASC, t.order_index ASC, t.task_id ASC
+        """
+        params = tuple(plan_ids) + (user_id,)
+        return self.fetch_all(query, params)
+
     def get_task(self, task_id: int, user_id: str) -> Optional[sqlite3.Row]:
         """
         Fetch a single task by ID, scoped to its owner.
@@ -1471,7 +1585,8 @@ class Database:
         segment_started_at: Optional[str],
         paused_at: Optional[str],
         total_paused_seconds: int,
-    ) -> None:
+        expected_version: Optional[int] = None,
+    ) -> int:
         """
         Directly set a task's full pause/resume timer state. Low-level —
         callers (services.start_task_timer/pause_task_timer/
@@ -1479,6 +1594,21 @@ class Database:
         computing the right values; this just persists them all in one
         statement (they always change together, so there's no reason to
         risk a partial update between two separate calls).
+
+        Optimistic concurrency: every successful write bumps
+        timer_version by 1. If ``expected_version`` is given, the write
+        only applies when the row's CURRENT timer_version still matches
+        it -- i.e. nothing else updated this task's timer in between
+        the caller's read and this write. This closes a lost-update
+        race: start/pause/resume/finish all read the current state,
+        compute a new state from it, then call this method to persist
+        it, so two overlapping calls (a double-submitted click, two
+        open tabs, a retried request) can otherwise both read the same
+        starting point and the second blind write silently clobbers the
+        first, dropping whatever time the first call banked.
+        ``expected_version=None`` (the default) skips the check
+        entirely, for any caller that intentionally wants a last-write-
+        wins overwrite.
 
         Args:
             task_id: Target task.
@@ -1494,30 +1624,58 @@ class Database:
             total_paused_seconds: Cumulative duration of every FINISHED
                 pause (the currently-open one, if any, is on top of
                 this at read time, not included here yet).
+            expected_version: The timer_version the caller last read.
+                When given, the update is conditional on the row still
+                being at this version.
+
+        Returns:
+            The row's new timer_version after this write.
 
         Raises:
             OwnershipError: If task_id doesn't exist or isn't owned by
                 user_id.
+            TimerConflictError: If expected_version was given and no
+                longer matches the row's current timer_version (task
+                exists and is owned by user_id, but was updated by
+                someone/something else first).
         """
-        result = self.execute(
-            """
+        base_sql = """
             UPDATE tasks
             SET timer_accumulated_seconds = ?,
                 timer_segment_started_at = ?,
                 paused_at = ?,
                 timer_total_paused_seconds = ?,
+                timer_version = timer_version + 1,
                 updated_at = CURRENT_TIMESTAMP
             WHERE task_id = ?
               AND plan_id IN (SELECT plan_id FROM plans WHERE user_id = ?)
-            """,
-            (accumulated_seconds, segment_started_at, paused_at, total_paused_seconds, task_id, user_id),
-        )
+        """
+        params: list[Any] = [
+            accumulated_seconds, segment_started_at, paused_at,
+            total_paused_seconds, task_id, user_id,
+        ]
+        if expected_version is not None:
+            base_sql += " AND timer_version = ?"
+            params.append(expected_version)
+
+        result = self.execute(base_sql, tuple(params))
         if result.rowcount == 0:
             self.connection.rollback()
-            raise OwnershipError(
-                f"Task {task_id} not found or not owned by user {user_id!r}."
+            current = self.get_task(task_id, user_id)
+            if current is None:
+                raise OwnershipError(
+                    f"Task {task_id} not found or not owned by user {user_id!r}."
+                )
+            raise TimerConflictError(
+                f"Task {task_id}'s timer state changed concurrently "
+                f"(expected version {expected_version}, now "
+                f"{current.get('timer_version')})."
             )
         self.commit()
+        updated = self.get_task(task_id, user_id)
+        return int(updated["timer_version"]) if updated else (
+            (expected_version + 1) if expected_version is not None else 0
+        )
 
     def increment_task_pause_count(self, task_id: int, user_id: str) -> None:
         """Bump a task's pause_count by 1 (called once per Pause click).
