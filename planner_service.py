@@ -28,6 +28,7 @@ from planner import PlannerEngine, DayPlanOutput, TaskOutput
 from database import Database
 from config import CHART_COLORS
 from text_matching import normalize_for_matching, is_break_term
+from rate_limiter import RateLimiter
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -35,6 +36,11 @@ from text_matching import normalize_for_matching, is_break_term
 
 # Fallback color used for a new category if the AI didn't suggest one.
 _DEFAULT_CATEGORY_COLOR: str = CHART_COLORS[0]
+
+# Per-user rate limit on AI planning requests: normal usage is at most
+# a handful of drafts per minute (revise wording, redraft, save); this
+# leaves generous headroom while stopping a rapid-fire loop.
+_PLAN_RATE_LIMITER = RateLimiter(max_requests=6, window_seconds=60.0)
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +267,8 @@ class PlannerService:
         cleaned_input = raw_input.strip()
         if not cleaned_input:
             raise ValueError("raw_input cannot be empty.")
+
+        _PLAN_RATE_LIMITER.check(str(user_id))
 
         category_lookup = self._load_existing_categories(user_id)
         engine = self._get_engine()

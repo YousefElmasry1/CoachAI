@@ -4,6 +4,7 @@ from typing import Optional
 from recommendation import RecommendationEngine, RecommendationOutput
 from database import Database
 from analytics import AnalyticsEngine, AnalyticsFormatter
+from rate_limiter import RateLimiter
 
 _ARABIC_CHARS_PATTERN = re.compile(r"[\u0600-\u06FF]")
 
@@ -24,6 +25,12 @@ _TASK_LINE_FORMAT: str = "{start} - {end} | {title} ({minutes} min)"
 # count, so the window reflects a consistent span of long-term behavior
 # regardless of how many tasks a user logs per day.
 _HISTORY_WINDOW_DAYS: int = 30
+
+# Per-user rate limit on AI coaching requests: a coaching report is a
+# relatively heavy call (full analytics profile + LLM), and normal
+# usage requests one only occasionally, so the window is generous but
+# still stops a rapid-fire loop.
+_RECOMMENDATION_RATE_LIMITER = RateLimiter(max_requests=6, window_seconds=60.0)
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +190,8 @@ class RecommendationService:
         # 1. Format today's schedule
         schedule_text = self._format_schedule_text_for_plan(plan_id, user_id)
         language = _detect_language(schedule_text)
+
+        _RECOMMENDATION_RATE_LIMITER.check(str(user_id))
 
         # 2. Build analytics profile (single DB load, all metrics computed)
         analytics_engine = self._get_analytics_engine()

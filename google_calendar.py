@@ -94,7 +94,14 @@ class GoogleCalendarClient:
                 token_uri="https://oauth2.googleapis.com/token",
                 client_id=self.client_id,
                 client_secret=self.client_secret,
-                scopes=self._SCOPES
+                scopes=self._SCOPES,
+                # Without this, google-auth's Credentials.expired property
+                # always returns False (it only compares against
+                # self.expiry, and treats a missing expiry as "not
+                # expired") -- so refresh_if_expired() below would never
+                # actually refresh anything, no matter how old the token
+                # really is.
+                expiry=self.token_expiry,
             )
             
             if creds.expired and creds.refresh_token:

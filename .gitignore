@@ -5,3 +5,20 @@ __pycache__/
 venv/
 .vscode/
 .idea/
+
+# Local database files -- never commit real or stale application data.
+# The app auto-creates/migrates this file on first run (see
+# Database._maybe_create_schema in database.py); it must never be
+# tracked, since it can contain real user emails/password hashes and
+# its schema can silently drift from schema.sql over time.
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# OAuth / credential artifacts that must never be committed.
+*.pem
+*.key
+credentials.json
+token.json
+*.token

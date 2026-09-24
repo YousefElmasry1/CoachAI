@@ -15,11 +15,23 @@ from langchain_core.output_parsers import PydanticOutputParser
 load_dotenv()
 
 _GOOGLE_API_KEY: Optional[str] = os.getenv("GOOGLE_API_KEY")
-if not _GOOGLE_API_KEY:
-    raise EnvironmentError(
-        "GOOGLE_API_KEY not found. Please create a .env file with:\n"
-        "GOOGLE_API_KEY=your_key_here"
-    )
+
+
+def _require_google_api_key() -> str:
+    """Return the Gemini API key, validating lazily at call time.
+
+    Import of this module must not fail just because an optional API key
+    is missing from the environment (e.g. during tests, tooling, or when
+    unrelated parts of the app are used). The key is only required once
+    the planner is actually invoked.
+    """
+    key = os.getenv("GOOGLE_API_KEY") or _GOOGLE_API_KEY
+    if not key:
+        raise EnvironmentError(
+            "GOOGLE_API_KEY not found. Please create a .env file with:\n"
+            "GOOGLE_API_KEY=your_key_here"
+        )
+    return key
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +223,10 @@ class PlannerEngine:
     _MAX_RETRIES: int = 2
 
     def __init__(self) -> None:
-        self._api_key: str = _GOOGLE_API_KEY
+        # Validated lazily in _build_chain(), not at import/instantiation
+        # time, so constructing this object (or importing this module)
+        # never crashes merely because GOOGLE_API_KEY is unset.
+        self._api_key: Optional[str] = None
         self._chain: Optional[Any] = None
         self._parser: Optional[PydanticOutputParser] = None
 
@@ -223,6 +238,7 @@ class PlannerEngine:
         if self._chain is not None:
             return self._chain
 
+        self._api_key = _require_google_api_key()
         self._parser = PydanticOutputParser(pydantic_object=DayPlanOutput)
 
         prompt = ChatPromptTemplate.from_messages([

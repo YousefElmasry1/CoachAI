@@ -370,6 +370,40 @@ class Scheduler:
                         task_b_end=self._datetime_to_time(b_end_dt),
                     ))
 
+        def _ensure_same_day(
+            dt: datetime, task_title: str, allow_midnight_boundary: bool = False,
+        ) -> None:
+            """
+            Guard against a flexible task's scheduled time silently
+            rolling past midnight into the next calendar day.
+
+            This is a single-day planner: scheduled_start/scheduled_end
+            are persisted as bare HH:MM values with no date component
+            (see scheduler_service._save_schedule). If the cursor is
+            allowed to cross midnight, the wrapped-around time-of-day is
+            indistinguishable from — and can even sort before — an
+            earlier time on the same day (e.g. 01:00 stored as a bare
+            time looks earlier than 20:00), corrupting ordering,
+            persistence, and any downstream analytics/history/timer
+            logic that reads these fields. Reject it outright with a
+            clear error instead of silently producing a corrupt
+            schedule.
+            """
+            if allow_midnight_boundary and dt == base_date + timedelta(days=1):
+                # A task ending exactly at 24:00/00:00 still fits entirely
+                # within the plan_date — it just touches the boundary
+                # rather than crossing it. _datetime_to_time() renders
+                # this as 00:00, which downstream code treats as the
+                # (unambiguous) end of the working day for this task.
+                return
+            if dt.date() != base_date.date():
+                raise ValueError(
+                    f"Scheduling '{task_title}' would push past midnight "
+                    f"into {dt.date().isoformat()}. This planner only "
+                    f"supports same-day scheduling — reduce the day's "
+                    f"workload, or give the task a fixed earlier time."
+                )
+
         scheduled: list[ScheduledTask] = []
 
         # Fixed-time tasks are placed immediately; their time is
@@ -407,8 +441,10 @@ class Scheduler:
 
             if overlap is None:
                 # Clear runway: place the task right here.
+                _ensure_same_day(current, primary.title)
                 primary.scheduled_start = self._datetime_to_time(current)
                 current += timedelta(minutes=primary.estimated_minutes)
+                _ensure_same_day(current, primary.title, allow_midnight_boundary=True)
                 primary.scheduled_end = self._datetime_to_time(current)
                 scheduled.append(primary)
                 pending.pop(0)
@@ -422,8 +458,10 @@ class Scheduler:
                 filler = self._best_gap_filler(pending, primary, gap_minutes)
 
             if filler is not None:
+                _ensure_same_day(current, filler.title)
                 filler.scheduled_start = self._datetime_to_time(current)
                 current += timedelta(minutes=filler.estimated_minutes)
+                _ensure_same_day(current, filler.title, allow_midnight_boundary=True)
                 filler.scheduled_end = self._datetime_to_time(current)
                 scheduled.append(filler)
                 pending.remove(filler)
@@ -432,6 +470,7 @@ class Scheduler:
 
             # No task fits the gap — leave it empty and jump past the block.
             current = block_end
+            _ensure_same_day(current, primary.title)
 
         scheduled.sort(key=lambda st: st.order_index)
         return scheduled

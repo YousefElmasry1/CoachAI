@@ -33,13 +33,30 @@ import google.generativeai as genai
 load_dotenv()
 
 _GOOGLE_API_KEY: Optional[str] = os.getenv("GOOGLE_API_KEY")
-if not _GOOGLE_API_KEY:
-    raise EnvironmentError(
-        "GOOGLE_API_KEY not found. Please create a .env file with:\n"
-        "GOOGLE_API_KEY=your_key_here"
-    )
+_genai_configured: bool = False
 
-genai.configure(api_key=_GOOGLE_API_KEY)
+
+def _require_google_api_key() -> str:
+    """Return the Gemini API key, validating lazily at call time.
+
+    Import of this module must not fail just because an optional API key
+    is missing from the environment. The key (and genai.configure()) is
+    only required once transcription is actually attempted.
+    """
+    key = os.getenv("GOOGLE_API_KEY") or _GOOGLE_API_KEY
+    if not key:
+        raise EnvironmentError(
+            "GOOGLE_API_KEY not found. Please create a .env file with:\n"
+            "GOOGLE_API_KEY=your_key_here"
+        )
+    return key
+
+
+def _ensure_genai_configured() -> None:
+    global _genai_configured
+    if not _genai_configured:
+        genai.configure(api_key=_require_google_api_key())
+        _genai_configured = True
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +139,8 @@ def transcribe_audio(audio_bytes: bytes, mime_type: str = "audio/wav") -> str:
     """
     if not audio_bytes:
         raise ValueError("audio_bytes cannot be empty.")
+
+    _ensure_genai_configured()
 
     try:
         model = genai.GenerativeModel(_MODEL_NAME)
