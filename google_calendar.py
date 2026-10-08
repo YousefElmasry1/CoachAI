@@ -1,14 +1,24 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, time
+from datetime import datetime, time, timezone as dt_timezone
+import logging
 from zoneinfo import ZoneInfo
+from typing import Optional
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 class GoogleCalendarError(Exception):
+    pass
+
+
+class GoogleCalendarEventIdGone(GoogleCalendarError):
+    """A requested custom event ID is a permanent deleted-event tombstone."""
+
     pass
 
 class GoogleCalendarClient:
@@ -61,7 +71,11 @@ class GoogleCalendarClient:
 
             if token_response.status_code != 200:
                 error_detail = token_response.text
-                print(f"[CoachAI] Google token exchange failed ({token_response.status_code}): {error_detail}")
+                logger.warning(
+                    "Google token exchange failed (%s): %s",
+                    token_response.status_code,
+                    error_detail,
+                )
                 raise GoogleCalendarError(
                     f"Token exchange failed ({token_response.status_code}): {error_detail}"
                 )
@@ -212,7 +226,7 @@ class GoogleCalendarClient:
 
     def create_event(
         self, calendar_id: str, title: str, start_time: str, end_time: str,
-        event_date: str, timezone: str = "UTC",
+        event_date: str, timezone: str = "UTC", event_id: Optional[str] = None,
     ) -> str:
         try:
             service = self._build_service()
@@ -226,8 +240,8 @@ class GoogleCalendarClient:
             # timezone via a bare .astimezone()) -- otherwise Google
             # re-interprets these times as the server's zone and shifts
             # them when displaying in the user's real timezone.
-            start_dt = datetime.combine(date_obj, start_t, tzinfo=tz)
-            end_dt = datetime.combine(date_obj, end_t, tzinfo=tz)
+            start_dt = self._validated_local_datetime(date_obj, start_t, tz)
+            end_dt = self._validated_local_datetime(date_obj, end_t, tz)
             
             event = {
                 'summary': title,
@@ -240,10 +254,26 @@ class GoogleCalendarClient:
                     'timeZone': timezone or "UTC",
                 }
             }
+            if event_id:
+                event['id'] = event_id
             
             created_event = service.events().insert(calendarId=calendar_id, body=event).execute()
             return created_event['id']
         except Exception as e:
+            if event_id and getattr(getattr(e, "resp", None), "status", None) == 409:
+                try:
+                    existing = service.events().get(
+                        calendarId=calendar_id, eventId=event_id
+                    ).execute()
+                    if existing.get("status") == "cancelled":
+                        raise GoogleCalendarEventIdGone(
+                            f"Event ID {event_id} is a deleted Google Calendar tombstone."
+                        )
+                    return event_id
+                except GoogleCalendarEventIdGone:
+                    raise
+                except Exception:
+                    pass
             raise GoogleCalendarError(f"Failed to create event: {e}")
 
     def update_event(
@@ -258,8 +288,8 @@ class GoogleCalendarClient:
             start_t = time.fromisoformat(start_time)
             end_t = time.fromisoformat(end_time)
 
-            start_dt = datetime.combine(date_obj, start_t, tzinfo=tz)
-            end_dt = datetime.combine(date_obj, end_t, tzinfo=tz)
+            start_dt = self._validated_local_datetime(date_obj, start_t, tz)
+            end_dt = self._validated_local_datetime(date_obj, end_t, tz)
             
             event = service.events().get(calendarId=calendar_id, eventId=google_event_id).execute()
             event['summary'] = title
@@ -281,4 +311,21 @@ class GoogleCalendarClient:
             service = self._build_service()
             service.events().delete(calendarId=calendar_id, eventId=google_event_id).execute()
         except Exception as e:
+            # Google may retain a cancelled tombstone and answer 410 Gone
+            # after a successful deletion.  Both responses mean the active
+            # event is absent, so cleanup is idempotently complete.
+            if getattr(getattr(e, "resp", None), "status", None) in {404, 410}:
+                return
             raise GoogleCalendarError(f"Failed to delete event: {e}")
+
+    @staticmethod
+    def _validated_local_datetime(date_obj, time_obj: time, tz: ZoneInfo) -> datetime:
+        """Attach an IANA zone and reject nonexistent DST wall times."""
+        naive = datetime.combine(date_obj, time_obj)
+        aware = naive.replace(tzinfo=tz, fold=0)
+        round_trip = aware.astimezone(dt_timezone.utc).astimezone(tz).replace(tzinfo=None)
+        if round_trip != naive:
+            raise GoogleCalendarError(
+                f"The local time {naive.isoformat()} does not exist in timezone {tz.key}."
+            )
+        return aware

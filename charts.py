@@ -413,20 +413,12 @@ def create_timeline(
         fig.update_layout(**_base_layout(), height=200)
         return fig
 
-    today_str = dt.now().strftime("%Y-%m-%d")
+    today_str = "2000-01-01"
 
     for i, task in enumerate(reversed(tasks)):
-        start = task.get("scheduled_start", "")
-        end = task.get("scheduled_end", "")
-
-        if not start or not end:
-            continue
-
-        try:
-            start_dt = dt.strptime(f"{today_str} {start}", "%Y-%m-%d %H:%M")
-            end_dt = dt.strptime(f"{today_str} {end}", "%Y-%m-%d %H:%M")
-        except (ValueError, TypeError):
-            continue
+        segments = task.get("segments") or []
+        if not segments and task.get("scheduled_start") and task.get("scheduled_end"):
+            segments = [{"scheduled_start": task["scheduled_start"], "scheduled_end": task["scheduled_end"]}]
 
         priority = task.get("priority", 3)
         status = task.get("status", "pending")
@@ -435,14 +427,23 @@ def create_timeline(
         # Dim completed/failed tasks
         opacity = 0.4 if status in ("completed", "failed") else 1.0
 
-        # Plotly's date-typed Bar traces accept the bar length as
+        for segment_index, segment in enumerate(segments):
+            start = str(segment.get("scheduled_start", ""))[:8]
+            end = str(segment.get("scheduled_end", ""))[:8]
+            try:
+                start_dt = dt.fromisoformat(f"{today_str} {start}")
+                end_dt = dt.fromisoformat(f"{today_str} {end}")
+            except (ValueError, TypeError):
+                continue
+
+            # Plotly's date-typed Bar traces accept the bar length as
         # milliseconds. Passing a raw datetime.timedelta works with
         # Plotly's own renderer, but orjson (used by Streamlit's
         # plotly_chart for serialization) cannot JSON-encode a
         # timedelta object directly, so we convert it explicitly.
-        duration_ms = (end_dt - start_dt).total_seconds() * 1000
+            duration_ms = (end_dt - start_dt).total_seconds() * 1000
 
-        fig.add_trace(go.Bar(
+            fig.add_trace(go.Bar(
             x=[duration_ms],
             y=[task.get("title", "Task")],
             base=[start_dt],
@@ -453,18 +454,17 @@ def create_timeline(
                 "cornerradius": 6,
                 "line": {"width": 0},
             },
-            text=f"{start}–{end}",
+            text=f"{start[:5]}–{end[:5]}",
             textposition="inside",
             textfont={"color": "white", "size": 10, "family": "Inter"},
             hovertemplate=(
                 f"<b>{task.get('title', '')}</b><br>"
-                f"Time: {start} – {end}<br>"
-                f"Duration: {task.get('estimated_minutes', 0)} min<br>"
+                f"Segment {segment_index + 1}: {start[:5]} – {end[:5]}<br>"
                 f"Status: {status.title()}<br>"
                 "<extra></extra>"
             ),
             showlegend=False,
-        ))
+            ))
 
     fig.update_layout(
         **_base_layout(),

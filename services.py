@@ -19,6 +19,10 @@ without ever handing a connection to the wrong thread.
 from __future__ import annotations
 
 import os
+import json
+import base64
+import hashlib
+import logging
 import threading
 import uuid
 from datetime import date, datetime, time, timedelta, timezone
@@ -26,11 +30,13 @@ from typing import Any, Optional
 
 import streamlit as st
 
-from config import DEFAULT_ANALYTICS_WINDOW, DEFAULT_USER_ID
+from config import DEFAULT_ANALYTICS_WINDOW, DEFAULT_USER_ID, WORK_DAY_END
 from text_matching import detect_language
 from timezone_utils import user_today, user_now, get_user_timezone, safe_zoneinfo
 
 _local = threading.local()
+_LAST_CALENDAR_RECONCILIATION: dict[str, Any] = {"errors": []}
+logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -48,10 +54,11 @@ def get_current_user_id():
     return st.session_state.get("user_id") or DEFAULT_USER_ID
 
 
-def create_guest_user(display_name: str) -> Optional[str]:
+def create_guest_user(display_name: str) -> Optional[Any]:
     """Create an isolated guest account with a random UUID-based id.
 
-    Returns the new user_id (str) or None on failure.
+    Returns the new user_id (text on current schemas, integer on historical
+    SQLite schemas) or None on failure.
     """
     try:
         db = get_database()
@@ -63,6 +70,7 @@ def create_guest_user(display_name: str) -> Optional[str]:
         )
         return user_id
     except Exception:
+        logger.exception("Guest session creation failed for display_name=%r", display_name)
         return None
 
 
@@ -116,18 +124,13 @@ def sign_up(email: str, password: str, display_name: str) -> tuple:
             return None, "An account with this email already exists."
 
         uid = f"local_{uuid.uuid4().hex[:12]}"
+        pw_hash = _hash_password(password)
         user_id = db.create_user(
             user_id=uid,
             email=email,
             display_name=display_name,
+            password_hash=pw_hash,
         )
-        # Store the password hash in the user row
-        pw_hash = _hash_password(password)
-        db.execute(
-            "UPDATE users SET password_hash = ? WHERE user_id = ?",
-            (pw_hash, user_id),
-        )
-        db.connection.commit()
         return user_id, None
     except Exception as e:
         return None, f"Sign-up failed: {e}"
@@ -193,6 +196,87 @@ def get_scheduler_service():
         from scheduler_service import SchedulerService
         _local.scheduler_service = SchedulerService(get_database())
     return _local.scheduler_service
+
+
+def get_future_planning_service():
+    """Return the deterministic future-planning orchestrator for this thread."""
+    if getattr(_local, "future_planning_service", None) is None:
+        from future_planner import FuturePlanningService
+        _local.future_planning_service = FuturePlanningService(get_database())
+    return _local.future_planning_service
+
+
+def get_planning_request_interpreter():
+    """Return the LCEL intent-only adapter used by Write and Voice modes."""
+    if getattr(_local, "planning_request_interpreter", None) is None:
+        from planning_request import PlanningRequestInterpreter
+        _local.planning_request_interpreter = PlanningRequestInterpreter()
+    return _local.planning_request_interpreter
+
+
+def load_future_planning_candidates(
+    planning_start: date,
+    planning_end: date,
+    user_id: str = DEFAULT_USER_ID,
+) -> list[dict]:
+    """Return eligible logical tasks in an owned future-planning scope."""
+    tasks = get_database().get_future_planning_tasks(user_id, planning_start, planning_end)
+    return [
+        task for task in tasks
+        if not bool(task["is_fixed_time"])
+        and not bool(task["is_break"])
+        and task["status"] not in {"completed", "failed"}
+        and not bool(task.get("started_at"))
+    ]
+
+
+def understand_future_planning_text(
+    raw_input: str,
+    *,
+    scope,
+    input_method,
+    planning_start: date,
+    planning_end: date,
+    work_day_start: time,
+    user_id: str = DEFAULT_USER_ID,
+):
+    """Interpret text against only relevant tasks; never choose placement."""
+    from planning_request import PlanningInputMethod, PlanningScope
+
+    candidates = load_future_planning_candidates(planning_start, planning_end, user_id)
+    return get_planning_request_interpreter().interpret(
+        raw_input,
+        candidates=candidates,
+        scope=PlanningScope(scope),
+        input_method=PlanningInputMethod(input_method),
+        planning_start=planning_start,
+        planning_end=planning_end,
+        work_day_start=work_day_start,
+        local_date=user_today(get_database(), user_id),
+    )
+
+
+def preview_future_plan(
+    planning_start: date, planning_end: date, work_day_start: time,
+    user_id: str = DEFAULT_USER_ID,
+):
+    """Compute a read-only future schedule preview."""
+    from scheduler import SchedulingPreferences
+    return get_future_planning_service().preview(
+        user_id, planning_start, planning_end, SchedulingPreferences(work_day_start=work_day_start)
+    )
+
+
+def preview_structured_future_plan(request, user_id: str = DEFAULT_USER_ID):
+    """Send every Future Planning input mode through the same planner."""
+    return get_future_planning_service().preview_request(user_id, request)
+
+
+def apply_future_plan(preview, user_id: str = DEFAULT_USER_ID) -> str:
+    """Commit exactly the supplied preview after revision/task race checks."""
+    if preview.user_id != user_id:
+        raise ValueError("The preview belongs to another user.")
+    return get_future_planning_service().apply(preview)
 
 
 # Holds the error message from the most recent failed scheduler run (see
@@ -340,6 +424,7 @@ def set_user_timezone(user_id: str, tz_name: str) -> bool:
         db.connection.commit()
         return True
     except Exception:
+        logger.exception("Timezone update failed for user_id=%s", user_id)
         return False
 
 
@@ -406,8 +491,7 @@ def load_plan_tasks(plan_id: int, user_id: str = DEFAULT_USER_ID) -> list[dict]:
     ever returning another user's tasks.
     """
     db = get_database()
-    rows = db.get_tasks_by_plan(plan_id, user_id)
-    return [dict(r) for r in rows]
+    return db.get_tasks_with_segments(plan_id, user_id)
 
 
 def load_today_tasks(user_id: str = DEFAULT_USER_ID) -> list[dict]:
@@ -438,9 +522,19 @@ def load_recent_plans(
 
     plan_ids = [row["plan_id"] for row in rows]
     task_rows = db.get_tasks_by_plan_ids(plan_ids, user_id)
+    segment_rows = db.get_segments_by_task_ids(
+        [int(task["task_id"]) for task in task_rows], user_id,
+    )
+    segments_by_task: dict[int, list[dict]] = {}
+    for segment in segment_rows:
+        segments_by_task.setdefault(int(segment["task_id"]), []).append(dict(segment))
     tasks_by_plan: dict[int, list[dict]] = {}
     for t in task_rows:
-        tasks_by_plan.setdefault(int(t["plan_id"]), []).append(dict(t))
+        task = dict(t)
+        task["segments"] = segments_by_task.get(int(t["task_id"]), [])
+        task["scheduled_start"] = task["segments"][0]["scheduled_start"] if task["segments"] else None
+        task["scheduled_end"] = task["segments"][-1]["scheduled_end"] if task["segments"] else None
+        tasks_by_plan.setdefault(int(t["plan_id"]), []).append(task)
 
     plans = []
     for row in rows:
@@ -448,6 +542,46 @@ def load_recent_plans(
         plan["tasks"] = tasks_by_plan.get(plan["plan_id"], [])
         plans.append(plan)
     return plans
+
+
+def summarize_plan_history(plan: dict) -> dict:
+    """Separate logical-task totals from dated physical segment occupancy."""
+    logical_minutes = sum(
+        int(task.get("estimated_minutes") or 0) for task in plan.get("tasks", [])
+    )
+    intervals_by_date: dict[str, list[tuple[datetime, datetime]]] = {}
+    for task in plan.get("tasks", []):
+        for segment in task.get("segments") or []:
+            effective_date = str(
+                segment.get("effective_date")
+                or segment.get("scheduled_date")
+                or plan.get("plan_date")
+            )
+            start = datetime.combine(
+                date.min, time.fromisoformat(str(segment["scheduled_start"]))
+            )
+            end = datetime.combine(
+                date.min, time.fromisoformat(str(segment["scheduled_end"]))
+            )
+            if end > start:
+                intervals_by_date.setdefault(effective_date, []).append((start, end))
+    scheduled_by_date: dict[str, int] = {}
+    for effective_date, intervals in intervals_by_date.items():
+        merged: list[list[datetime]] = []
+        for start, end in sorted(intervals):
+            if not merged or start > merged[-1][1]:
+                merged.append([start, end])
+            elif end > merged[-1][1]:
+                merged[-1][1] = end
+        scheduled_by_date[effective_date] = sum(
+            int((end - start).total_seconds() // 60) for start, end in merged
+        )
+    anchor_date = str(plan.get("plan_date"))
+    return {
+        "logical_estimated_minutes": logical_minutes,
+        "scheduled_minutes_by_date": dict(sorted(scheduled_by_date.items())),
+        "anchor_scheduled_minutes": scheduled_by_date.get(anchor_date, 0),
+    }
 
 
 # ─────────────────────────────────────────────────────────────
@@ -480,6 +614,7 @@ def update_task_status(
         load_analytics_profile.clear()
         return True
     except Exception:
+        logger.exception("Task status update failed for task_id=%s user_id=%s", task_id, user_id)
         return False
 
 
@@ -773,7 +908,7 @@ def get_database_status() -> dict[str, Any]:
         db.fetch_one("SELECT 1")
 
         db_size = 0
-        db_path = db.db_url
+        db_path = db.engine.url.render_as_string(hide_password=True)
         if db.is_sqlite:
             # sqlite:///absolute/path -> absolute/path
             sqlite_path = db.db_url.split("sqlite:///", 1)[-1]
@@ -784,6 +919,8 @@ def get_database_status() -> dict[str, Any]:
         return {
             "connected": True,
             "path": db_path,
+            "backend": db.engine.dialect.name,
+            "version": ".".join(str(part) for part in db.engine.dialect.server_version_info),
             "size_bytes": db_size,
             "size_display": _format_file_size(db_size) if db.is_sqlite else "—",
         }
@@ -800,7 +937,6 @@ def get_database_status() -> dict[str, Any]:
 def get_system_info() -> dict[str, str]:
     """Gather system/version information."""
     import sys
-    import sqlite3
     try:
         from analytics import ANALYTICS_VERSION, PROFILE_VERSION, STATISTICS_VERSION
     except ImportError:
@@ -812,11 +948,14 @@ def get_system_info() -> dict[str, str]:
     except Exception:
         model_name = "Unknown"
 
+    database_status = get_database_status()
+
     return {
         "app_version": "1.0.0",
         "python_version": sys.version.split()[0],
         "streamlit_version": st.__version__,
-        "sqlite_version": sqlite3.sqlite_version,
+        "database_backend": database_status.get("backend", "unknown"),
+        "database_version": database_status.get("version", "unknown"),
         "analytics_version": ANALYTICS_VERSION,
         "profile_version": PROFILE_VERSION,
         "statistics_version": STATISTICS_VERSION,
@@ -1033,14 +1172,162 @@ def add_task_to_plan(
         return None
 
 
+def add_and_schedule_today_task(
+    *,
+    title: str,
+    estimated_minutes: int,
+    task_type: str,
+    work_day_start: time,
+    plan_id: Optional[int] = None,
+    order_index: Optional[int] = None,
+    fixed_start: Optional[time] = None,
+    category_id: Optional[int] = None,
+    description: str = "",
+    priority: int = 3,
+    user_id: str = DEFAULT_USER_ID,
+):
+    """Create and incrementally place one task on the user's current day."""
+    from scheduler import SchedulingPreferences
+
+    plan = load_today_plan(user_id)
+    if plan is None:
+        _LAST_SCHEDULER_ERROR["message"] = "Create today's plan before adding a task."
+        return None
+    if plan_id is not None and int(plan_id) != int(plan["plan_id"]):
+        _LAST_SCHEDULER_ERROR["message"] = "The selected plan is not today's plan."
+        return None
+    normalized = str(task_type).strip().lower()
+    if normalized not in {"fixed", "flexible"}:
+        _LAST_SCHEDULER_ERROR["message"] = "Task type must be Fixed or Flexible."
+        return None
+    try:
+        service = get_scheduler_service()
+        result = service.add_and_schedule_task(
+            int(plan["plan_id"]), user_id,
+            SchedulingPreferences(work_day_start=work_day_start),
+            title=title,
+            estimated_minutes=int(estimated_minutes),
+            is_fixed_time=normalized == "fixed",
+            fixed_start=fixed_start,
+            category_id=category_id,
+            description=description,
+            priority=int(priority),
+            order_index=(
+                int(order_index) if order_index is not None
+                else len(load_today_tasks(user_id))
+            ),
+            blocked_slots=get_google_calendar_blocked_slots(user_id),
+        )
+        reconciliation = reconcile_schedule_calendar_operation(
+            result.operation_id, user_id=user_id,
+        )
+        _LAST_CALENDAR_RECONCILIATION["errors"] = reconciliation.get("errors", [])
+        _LAST_SCHEDULER_ERROR["message"] = None
+        load_analytics_profile.clear()
+        return result
+    except Exception as exc:
+        logger.exception("Current-day task creation failed for user_id=%s", user_id)
+        _LAST_SCHEDULER_ERROR["message"] = str(exc)
+        return None
+
+
+def move_task_today(
+    task_id: int,
+    new_start: time,
+    expected_revision: int,
+    user_id: str = DEFAULT_USER_ID,
+):
+    """Move one flexible logical task within today through the domain layer."""
+    from database import OwnershipError, StaleScheduleError
+
+    db = get_database()
+    task = db.get_task(task_id, user_id)
+    today_plan = db.get_today_plan(user_id)
+    if task is None or today_plan is None or int(task["plan_id"]) != int(today_plan["plan_id"]):
+        _LAST_SCHEDULER_ERROR["message"] = "Only a task in today's plan can be moved here."
+        return None
+    try:
+        service = get_scheduler_service()
+        result = service.move_flexible_task(
+            task_id, user_id, new_start, expected_revision,
+            blocked_slots=get_google_calendar_blocked_slots(user_id),
+        )
+    except StaleScheduleError:
+        logger.exception("Stale Manual Move for task_id=%s user_id=%s", task_id, user_id)
+        _LAST_SCHEDULER_ERROR["message"] = (
+            "Today's schedule changed before this move could be saved. Refresh and try again."
+        )
+        return None
+    except OwnershipError:
+        logger.exception("Unauthorized Manual Move for task_id=%s user_id=%s", task_id, user_id)
+        _LAST_SCHEDULER_ERROR["message"] = "This task is not available in your current plan."
+        return None
+    except ValueError as exc:
+        logger.exception("Manual move failed for task_id=%s user_id=%s", task_id, user_id)
+        _LAST_SCHEDULER_ERROR["message"] = str(exc)
+        return None
+    except Exception:
+        logger.exception("Manual move failed for task_id=%s user_id=%s", task_id, user_id)
+        _LAST_SCHEDULER_ERROR["message"] = (
+            "The task could not be moved safely. No partial schedule was saved."
+        )
+        return None
+
+    try:
+        reconciliation = reconcile_schedule_calendar_operation(
+            result.operation_id, user_id=user_id,
+        )
+        _LAST_CALENDAR_RECONCILIATION["errors"] = reconciliation.get("errors", [])
+    except Exception:
+        logger.exception(
+            "Manual Move Calendar reconciliation failed for operation_id=%s user_id=%s",
+            result.operation_id, user_id,
+        )
+        _LAST_CALENDAR_RECONCILIATION["errors"] = [
+            "The schedule was saved, but Calendar reconciliation is still pending."
+        ]
+    _LAST_SCHEDULER_ERROR["message"] = None
+    try:
+        load_analytics_profile.clear()
+    except Exception:
+        logger.exception("Analytics cache clear failed after Manual Move for user_id=%s", user_id)
+    return result
+
+
 def delete_task(task_id: int, user_id: str = DEFAULT_USER_ID) -> bool:
     """Delete a task. Returns True on success, False on error (including
     if task_id doesn't exist or isn't owned by user_id)."""
     db = get_database()
     try:
+        segments = db.get_task_segments(task_id, user_id)
+        owned_events = [
+            row for row in segments
+            if row["calendar_provenance"] == "coachai_created" and row["google_event_id"]
+        ]
+        if owned_events:
+            client = _get_google_client(user_id)
+            if client is None:
+                return False
+            for segment in owned_events:
+                try:
+                    client.delete_event(
+                        segment["google_calendar_id"] or "primary",
+                        segment["google_event_id"],
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        "Calendar deletion failed for segment_id=%s user_id=%s",
+                        segment["segment_id"], user_id,
+                    )
+                    db.update_segment_calendar_state(
+                        segment["segment_id"], user_id,
+                        calendar_sync_status="error", calendar_sync_error=str(exc),
+                    )
+                    return False
         db.delete_task(task_id, user_id)
         return True
     except Exception:
+        logger.exception("Task deletion failed for task_id=%s user_id=%s", task_id, user_id)
         return False
 
 
@@ -1090,9 +1377,10 @@ def add_break_to_plan(
     try:
         existing = db.get_tasks_by_plan(plan_id, user_id)
         order_index = len(existing)
-        end_time = (
-            datetime.combine(date.today(), start_time) + timedelta(minutes=duration_minutes)
-        ).time()
+        end_dt = datetime.combine(date.min, start_time) + timedelta(minutes=duration_minutes)
+        if end_dt.date() != date.min or end_dt.time() > WORK_DAY_END:
+            return None
+        end_time = end_dt.time()
         return db.add_task(
             plan_id=plan_id,
             user_id=user_id,
@@ -1106,6 +1394,7 @@ def add_break_to_plan(
             is_break=True,
         )
     except Exception:
+        logger.exception("Break creation failed for plan_id=%s user_id=%s", plan_id, user_id)
         return None
 
 
@@ -1123,17 +1412,16 @@ def reschedule_break(task_id: int, new_start_time: time, user_id: str = DEFAULT_
         if task is None:
             return False
         duration = int(task["estimated_minutes"])
-        new_end_time = (
-            datetime.combine(date.today(), new_start_time) + timedelta(minutes=duration)
-        ).time()
-        db.update_task(
-            task_id,
-            user_id,
-            scheduled_start=new_start_time.strftime("%H:%M"),
-            scheduled_end=new_end_time.strftime("%H:%M"),
+        end_dt = datetime.combine(date.min, new_start_time) + timedelta(minutes=duration)
+        if end_dt.date() != date.min or end_dt.time() > WORK_DAY_END:
+            return False
+        new_end_time = end_dt.time()
+        db.set_single_task_segment(
+            task_id, user_id, new_start_time.strftime("%H:%M"), new_end_time.strftime("%H:%M")
         )
         return True
     except Exception:
+        logger.exception("Break reschedule failed for task_id=%s user_id=%s", task_id, user_id)
         return False
 
 
@@ -1174,17 +1462,11 @@ def defer_task_to_tomorrow(task_id: int, user_id: str = DEFAULT_USER_ID) -> bool
             plan_id = int(target_plan["plan_id"])
 
         next_order_index = len(db.get_tasks_by_plan(plan_id, user_id))
-        db.update_task(
-            task_id,
-            user_id,
-            plan_id=plan_id,
-            order_index=next_order_index,
-            scheduled_start=None,
-            scheduled_end=None,
-        )
+        db.move_task_unscheduled(task_id, user_id, plan_id, next_order_index)
         load_analytics_profile.clear()
         return True
     except Exception:
+        logger.exception("Task defer failed for task_id=%s user_id=%s", task_id, user_id)
         return False
 
 
@@ -1220,14 +1502,23 @@ def save_draft_tasks_to_plan(tasks: list, plan_id: int, user_id: str = DEFAULT_U
         try:
             is_fixed = bool(_get(t, "is_fixed_time", False))
             fixed_start = _get(t, "fixed_start", None)
+            estimated = int(_get(t, "estimated_minutes", 30))
+            fixed_end = None
+            if is_fixed and fixed_start:
+                parsed_start = time.fromisoformat(str(fixed_start))
+                computed_end = datetime.combine(date.min, parsed_start) + timedelta(minutes=estimated)
+                if computed_end.date() != date.min:
+                    raise ValueError("Fixed task cannot cross midnight.")
+                fixed_end = computed_end.time().strftime("%H:%M")
             db.add_task(
                 plan_id=plan_id,
                 user_id=user_id,
                 title=str(_get(t, "title", "Untitled")),
                 description=str(_get(t, "description", "") or ""),
                 priority=int(_get(t, "priority", 3)),
-                estimated_minutes=int(_get(t, "estimated_minutes", 30)),
+                estimated_minutes=estimated,
                 scheduled_start=str(fixed_start) if (is_fixed and fixed_start) else None,
+                scheduled_end=fixed_end,
                 order_index=existing_count + i,
                 is_fixed_time=is_fixed,
             )
@@ -1332,11 +1623,15 @@ def run_scheduler_for_plan(
             preferences=preferences,
             blocked_slots=blocked_slots,
         )
+        if service.last_operation_id:
+            reconciliation = reconcile_schedule_calendar_operation(
+                service.last_operation_id, user_id=user_id,
+            )
+            _LAST_CALENDAR_RECONCILIATION["errors"] = reconciliation.get("errors", [])
         _LAST_SCHEDULER_ERROR["message"] = None
         return result
     except Exception as exc:
-        import traceback
-        traceback.print_exc()
+        logger.exception("Smart Scheduling failed for plan_id=%s user_id=%s", plan_id, user_id)
         _LAST_SCHEDULER_ERROR["message"] = str(exc)
         return []
 
@@ -1352,6 +1647,100 @@ def get_last_scheduler_error() -> Optional[str]:
     instead of a generic "scheduling failed".
     """
     return _LAST_SCHEDULER_ERROR.get("message")
+
+
+def get_last_unplaced_tasks() -> list:
+    """Structured tasks the most recent Smart Scheduling run could not place."""
+    return getattr(get_scheduler_service(), "last_unplaced", [])
+
+
+def get_last_schedule_operation_id() -> Optional[str]:
+    """Durable operation identity for the most recent successful run."""
+    return getattr(get_scheduler_service(), "last_operation_id", None)
+
+
+def get_last_calendar_reconciliation_errors() -> list[str]:
+    """Visible, retryable Calendar errors from the latest schedule operation."""
+    return list(_LAST_CALENDAR_RECONCILIATION.get("errors") or [])
+
+
+def undo_smart_schedule(operation_id: str, user_id: str = DEFAULT_USER_ID) -> bool:
+    """Undo one complete Smart Scheduling operation atomically."""
+    try:
+        db = get_database()
+        operation = db.get_schedule_operation(operation_id, user_id)
+        if operation is None:
+            return False
+        before = json.loads(operation["before_state"])
+        after = json.loads(operation["after_state"])
+        # Calendar identities can be assigned after the scheduling transaction
+        # (export necessarily talks to an external system).  Capture the
+        # current owned identities before Undo restores/deletes the segments;
+        # the operation's original after-state may therefore be stale here.
+        task_ids = [int(task["task_id"]) for task in after.get("tasks", [])]
+        current_segments = db.get_segments_by_task_ids(task_ids, user_id)
+        db.undo_schedule_operation(operation_id, user_id)
+        before_ids = {
+            segment.get("google_event_id") for segment in before.get("segments", [])
+            if segment.get("google_event_id")
+        }
+        current_ids = {
+            segment.get("google_event_id") for segment in current_segments
+            if segment.get("google_event_id")
+        }
+        undo_orphans = {
+            (segment.get("google_calendar_id") or "primary", segment.get("google_event_id"))
+            for segment in current_segments
+            if segment.get("calendar_provenance") == "coachai_created"
+            and segment.get("google_event_id")
+            and segment.get("google_event_id") not in before_ids
+        }
+        restored_segments = [
+            segment for segment in db.get_segments_by_task_ids(task_ids, user_id)
+            if segment.get("calendar_provenance") == "coachai_created"
+            and segment.get("google_event_id") in before_ids
+        ]
+        for segment in restored_segments:
+            db.update_segment_calendar_state(
+                int(segment["segment_id"]), user_id,
+                calendar_sync_status=(
+                    "pending_update"
+                    if segment.get("google_event_id") in current_ids
+                    else "pending_create"
+                ),
+                calendar_sync_error="",
+            )
+        errors = []
+        if undo_orphans or restored_segments:
+            client = _get_google_client(user_id)
+            if client is None:
+                errors.append("Google Calendar is unavailable; Undo reconciliation is pending.")
+            else:
+                for calendar_id, event_id in undo_orphans:
+                    try:
+                        client.delete_event(calendar_id, event_id)
+                    except Exception as exc:
+                        errors.append(f"{calendar_id}/{event_id}: {exc}")
+                restored_by_task: dict[int, set[int]] = {}
+                for segment in restored_segments:
+                    restored_by_task.setdefault(int(segment["task_id"]), set()).add(
+                        int(segment["segment_id"])
+                    )
+                for task_id, segment_ids in restored_by_task.items():
+                    if not export_task_to_google_calendar(
+                        task_id, user_id, client=client, segment_ids=segment_ids,
+                    ):
+                        errors.append(
+                            f"Task {task_id}: restored Calendar segment reconciliation failed."
+                        )
+        db.mark_schedule_calendar_reconciliation(
+            operation_id, user_id, "\n".join(errors) if errors else None,
+        )
+        _LAST_CALENDAR_RECONCILIATION["errors"] = errors
+        return True
+    except Exception:
+        logger.exception("Schedule Undo failed for operation_id=%s user_id=%s", operation_id, user_id)
+        return False
 
 
 def get_last_scheduling_conflicts() -> list:
@@ -1442,17 +1831,16 @@ def reschedule_fixed_task(task_id: int, new_start_time: time, user_id: str = DEF
         if task is None:
             return False
         duration = int(task["estimated_minutes"])
-        new_end_time = (
-            datetime.combine(date.today(), new_start_time) + timedelta(minutes=duration)
-        ).time()
-        db.update_task(
-            task_id,
-            user_id,
-            scheduled_start=new_start_time.strftime("%H:%M"),
-            scheduled_end=new_end_time.strftime("%H:%M"),
+        end_dt = datetime.combine(date.min, new_start_time) + timedelta(minutes=duration)
+        if end_dt.date() != date.min or end_dt.time() > WORK_DAY_END:
+            return False
+        new_end_time = end_dt.time()
+        db.set_single_task_segment(
+            task_id, user_id, new_start_time.strftime("%H:%M"), new_end_time.strftime("%H:%M")
         )
         return True
     except Exception:
+        logger.exception("Fixed task reschedule failed for task_id=%s user_id=%s", task_id, user_id)
         return False
 
 
@@ -1565,7 +1953,7 @@ def connect_google_calendar(
         return True
     except GoogleCalendarError as e:
         import traceback
-        print(f"[CoachAI] Google Calendar connection failed: {e}")
+        logger.warning("Google Calendar connection failed: %s", e)
         traceback.print_exc()
         return False
 
@@ -1582,7 +1970,7 @@ def fetch_google_calendars(
     user_id: str = DEFAULT_USER_ID,
 ) -> list[dict]:
     """Fetch available calendars from Google API."""
-    from google_calendar import GoogleCalendarError
+    from google_calendar import GoogleCalendarError, GoogleCalendarEventIdGone
 
     client = _get_google_client(user_id)
     if client is None:
@@ -1710,20 +2098,16 @@ def find_task_conflicts_with_google_events(
         return []
 
     conflicts = []
-    for task in db.get_tasks_by_plan(plan["plan_id"], user_id):
-        if not task["scheduled_start"] or not task["scheduled_end"]:
-            continue
-        t_start = dt_time.fromisoformat(task["scheduled_start"])
-        t_end = dt_time.fromisoformat(task["scheduled_end"])
-        for block_start, block_end in blocked:
-            if t_start < block_end and t_end > block_start:
+    for task in db.get_tasks_with_segments(plan["plan_id"], user_id):
+        for segment in task["segments"]:
+            t_start = dt_time.fromisoformat(str(segment["scheduled_start"]))
+            t_end = dt_time.fromisoformat(str(segment["scheduled_end"]))
+            if any(t_start < block_end and t_end > block_start for block_start, block_end in blocked):
                 conflicts.append({
-                    "task_id": task["task_id"],
-                    "title": task["title"],
-                    "scheduled_start": task["scheduled_start"],
-                    "scheduled_end": task["scheduled_end"],
+                    "task_id": task["task_id"], "segment_id": segment["segment_id"],
+                    "title": task["title"], "scheduled_start": segment["scheduled_start"],
+                    "scheduled_end": segment["scheduled_end"],
                 })
-                break
     return conflicts
 
 
@@ -1821,11 +2205,17 @@ def import_calendar_event_as_task(
             scheduled_end=end_str,
             order_index=order_index,
             is_fixed_time=True,
+            calendar_provenance="imported",
+            google_event_id=target_event_id,
+            google_calendar_id=event.get("calendar_id"),
         )
-        db.update_task_google_event_id(task_id, user_id, target_event_id)
         load_analytics_profile.clear()
         return task_id
     except Exception:
+        logger.exception(
+            "Calendar import failed for plan_id=%s user_id=%s event_id=%s",
+            plan_id, user_id, event.get("google_event_id"),
+        )
         return None
 
 
@@ -1848,10 +2238,9 @@ def get_google_calendar_blocked_slots(
     own_event_ids = set()
     plan = db.get_today_plan(user_id)
     if plan is not None:
-        for t in db.get_tasks_by_plan(plan["plan_id"], user_id):
-            eid = t["google_event_id"] if "google_event_id" in t.keys() else None
-            if eid:
-                own_event_ids.add(eid)
+        for segment in db.get_plan_segments(plan["plan_id"], user_id):
+            if segment["google_event_id"]:
+                own_event_ids.add(segment["google_event_id"])
 
     events = get_google_calendar_events_today(user_id)
     slots = []
@@ -1865,6 +2254,56 @@ def get_google_calendar_blocked_slots(
         except (ValueError, TypeError):
             continue
     return slots
+
+
+def reconcile_schedule_calendar_operation(
+    operation_id: str,
+    user_id: str = DEFAULT_USER_ID,
+    client=None,
+) -> dict:
+    """Delete only orphaned CoachAI-owned events from one schedule operation.
+
+    Imported and legacy-unknown identities are never mutated.  Failed work is
+    recorded on the durable operation and can be retried by calling this again.
+    """
+    db = get_database()
+    operation = db.get_schedule_operation(operation_id, user_id)
+    if operation is None:
+        return {"deleted": 0, "errors": ["Scheduling operation was not found."]}
+    before = json.loads(operation["before_state"])
+    after = json.loads(operation["after_state"])
+    current_ids = {
+        segment.get("google_event_id")
+        for segment in after.get("segments", [])
+        if segment.get("google_event_id")
+    }
+    orphaned = {
+        (segment.get("google_calendar_id") or "primary", segment.get("google_event_id"))
+        for segment in before.get("segments", [])
+        if segment.get("calendar_provenance") == "coachai_created"
+        and segment.get("google_event_id")
+        and segment.get("google_event_id") not in current_ids
+    }
+    if not orphaned:
+        db.mark_schedule_calendar_reconciliation(operation_id, user_id, None)
+        return {"deleted": 0, "errors": []}
+    client = client or _get_google_client(user_id)
+    if client is None:
+        error = "Google Calendar is unavailable; orphan cleanup is pending."
+        db.mark_schedule_calendar_reconciliation(operation_id, user_id, error)
+        return {"deleted": 0, "errors": [error]}
+    deleted = 0
+    errors: list[str] = []
+    for calendar_id, event_id in orphaned:
+        try:
+            client.delete_event(calendar_id, event_id)
+            deleted += 1
+        except Exception as exc:
+            errors.append(f"{calendar_id}/{event_id}: {exc}")
+    db.mark_schedule_calendar_reconciliation(
+        operation_id, user_id, "\n".join(errors) if errors else None,
+    )
+    return {"deleted": deleted, "errors": errors}
 
 
 def get_last_sync_time(
@@ -1939,59 +2378,130 @@ def get_last_sync_label(user_id: str = DEFAULT_USER_ID) -> Optional[str]:
 def export_task_to_google_calendar(
     task_id: int,
     user_id: str = DEFAULT_USER_ID,
+    *,
+    client=None,
+    segment_ids: Optional[set[int]] = None,
 ) -> bool:
     """Create or update a Google Calendar event for a scheduled task.
 
     Returns False if task_id doesn't exist or isn't owned by user_id.
     """
-    from google_calendar import GoogleCalendarError
+    from google_calendar import GoogleCalendarError, GoogleCalendarEventIdGone
 
-    client = _get_google_client(user_id)
+    client = client or _get_google_client(user_id)
     if client is None:
         return False
 
     db = get_database()
     task = db.get_task(task_id, user_id)
-    if task is None or not task["scheduled_start"] or not task["scheduled_end"]:
+    segments = db.get_task_segments(task_id, user_id)
+    if segment_ids is not None:
+        segments = [
+            segment for segment in segments
+            if int(segment["segment_id"]) in segment_ids
+        ]
+    if task is None or not segments:
         return False
 
     plan = db.get_plan_by_id(task["plan_id"], user_id)
     if plan is None:
         return False
 
-    plan_date = str(plan["plan_date"])
     tz_name = get_user_timezone(db, user_id)
 
     try:
-        existing_event_id = task["google_event_id"] if "google_event_id" in task.keys() else None
-
-        if existing_event_id:
-            client.update_event(
-                calendar_id="primary",
-                google_event_id=existing_event_id,
-                title=task["title"],
-                start_time=task["scheduled_start"],
-                end_time=task["scheduled_end"],
-                event_date=plan_date,
-                timezone=tz_name,
-            )
-            # google_event_id doesn't change on this path, but the
-            # export timestamp still needs to move forward — this is
-            # what clears the "stale export" warning after a re-export.
-            db.mark_task_exported(task_id, user_id)
-        else:
-            new_event_id = client.create_event(
-                calendar_id="primary",
-                title=task["title"],
-                start_time=task["scheduled_start"],
-                end_time=task["scheduled_end"],
-                event_date=plan_date,
-                timezone=tz_name,
-            )
-            db.update_task_google_event_id(task_id, user_id, new_event_id)
+        for segment in segments:
+            segment_date = str(segment["effective_date"] or plan["plan_date"])
+            provenance = segment["calendar_provenance"]
+            event_id = segment["google_event_id"]
+            calendar_id = segment["google_calendar_id"] or "primary"
+            if event_id and provenance != "coachai_created":
+                # Imported and legacy-unknown events are deliberately read-only.
+                continue
+            create_retry = segment["calendar_sync_status"] in {"pending_create", "create_error"}
+            try:
+                if event_id and not create_retry:
+                    client.update_event(
+                        calendar_id=calendar_id, google_event_id=event_id,
+                        title=task["title"], start_time=segment["scheduled_start"],
+                        end_time=segment["scheduled_end"], event_date=segment_date,
+                        timezone=tz_name,
+                    )
+                else:
+                    if not event_id:
+                        digest = hashlib.sha256(
+                            f"{user_id}:{segment['segment_id']}".encode("utf-8")
+                        ).digest()
+                        event_id = (
+                            "coachai"
+                            + base64.b32hexencode(digest).decode("ascii").lower().rstrip("=")[:40]
+                        )
+                        db.update_segment_calendar_state(
+                            segment["segment_id"], user_id,
+                            google_event_id=event_id, google_calendar_id=calendar_id,
+                            calendar_provenance="coachai_created",
+                            calendar_sync_status="pending_create", calendar_sync_error="",
+                        )
+                    event_id = client.create_event(
+                        calendar_id=calendar_id, title=task["title"],
+                        start_time=segment["scheduled_start"], end_time=segment["scheduled_end"],
+                        event_date=segment_date, timezone=tz_name, event_id=event_id,
+                    )
+                db.update_segment_calendar_state(
+                    segment["segment_id"], user_id,
+                    google_event_id=event_id, google_calendar_id=calendar_id,
+                    calendar_provenance="coachai_created",
+                    calendar_sync_status="synced", calendar_sync_error="",
+                )
+            except GoogleCalendarEventIdGone:
+                # Google never permits reuse of a deleted custom event ID.
+                # Persist the replacement before the network retry so a lost
+                # response remains idempotent on the next user retry.
+                event_id = "coachai" + uuid.uuid4().hex
+                db.update_segment_calendar_state(
+                    segment["segment_id"], user_id,
+                    google_event_id=event_id, google_calendar_id=calendar_id,
+                    calendar_provenance="coachai_created",
+                    calendar_sync_status="pending_create", calendar_sync_error="",
+                )
+                try:
+                    event_id = client.create_event(
+                        calendar_id=calendar_id, title=task["title"],
+                        start_time=segment["scheduled_start"], end_time=segment["scheduled_end"],
+                        event_date=segment_date, timezone=tz_name, event_id=event_id,
+                    )
+                    db.update_segment_calendar_state(
+                        segment["segment_id"], user_id,
+                        google_event_id=event_id, google_calendar_id=calendar_id,
+                        calendar_provenance="coachai_created",
+                        calendar_sync_status="synced", calendar_sync_error="",
+                    )
+                except GoogleCalendarError as exc:
+                    db.update_segment_calendar_state(
+                        segment["segment_id"], user_id,
+                        calendar_sync_status="create_error", calendar_sync_error=str(exc),
+                    )
+                    return False
+            except GoogleCalendarError as exc:
+                logger.warning(
+                    "Calendar export failed for segment_id=%s user_id=%s status=%s",
+                    segment["segment_id"], user_id,
+                    "create" if (not segment["google_event_id"] or create_retry) else "update",
+                    exc_info=True,
+                )
+                db.update_segment_calendar_state(
+                    segment["segment_id"], user_id,
+                    calendar_sync_status=(
+                        "create_error" if (not segment["google_event_id"] or create_retry)
+                        else "update_error"
+                    ),
+                    calendar_sync_error=str(exc),
+                )
+                return False
 
         return True
     except GoogleCalendarError:
+        logger.exception("Calendar export failed for task_id=%s user_id=%s", task_id, user_id)
         return False
 
 
@@ -2004,14 +2514,14 @@ def export_all_scheduled_tasks(
         return {"exported": 0, "error": "No plan for today"}
 
     db = get_database()
-    tasks = db.get_tasks_by_plan(plan["plan_id"], user_id)
+    tasks = db.get_tasks_with_segments(plan["plan_id"], user_id)
     exported = 0
     errors = 0
 
     for task in tasks:
-        if task["scheduled_start"] and task["scheduled_end"]:
+        if task["segments"]:
             if export_task_to_google_calendar(task["task_id"], user_id):
-                exported += 1
+                exported += len(task["segments"])
             else:
                 errors += 1
 
@@ -2033,7 +2543,7 @@ def get_stale_export_count(user_id: str = DEFAULT_USER_ID) -> int:
     if plan is None:
         return 0
     db = get_database()
-    return len(db.get_stale_google_exports(plan["plan_id"], user_id))
+    return db.count_stale_segment_exports(plan["plan_id"], user_id)
 
 
 # ─────────────────────────────────────────────────────────────

@@ -10,6 +10,7 @@ completed/failed — all through existing Database methods only.
 
 from __future__ import annotations
 
+import logging
 import random
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional
@@ -38,6 +39,8 @@ from services import (
     draft_plan_total_minutes,
     check_capacity_for_today,
     add_task_to_plan,
+    add_and_schedule_today_task,
+    move_task_today,
     delete_task,
     defer_task_to_tomorrow,
     save_draft_tasks_to_plan,
@@ -58,6 +61,10 @@ from services import (
     get_persisted_fixed_task_conflicts,
     reschedule_fixed_task,
     get_last_scheduler_error,
+    get_last_unplaced_tasks,
+    get_last_schedule_operation_id,
+    get_last_calendar_reconciliation_errors,
+    undo_smart_schedule,
     add_break_to_plan,
     reschedule_break,
     start_break,
@@ -75,6 +82,9 @@ from services import (
 )
 from voice_service import VoiceTranscriptionError
 from charts import create_timeline, create_donut
+
+
+logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -304,7 +314,9 @@ try:
         if _should_sync:
             sync_google_calendar(user_id)
 except Exception:
-    pass  # Never block the page for a sync failure
+    # Calendar availability must never prevent the schedule itself from
+    # loading, but the failure still needs an operational trace.
+    logger.exception("Google Calendar auto-sync failed for user_id=%s", user_id)
 
 plan = load_today_plan(user_id=user_id)
 
@@ -686,28 +698,32 @@ def _commit_manual_task(pending: dict) -> None:
     if pending["mode"] == "create_plan":
         new_plan_id = create_today_plan(raw_input=kwargs["title"], user_id=user_id)
         if new_plan_id:
-            new_id = add_task_to_plan(
-                plan_id=new_plan_id,
-                title=kwargs["title"],
-                category_id=kwargs["category_id"],
-                description=kwargs["description"],
-                priority=kwargs["priority"],
-                estimated_minutes=kwargs["estimated_minutes"],
-                order_index=0,
+            action_kwargs = dict(kwargs)
+            action_start = action_kwargs.pop("work_day_start", time(9, 0))
+            result = add_and_schedule_today_task(
+                **action_kwargs, work_day_start=action_start,
                 user_id=user_id,
             )
-            if new_id:
-                st.toast("Plan and first task created! 🎉", icon="✅")
+            if result:
+                st.session_state["_last_schedule_operation_id"] = result.operation_id
+                st.session_state["_last_unplaced_tasks"] = get_last_unplaced_tasks()
+                st.toast("Plan and first task created and scheduled!", icon="✅")
             else:
                 st.warning("Plan created, but the task couldn't be saved. Add it below.")
         else:
             st.error("Couldn't create a plan — one may already exist for today.")
     else:  # mode == "add_task"
-        new_id = add_task_to_plan(**kwargs)
-        if new_id:
-            st.toast("Task added!", icon="➕")
+        result = add_and_schedule_today_task(**kwargs)
+        if result:
+            st.session_state["_last_schedule_operation_id"] = result.operation_id
+            st.session_state["_last_unplaced_tasks"] = get_last_unplaced_tasks()
+            if result.placed:
+                st.toast("Task added and placed without moving existing tasks.", icon="➕")
+            else:
+                label = "Not enough free time" if result.reason == "capacity_shortfall" else "Available time is too fragmented"
+                st.warning(f"Task saved but not placed: {label}. {result.message}")
         else:
-            st.error("Couldn't add the task. Please try again.")
+            st.error(get_last_scheduler_error() or "Couldn't add the task. Please try again.")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -830,7 +846,7 @@ if plan is None:
                 with c1:
                     m_title = st.text_input("Task title *")
                     m_minutes = st.number_input(
-                        "Estimated minutes", min_value=5, max_value=480, value=30, step=5
+                        "Duration (minutes)", min_value=15, max_value=480, value=30, step=5
                     )
                 with c2:
                     m_priority = st.select_slider(
@@ -842,6 +858,14 @@ if plan is None:
                         **{c["name"]: c["category_id"] for c in manual_categories},
                     }
                     m_cat_choice = st.selectbox("Category", list(m_cat_options.keys()))
+                m_task_type = st.radio(
+                    "Task type", ["Flexible", "Fixed"], horizontal=True,
+                    help="Flexible tasks are placed automatically. Fixed tasks keep the exact start time you choose.",
+                )
+                m_fixed_start = st.time_input(
+                    "Fixed start time", value=time(9, 0),
+                    help="Used only when Task type is Fixed.",
+                )
                 m_description = st.text_area("Notes (optional)", height=70)
 
                 submitted = st.form_submit_button("Create Plan", use_container_width=True)
@@ -855,6 +879,9 @@ if plan is None:
                             "description": m_description.strip(),
                             "priority": m_priority,
                             "estimated_minutes": int(m_minutes),
+                            "task_type": m_task_type,
+                            "fixed_start": m_fixed_start if m_task_type == "Fixed" else None,
+                            "work_day_start": time(9, 0),
                         }
                         capacity_info = check_capacity_for_today(
                             int(m_minutes), user_id=user_id,
@@ -1009,13 +1036,17 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
     st.session_state.setdefault(DELAY_WARNING_KEY, [])
 
     def _shift_time(t: time, delta_minutes: int) -> time:
-        return (datetime.combine(date.today(), t) + timedelta(minutes=delta_minutes)).time()
+        return (datetime.combine(date.min, t) + timedelta(minutes=delta_minutes)).time()
 
     def _run_and_track_conflicts() -> list:
         with st.spinner("Assigning time slots..."):
             scheduled = run_scheduler_for_today(work_day_start=work_start, user_id=user_id)
         st.session_state[CONFLICTS_KEY] = get_last_scheduling_conflicts() if scheduled else []
         st.session_state[FIXED_CONFLICTS_KEY] = get_last_fixed_task_conflicts() if scheduled else []
+        operation_id = get_last_schedule_operation_id()
+        if operation_id:
+            st.session_state["_last_schedule_operation_id"] = operation_id
+        st.session_state["_last_unplaced_tasks"] = get_last_unplaced_tasks()
         return scheduled
 
     def _find_break_task(break_start_t: time, duration_minutes: int) -> dict | None:
@@ -1125,7 +1156,8 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
 
     if st.button("▶️ Run Scheduler", type="primary"):
         scheduled = _run_and_track_conflicts()
-        if scheduled:
+        operation_id = get_last_schedule_operation_id()
+        if scheduled or operation_id:
             if not st.session_state.get(CONFLICTS_KEY):
                 st.toast("Schedule updated!", icon="✅")
             st.rerun()
@@ -1137,13 +1169,46 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
             else:
                 st.error("Scheduling failed. Make sure today's plan has at least one task.")
 
+    operation_id = st.session_state.get("_last_schedule_operation_id")
+    manual_move_summary = st.session_state.get("_last_manual_move_summary") or []
+    manual_move_operation_id = st.session_state.get("_last_manual_move_operation_id")
+    if operation_id and operation_id == manual_move_operation_id and manual_move_summary:
+        st.success("Manual Move completed. These are the exact schedule changes:")
+        for movement in manual_move_summary:
+            old_label = " + ".join(
+                f"{format_time_12h(start)}–{format_time_12h(end)}"
+                for start, end in movement.get("old_segments", [])
+            ) or "Unscheduled"
+            new_label = " + ".join(
+                f"{format_time_12h(start)}–{format_time_12h(end)}"
+                for start, end in movement.get("new_segments", [])
+            ) or "Unscheduled"
+            prefix = "Requested" if movement.get("requested") else "Local repair"
+            st.caption(f"{prefix}: {movement['title']} · {old_label} → {new_label}")
+    if operation_id and st.button("↩️ Undo last Smart Scheduling operation", use_container_width=True):
+        if undo_smart_schedule(operation_id, user_id=user_id):
+            st.session_state["_last_schedule_operation_id"] = None
+            st.session_state["_last_manual_move_operation_id"] = None
+            st.session_state["_last_manual_move_summary"] = []
+            st.session_state["_last_unplaced_tasks"] = []
+            st.toast("The complete previous schedule was restored.", icon="↩️")
+            st.rerun()
+        else:
+            st.error("Undo is no longer safe because the plan changed after that scheduling operation.")
+
+    for unplaced in st.session_state.get("_last_unplaced_tasks", []):
+        label = "Not enough free time" if unplaced.reason == "capacity_shortfall" else "Too fragmented for the 3-segment limit"
+        st.warning(f"**{unplaced.title}** was not placed — {label}. {unplaced.message}")
+    for calendar_error in get_last_calendar_reconciliation_errors():
+        st.warning(f"Calendar reconciliation is pending: {calendar_error}")
+
     # ── Persistent conflict banner + resolution actions ──
     # Shown on every render until resolved (unlike st.warning above the
     # old st.rerun(), which vanished after ~1 frame).
     for idx, c in enumerate(st.session_state.get(CONFLICTS_KEY) or []):
         duration = int(
-            (datetime.combine(date.today(), c.break_end)
-             - datetime.combine(date.today(), c.break_start)).total_seconds() // 60
+            (datetime.combine(date.min, c.break_end)
+             - datetime.combine(date.min, c.break_start)).total_seconds() // 60
         )
         st.warning(
             f"⚠️ Couldn't fit your break "
@@ -1157,7 +1222,7 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
         res_cols = st.columns(3)
         with res_cols[0]:
             if st.button("⬅️ Move break before task", key=f"conflict_before_{idx}", use_container_width=True):
-                row = _find_break_task(c.break_start, duration)
+                row = next((t for t in tasks if t.get("task_id") == c.break_task_id), None)
                 if row is not None:
                     new_time = _shift_time(c.fixed_task_start, -duration)
                     if reschedule_break(row["task_id"], new_time, user_id=user_id):
@@ -1165,7 +1230,7 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
                         st.rerun()
         with res_cols[1]:
             if st.button("➡️ Move break after task", key=f"conflict_after_{idx}", use_container_width=True):
-                row = _find_break_task(c.break_start, duration)
+                row = next((t for t in tasks if t.get("task_id") == c.break_task_id), None)
                 if row is not None:
                     new_time = c.fixed_task_end
                     if reschedule_break(row["task_id"], new_time, user_id=user_id):
@@ -1173,7 +1238,7 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
                         st.rerun()
         with res_cols[2]:
             if st.button("🗑️ Remove this break", key=f"conflict_remove_{idx}", use_container_width=True):
-                row = _find_break_task(c.break_start, duration)
+                row = next((t for t in tasks if t.get("task_id") == c.break_task_id), None)
                 if row is not None and delete_task(row["task_id"], user_id=user_id):
                     _run_and_track_conflicts()
                     st.rerun()
@@ -1189,12 +1254,12 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
     # be the one that moves.
     for f_idx, fc in enumerate(st.session_state.get(FIXED_CONFLICTS_KEY) or []):
         a_duration = int(
-            (datetime.combine(date.today(), fc.task_a_end)
-             - datetime.combine(date.today(), fc.task_a_start)).total_seconds() // 60
+            (datetime.combine(date.min, fc.task_a_end)
+             - datetime.combine(date.min, fc.task_a_start)).total_seconds() // 60
         )
         b_duration = int(
-            (datetime.combine(date.today(), fc.task_b_end)
-             - datetime.combine(date.today(), fc.task_b_start)).total_seconds() // 60
+            (datetime.combine(date.min, fc.task_b_end)
+             - datetime.combine(date.min, fc.task_b_start)).total_seconds() // 60
         )
         st.warning(
             f"⚠️ **'{fc.task_a_title}'** "
@@ -1212,7 +1277,7 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
                 f"➡️ Move '{fc.task_a_title}' after '{fc.task_b_title}'",
                 key=f"fixed_conflict_move_a_{f_idx}", use_container_width=True,
             ):
-                row = _find_fixed_task(fc.task_a_title, fc.task_a_start, a_duration)
+                row = next((t for t in tasks if t.get("task_id") == fc.task_a_id), None)
                 if row is not None and reschedule_fixed_task(row["task_id"], fc.task_b_end, user_id=user_id):
                     _run_and_track_conflicts()
                     st.rerun()
@@ -1221,7 +1286,7 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
                 f"➡️ Move '{fc.task_b_title}' after '{fc.task_a_title}'",
                 key=f"fixed_conflict_move_b_{f_idx}", use_container_width=True,
             ):
-                row = _find_fixed_task(fc.task_b_title, fc.task_b_start, b_duration)
+                row = next((t for t in tasks if t.get("task_id") == fc.task_b_id), None)
                 if row is not None and reschedule_fixed_task(row["task_id"], fc.task_a_end, user_id=user_id):
                     _run_and_track_conflicts()
                     st.rerun()
@@ -1231,7 +1296,7 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
                 f"🗑️ Remove '{fc.task_a_title}'",
                 key=f"fixed_conflict_remove_a_{f_idx}", use_container_width=True,
             ):
-                row = _find_fixed_task(fc.task_a_title, fc.task_a_start, a_duration)
+                row = next((t for t in tasks if t.get("task_id") == fc.task_a_id), None)
                 if row is not None and delete_task(row["task_id"], user_id=user_id):
                     _run_and_track_conflicts()
                     st.rerun()
@@ -1240,7 +1305,7 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
                 f"🗑️ Remove '{fc.task_b_title}'",
                 key=f"fixed_conflict_remove_b_{f_idx}", use_container_width=True,
             ):
-                row = _find_fixed_task(fc.task_b_title, fc.task_b_start, b_duration)
+                row = next((t for t in tasks if t.get("task_id") == fc.task_b_id), None)
                 if row is not None and delete_task(row["task_id"], user_id=user_id):
                     _run_and_track_conflicts()
                     st.rerun()
@@ -1255,18 +1320,8 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
             for d in delay_warnings
         )
         st.warning(f"⚠️ This break pushed back a high-priority task: {delay_lines}.")
+        st.caption("Use the operation-level Undo above to restore the complete pre-scheduling state.")
         warn_cols = st.columns([2, 1])
-        with warn_cols[0]:
-            if st.button("↩️ Undo — remove this break", key="undo_break_delay", use_container_width=True):
-                last_break_id = st.session_state.get(LAST_BREAK_ADDED_KEY)
-                if last_break_id and delete_task(last_break_id, user_id=user_id):
-                    st.session_state[DELAY_WARNING_KEY] = []
-                    st.session_state[LAST_BREAK_ADDED_KEY] = None
-                    _run_and_track_conflicts()
-                    st.toast("Break removed — schedule restored.", icon="↩️")
-                    st.rerun()
-                else:
-                    st.error("Couldn't undo — the break may have already been changed.")
         with warn_cols[1]:
             if st.button("Keep it", key="dismiss_break_delay", use_container_width=True):
                 st.session_state[DELAY_WARNING_KEY] = []
@@ -1483,6 +1538,17 @@ for task in tasks_display:
         f"{format_time_12h(task.get('scheduled_start'))} – {format_time_12h(task.get('scheduled_end'))}",
         expanded=False,
     ):
+        segments = task.get("segments") or []
+        if segments:
+            st.caption("Fixed task · immovable" if task.get("is_fixed_time") else "Flexible task")
+            for segment in segments:
+                st.caption(
+                    f"└ Window {int(segment.get('segment_index', 0)) + 1}: "
+                    f"{format_time_12h(segment.get('scheduled_start'))} → "
+                    f"{format_time_12h(segment.get('scheduled_end'))}"
+                )
+            if len(segments) > 1:
+                st.caption("🧠 Smart adjustment · one logical task, multiple schedule windows")
         top = st.columns([3, 1, 1])
         with top[0]:
             st.markdown(
@@ -1511,6 +1577,42 @@ for task in tasks_display:
                 if delete_task(task["task_id"], user_id=user_id):
                     st.toast("Task deleted.", icon="🗑️")
                     st.rerun()
+
+        if status == "pending" and not task.get("is_fixed_time"):
+            with st.popover("🕒 Move today", use_container_width=True):
+                st.caption(
+                    "Moves the whole logical task to one continuous window today. "
+                    "If it is currently split, the existing segments are replaced atomically."
+                )
+                move_start = st.time_input(
+                    "New start time",
+                    value=time.fromisoformat(str(task.get("scheduled_start") or "09:00")[:5]),
+                    key=f"manual_move_time_{task['task_id']}",
+                )
+                if st.button("Validate and move", key=f"manual_move_{task['task_id']}"):
+                    result = move_task_today(
+                        task["task_id"], move_start,
+                        expected_revision=int(plan.get("schedule_revision") or 0),
+                        user_id=user_id,
+                    )
+                    if result:
+                        st.session_state["_last_schedule_operation_id"] = result.operation_id
+                        st.session_state["_last_manual_move_operation_id"] = result.operation_id
+                        st.session_state["_last_manual_move_summary"] = [
+                            {
+                                "title": movement.title,
+                                "old_segments": movement.old_segments,
+                                "new_segments": movement.new_segments,
+                                "requested": movement.requested,
+                            }
+                            for movement in result.movements
+                        ]
+                        st.toast(result.message + " Undo is available above.", icon="🕒")
+                        st.rerun()
+                    else:
+                        st.error(get_last_scheduler_error() or "That move is not valid.")
+        elif task.get("is_fixed_time"):
+            st.caption("Fixed tasks cannot be manually moved. Delete and recreate it only if its fixed time was entered incorrectly.")
 
         if status in ("pending", "in_progress"):
             paused = is_task_timer_paused(task)
@@ -1610,7 +1712,7 @@ with st.expander("➕ Add Tasks to Today's Plan"):
                 c1, c2 = st.columns(2)
                 with c1:
                     title = st.text_input("Task title *")
-                    minutes = st.number_input("Estimated minutes", min_value=5, max_value=480, value=30, step=5)
+                    minutes = st.number_input("Duration (minutes)", min_value=15, max_value=480, value=30, step=5)
                 with c2:
                     priority = st.select_slider(
                         "Priority", options=[1, 2, 3, 4, 5],
@@ -1618,6 +1720,14 @@ with st.expander("➕ Add Tasks to Today's Plan"):
                     )
                     cat_options = {"— None —": None, **{c["name"]: c["category_id"] for c in categories}}
                     cat_choice = st.selectbox("Category", list(cat_options.keys()))
+                task_type = st.radio(
+                    "Task type", ["Flexible", "Fixed"], horizontal=True,
+                    help="Flexible tasks are placed automatically. Fixed tasks keep the exact start time you choose.",
+                )
+                fixed_start = st.time_input(
+                    "Fixed start time", value=work_start,
+                    help="Used only when Task type is Fixed.",
+                )
                 description = st.text_area("Notes (optional)", height=70)
 
                 if st.form_submit_button("Add Task", type="primary", use_container_width=True):
@@ -1632,6 +1742,9 @@ with st.expander("➕ Add Tasks to Today's Plan"):
                             "priority": priority,
                             "estimated_minutes": int(minutes),
                             "order_index": len(tasks),
+                            "task_type": task_type,
+                            "fixed_start": fixed_start if task_type == "Fixed" else None,
+                            "work_day_start": work_start,
                             "user_id": user_id,
                         }
                         capacity_info = check_capacity_for_today(

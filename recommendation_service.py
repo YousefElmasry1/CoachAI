@@ -126,9 +126,18 @@ class RecommendationService:
             title = self._row_get(row, "title", "Untitled")
             minutes = self._row_get(row, "estimated_minutes", 0)
 
-            # Handle tasks that haven't been scheduled yet
-            start_str = str(start) if start else "??:??"
-            end_str = str(end) if end else "??:??"
+            segments = self._row_get(row, "segments", []) or []
+            if segments:
+                windows = ", ".join(
+                    f"{segment.get('effective_date') or segment.get('scheduled_date') or self._row_get(row, 'plan_date', '')} "
+                    f"{segment.get('scheduled_start')}–{segment.get('scheduled_end')}"
+                    for segment in segments
+                )
+                lines.append(f"{windows} | {title} ({minutes} min total)")
+                continue
+            else:
+                start_str = str(start) if start else "??:??"
+                end_str = str(end) if end else "??:??"
 
             line = _TASK_LINE_FORMAT.format(
                 start=start_str,
@@ -156,7 +165,7 @@ class RecommendationService:
             ValueError: If the plan has no tasks, doesn't exist, or
                 isn't owned by user_id.
         """
-        tasks = self.db.get_tasks_by_plan(plan_id, user_id)
+        tasks = self.db.get_tasks_with_segments(plan_id, user_id)
         if not tasks:
             raise ValueError(f"Plan {plan_id} has no tasks to analyze.")
         return self._format_schedule_text(tasks)

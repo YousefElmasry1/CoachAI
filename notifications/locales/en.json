@@ -1,0 +1,54 @@
+{
+  "task_reminder": {
+    "neutral": [
+      {"id": "task.reminder.en.neutral.1", "version": 1, "title": "Task coming up", "body": "{task_title} starts soon."},
+      {"id": "task.reminder.en.neutral.2", "version": 1, "title": "Upcoming task", "body": "Your session for {task_title} is approaching."}
+    ],
+    "friendly": [{"id": "task.reminder.en.friendly.1", "version": 1, "title": "Coming up next", "body": "{task_title} is almost ready to start."}],
+    "coach": [{"id": "task.reminder.en.coach.1", "version": 1, "title": "Prepare to focus", "body": "{task_title} starts soon. Get ready for the session."}]
+  },
+  "schedule_updated": {
+    "neutral": [
+      {"id": "schedule.updated.en.neutral.1", "version": 1, "title": "Schedule updated", "body": "{adjusted_count} tasks were adjusted."},
+      {"id": "schedule.updated.en.neutral.2", "version": 1, "title": "Plan refreshed", "body": "Your schedule now includes {adjusted_count} task adjustments."}
+    ],
+    "friendly": [{"id": "schedule.updated.en.friendly.1", "version": 1, "title": "Your plan is up to date", "body": "We adjusted {adjusted_count} tasks in your schedule."}],
+    "coach": [{"id": "schedule.updated.en.coach.1", "version": 1, "title": "Plan adjusted", "body": "{adjusted_count} tasks were moved so your plan stays workable."}]
+  },
+  "schedule_undone": {
+    "neutral": [{"id": "schedule.undone.en.1", "version": 1, "title": "Schedule restored", "body": "The previous schedule state was restored."}]
+  },
+  "task_unplaced": {
+    "neutral": [{"id": "task.unplaced.en.1", "version": 1, "title": "Task needs attention", "body": "{task_title} could not be scheduled because of {reason}."}]
+  },
+  "deadline_risk": {
+    "neutral": [{"id": "deadline.risk.en.1", "version": 1, "title": "Deadline may be at risk", "body": "{task_title} may no longer fit before its deadline."}],
+    "friendly": [{"id": "deadline.risk.en.friendly.1", "version": 1, "title": "Let's protect this deadline", "body": "{task_title} may need a plan adjustment."}],
+    "coach": [{"id": "deadline.risk.en.coach.1", "version": 1, "title": "Replanning recommended", "body": "The current plan may not finish {task_title} before its deadline."}]
+  },
+  "deadline_passed": {
+    "neutral": [{"id": "deadline.passed.en.1", "version": 1, "title": "Deadline passed", "body": "{task_title} is still unfinished. Review or replan it."}]
+  },
+  "calendar_attention": {
+    "neutral": [{"id": "calendar.attention.en.1", "version": 1, "title": "Calendar needs attention", "body": "CoachAI could not fully reconcile the latest schedule change."}]
+  },
+  "calendar_reconciled": {
+    "neutral": [{"id": "calendar.reconciled.en.1", "version": 1, "title": "Calendar is up to date", "body": "The pending calendar change was reconciled."}]
+  },
+  "daily_summary": {
+    "neutral": [{"id": "daily.summary.en.1", "version": 1, "title": "Today's summary", "body": "You completed {completed_count} of {total_count} tasks and focused for {focused_duration}."}]
+  },
+  "focus_started": {
+    "neutral": [{"id": "focus.started.en.1", "version": 1, "title": "Focus session started", "body": "Your session for {task_title} is underway."}]
+  },
+  "focus_ended": {
+    "neutral": [{"id": "focus.ended.en.1", "version": 1, "title": "Focus session ended", "body": "Review your progress on {task_title}."}]
+  },
+  "task_created": {"neutral": [{"id": "task.created.en.1", "version": 1, "title": "Task created", "body": "{task_title} was added."}]},
+  "task_started": {"neutral": [{"id": "task.started.en.1", "version": 1, "title": "Task started", "body": "{task_title} is in progress."}]},
+  "task_completed": {"neutral": [{"id": "task.completed.en.1", "version": 1, "title": "Task completed", "body": "{task_title} was completed."}]},
+  "task_failed": {"neutral": [{"id": "task.failed.en.1", "version": 1, "title": "Task closed", "body": "{task_title} was marked as failed."}]},
+  "task_deleted": {"neutral": [{"id": "task.deleted.en.1", "version": 1, "title": "Task deleted", "body": "{task_title} was removed."}]},
+  "task_deferred": {"neutral": [{"id": "task.deferred.en.1", "version": 1, "title": "Task deferred", "body": "{task_title} was moved to another plan."}]},
+  "task_updated": {"neutral": [{"id": "task.updated.en.1", "version": 1, "title": "Task updated", "body": "{task_title} changed."}]}
+}

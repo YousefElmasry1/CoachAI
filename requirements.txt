@@ -5,11 +5,19 @@ python-dotenv>=1.0.1
 langchain-core>=0.3.0
 langchain-google-genai>=2.0.0
 google-generativeai>=0.8.0
+# langgraph-sdk (pulled by the LangChain stack) currently requires <16.
+websockets>=14,<16
 google-api-python-client>=2.100.0
 google-auth>=2.23.0
 google-auth-oauthlib>=1.1.0
 google-auth-httplib2>=0.1.1
 SQLAlchemy>=2.0.0
+# Required by the documented postgresql+psycopg2:// local runtime URL.
+psycopg2-binary>=2.9.9
+# Patch 3 server-side push providers. No mobile/client SDKs are used.
+firebase-admin>=7.7.0,<8.0.0
+httpx[http2]>=0.28.1,<1.0.0
+cryptography>=49.0.0,<51.0.0
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
 apscheduler>=3.10.0

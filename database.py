@@ -3,10 +3,12 @@ import re
 import sqlite3  # kept only for type hints (sqlite3.Row / sqlite3.Cursor) below —
                 # the actual connection no longer uses this module directly.
 from contextlib import contextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from itertools import count
 from pathlib import Path
 from typing import Any, Optional
+import json
+import uuid
 
 from sqlalchemy import (
     create_engine, text, inspect,
@@ -14,10 +16,12 @@ from sqlalchemy import (
     DateTime, Date, Time, ForeignKey, UniqueConstraint, CheckConstraint,
     Index, func,
 )
-from sqlalchemy.engine import Connection, CursorResult, Engine
+from sqlalchemy.engine import Connection, CursorResult, Engine, make_url
 from sqlalchemy.exc import DBAPIError, IntegrityError, SQLAlchemyError
+from dotenv import load_dotenv
 
 from timezone_utils import get_user_timezone, safe_zoneinfo, local_hour_from_utc_string, user_today
+from config import MAX_SEGMENTS_PER_TASK, MIN_SEGMENT_MINUTES, WORK_DAY_END
 
 
 class OwnershipError(Exception):
@@ -45,6 +49,10 @@ class TimerConflictError(Exception):
     the task and retry (once) rather than silently dropping the
     conflicting update.
     """
+
+
+class StaleScheduleError(Exception):
+    """Raised when scheduling or Undo targets an obsolete plan revision."""
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +97,7 @@ plans = Table(
     Column("ai_summary", Text),
     Column("status", String, nullable=False, server_default="active"),
     Column("created_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    Column("schedule_revision", Integer, nullable=False, server_default="0"),
     UniqueConstraint("user_id", "plan_date"),
     CheckConstraint("status IN ('draft','active','completed')", name="ck_plans_status"),
 )
@@ -125,6 +134,8 @@ tasks = Table(
     Column("updated_at", DateTime, nullable=False, server_default=func.current_timestamp()),
     Column("google_event_id", String),
     Column("google_exported_at", DateTime),
+    Column("earliest_start", DateTime),
+    Column("deadline", DateTime),
     CheckConstraint("priority BETWEEN 1 AND 5", name="ck_tasks_priority"),
     CheckConstraint("estimated_minutes >= 0", name="ck_tasks_est_minutes"),
     CheckConstraint("status IN ('pending','in_progress','completed','failed')", name="ck_tasks_status"),
@@ -141,6 +152,298 @@ Index("idx_tasks_plan_id", tasks.c.plan_id)
 Index("idx_tasks_category_id", tasks.c.category_id)
 Index("idx_tasks_status", tasks.c.status)
 Index("idx_tasks_plan_status", tasks.c.plan_id, tasks.c.status)
+
+task_segments = Table(
+    "task_segments", metadata,
+    Column("segment_id", Integer, primary_key=True, autoincrement=True),
+    Column("task_id", Integer, ForeignKey("tasks.task_id", ondelete="CASCADE"), nullable=False),
+    Column("segment_index", Integer, nullable=False),
+    Column("scheduled_start", Time, nullable=False),
+    Column("scheduled_end", Time, nullable=False),
+    Column("scheduled_date", Date),
+    Column("created_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    Column("google_event_id", String),
+    Column("google_calendar_id", String),
+    Column("calendar_provenance", String, nullable=False, server_default="legacy_unknown"),
+    Column("calendar_sync_status", String, nullable=False, server_default="not_synced"),
+    Column("calendar_sync_error", Text),
+    UniqueConstraint("task_id", "segment_index"),
+    CheckConstraint("segment_index >= 0", name="ck_task_segments_index"),
+    CheckConstraint("scheduled_end > scheduled_start", name="ck_task_segments_same_day"),
+    CheckConstraint(
+        "calendar_provenance IN ('imported','coachai_created','legacy_unknown')",
+        name="ck_task_segments_provenance",
+    ),
+)
+Index("idx_task_segments_task_id", task_segments.c.task_id)
+Index("idx_task_segments_date", task_segments.c.scheduled_date)
+Index("idx_task_segments_google_event", task_segments.c.google_event_id)
+
+schedule_operations = Table(
+    "schedule_operations", metadata,
+    Column("operation_id", String, primary_key=True),
+    Column("plan_id", Integer, ForeignKey("plans.plan_id", ondelete="CASCADE"), nullable=False),
+    Column("user_id", String, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False),
+    Column("base_revision", Integer, nullable=False),
+    Column("result_revision", Integer, nullable=False),
+    Column("before_state", Text, nullable=False),
+    Column("after_state", Text, nullable=False),
+    Column("status", String, nullable=False, server_default="applied"),
+    Column("created_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    Column("undone_at", DateTime),
+    Column("calendar_reconciled_at", DateTime),
+    Column("calendar_reconciliation_error", Text),
+    CheckConstraint("status IN ('applied','undone')", name="ck_schedule_operations_status"),
+)
+Index("idx_schedule_operations_plan", schedule_operations.c.plan_id, schedule_operations.c.created_at)
+Index("idx_schedule_operations_user", schedule_operations.c.user_id)
+
+# Notification foundation. These tables intentionally contain no provider-
+# specific Firebase/APNs fields beyond an opaque device token and provider
+# name. Business policy and delivery remain separate layers.
+notification_preferences = Table(
+    "notification_preferences", metadata,
+    Column("user_id", String, ForeignKey("users.user_id", ondelete="CASCADE"), primary_key=True),
+    Column("tone", String, nullable=False, server_default="neutral"),
+    Column("default_reminder_lead_minutes", Integer, server_default="10"),
+    Column("quiet_hours_start", Time),
+    Column("quiet_hours_end", Time),
+    Column("daily_summary_enabled", Integer, nullable=False, server_default="0"),
+    Column("coach_checkins_enabled", Integer, nullable=False, server_default="0"),
+    Column("privacy_mode", String, nullable=False, server_default="show_title"),
+    Column("sound_enabled", Integer, nullable=False, server_default="1"),
+    Column("vibration_enabled", Integer, nullable=False, server_default="1"),
+    Column("multi_device_policy", String, nullable=False, server_default="primary"),
+    Column("locale", String, nullable=False, server_default="en"),
+    Column("time_format", String, nullable=False, server_default="12h"),
+    Column("created_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    Column("updated_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    CheckConstraint("tone IN ('neutral','friendly','coach')", name="ck_notification_preferences_tone"),
+    CheckConstraint(
+        "default_reminder_lead_minutes IS NULL OR default_reminder_lead_minutes IN (0,5,10,15,30)",
+        name="ck_notification_preferences_lead",
+    ),
+    CheckConstraint("daily_summary_enabled IN (0,1)", name="ck_notification_preferences_daily"),
+    CheckConstraint("coach_checkins_enabled IN (0,1)", name="ck_notification_preferences_checkins"),
+    CheckConstraint("privacy_mode IN ('show_title','hide_title','generic')", name="ck_notification_preferences_privacy"),
+    CheckConstraint("sound_enabled IN (0,1)", name="ck_notification_preferences_sound"),
+    CheckConstraint("vibration_enabled IN (0,1)", name="ck_notification_preferences_vibration"),
+    CheckConstraint("multi_device_policy IN ('all','primary','selected')", name="ck_notification_preferences_devices"),
+    CheckConstraint("locale IN ('ar','en')", name="ck_notification_preferences_locale"),
+    CheckConstraint("time_format IN ('12h','24h')", name="ck_notification_preferences_time_format"),
+)
+
+notification_type_preferences = Table(
+    "notification_type_preferences", metadata,
+    Column("user_id", String, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False),
+    Column("notification_type", String, nullable=False),
+    Column("enabled", Integer, nullable=False, server_default="1"),
+    Column("preferred_channel", String, nullable=False, server_default="in_app"),
+    Column("lead_minutes", Integer),
+    Column("cooldown_seconds", Integer, nullable=False, server_default="0"),
+    Column("interruption_level", String, nullable=False, server_default="passive"),
+    Column("created_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    Column("updated_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    UniqueConstraint("user_id", "notification_type"),
+    CheckConstraint("enabled IN (0,1)", name="ck_notification_type_preferences_enabled"),
+    CheckConstraint("preferred_channel IN ('in_app','local','push')", name="ck_notification_type_preferences_channel"),
+    CheckConstraint("lead_minutes IS NULL OR lead_minutes IN (0,5,10,15,30)", name="ck_notification_type_preferences_lead"),
+    CheckConstraint("cooldown_seconds >= 0", name="ck_notification_type_preferences_cooldown"),
+    CheckConstraint("interruption_level IN ('passive','active','time_sensitive')", name="ck_notification_type_preferences_interruption"),
+)
+Index("idx_notification_type_preferences_user", notification_type_preferences.c.user_id)
+
+notification_devices = Table(
+    "notification_devices", metadata,
+    Column("device_id", String, primary_key=True),
+    Column("user_id", String, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False),
+    Column("platform", String, nullable=False),
+    Column("provider", String, nullable=False),
+    Column("push_token", Text),
+    Column("app_identifier", String),
+    Column("provider_metadata", Text, nullable=False, server_default="{}"),
+    Column("app_version", String),
+    Column("locale", String, nullable=False, server_default="en"),
+    Column("timezone", String, nullable=False, server_default="UTC"),
+    Column("is_primary", Integer, nullable=False, server_default="0"),
+    Column("is_enabled", Integer, nullable=False, server_default="1"),
+    Column("last_seen_at", DateTime),
+    Column("token_invalidated_at", DateTime),
+    Column("last_acknowledged_schedule_revision", Integer, nullable=False, server_default="0"),
+    Column("created_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    Column("updated_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    UniqueConstraint("provider", "push_token"),
+    CheckConstraint("platform IN ('ios','android')", name="ck_notification_devices_platform"),
+    CheckConstraint("provider IN ('apns','fcm','none')", name="ck_notification_devices_provider"),
+    CheckConstraint("locale IN ('ar','en')", name="ck_notification_devices_locale"),
+    CheckConstraint("is_primary IN (0,1)", name="ck_notification_devices_primary"),
+    CheckConstraint("is_enabled IN (0,1)", name="ck_notification_devices_enabled"),
+    CheckConstraint("last_acknowledged_schedule_revision >= 0", name="ck_notification_devices_revision"),
+)
+Index("idx_notification_devices_user", notification_devices.c.user_id)
+Index("idx_notification_devices_token", notification_devices.c.push_token)
+
+notification_outbox = Table(
+    "notification_outbox", metadata,
+    Column("sequence_id", Integer, primary_key=True, autoincrement=True),
+    Column("outbox_id", String, nullable=False, unique=True),
+    Column("user_id", String, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False),
+    Column("event_type", String, nullable=False),
+    Column("task_id", Integer),
+    Column("segment_id", Integer),
+    Column("scheduled_date", Date),
+    Column("segment_index", Integer),
+    Column("schedule_revision", Integer),
+    Column("schedule_operation_id", String),
+    Column("event_payload", Text, nullable=False),
+    Column("idempotency_key", String, nullable=False),
+    Column("status", String, nullable=False, server_default="queued"),
+    Column("attempts", Integer, nullable=False, server_default="0"),
+    Column("available_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    Column("locked_at", DateTime),
+    Column("locked_by", String),
+    Column("expires_at", DateTime),
+    Column("processed_at", DateTime),
+    Column("last_error", Text),
+    Column("created_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    UniqueConstraint("user_id", "idempotency_key"),
+    CheckConstraint("status IN ('queued','processing','processed','failed','cancelled','expired')", name="ck_notification_outbox_status"),
+    CheckConstraint("attempts >= 0", name="ck_notification_outbox_attempts"),
+    CheckConstraint("segment_index IS NULL OR segment_index >= 0", name="ck_notification_outbox_segment_index"),
+)
+Index("idx_notification_outbox_ready", notification_outbox.c.status, notification_outbox.c.available_at)
+Index("idx_notification_outbox_lease", notification_outbox.c.status, notification_outbox.c.locked_at)
+Index("idx_notification_outbox_user", notification_outbox.c.user_id, notification_outbox.c.created_at)
+
+notifications = Table(
+    "notifications", metadata,
+    Column("notification_id", String, primary_key=True),
+    Column("user_id", String, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False),
+    Column("notification_type", String, nullable=False),
+    Column("urgency", String, nullable=False),
+    Column("interruption_level", String, nullable=False),
+    Column("task_id", Integer),
+    Column("segment_id", Integer),
+    Column("scheduled_date", Date),
+    Column("segment_index", Integer),
+    Column("schedule_revision", Integer),
+    Column("schedule_operation_id", String),
+    Column("title", Text, nullable=False),
+    Column("body", Text, nullable=False),
+    Column("locale", String, nullable=False),
+    Column("template_id", String, nullable=False),
+    Column("template_version", Integer, nullable=False),
+    Column("scheduled_for", DateTime, nullable=False),
+    Column("expires_at", DateTime, nullable=False),
+    Column("status", String, nullable=False, server_default="active"),
+    Column("dedupe_key", String, nullable=False),
+    Column("suppression_reason", String),
+    Column("action_metadata", Text, nullable=False, server_default="{}"),
+    Column("read_at", DateTime),
+    Column("acted_at", DateTime),
+    Column("sync_revision", Integer, nullable=False, server_default="0"),
+    Column("created_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    Column("updated_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    UniqueConstraint("user_id", "dedupe_key"),
+    CheckConstraint("urgency IN ('critical','high','normal','low')", name="ck_notifications_urgency"),
+    CheckConstraint("interruption_level IN ('passive','active','time_sensitive')", name="ck_notifications_interruption"),
+    CheckConstraint("locale IN ('ar','en')", name="ck_notifications_locale"),
+    CheckConstraint("template_version >= 1", name="ck_notifications_template_version"),
+    CheckConstraint("status IN ('active','suppressed','expired','cancelled')", name="ck_notifications_status"),
+    CheckConstraint("segment_index IS NULL OR segment_index >= 0", name="ck_notifications_segment_index"),
+    CheckConstraint("sync_revision >= 0", name="ck_notifications_sync_revision"),
+)
+Index("idx_notifications_user_created", notifications.c.user_id, notifications.c.created_at)
+Index("idx_notifications_user_unread", notifications.c.user_id, notifications.c.read_at)
+Index("idx_notifications_task", notifications.c.user_id, notifications.c.task_id)
+Index("idx_notifications_sync", notifications.c.user_id, notifications.c.sync_revision)
+
+notification_deliveries = Table(
+    "notification_deliveries", metadata,
+    Column("delivery_id", String, primary_key=True),
+    Column("notification_id", String, ForeignKey("notifications.notification_id", ondelete="CASCADE"), nullable=False),
+    Column("channel", String, nullable=False),
+    Column("device_id", String, ForeignKey("notification_devices.device_id", ondelete="SET NULL")),
+    Column("target_key", String, nullable=False, server_default="account"),
+    Column("provider_message_id", String),
+    Column("provider", String),
+    Column("status", String, nullable=False, server_default="queued"),
+    Column("queued_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    Column("sent_at", DateTime),
+    Column("delivered_at", DateTime),
+    Column("read_at", DateTime),
+    Column("acted_at", DateTime),
+    Column("cancelled_at", DateTime),
+    Column("retry_count", Integer, nullable=False, server_default="0"),
+    Column("next_attempt_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    Column("last_attempt_at", DateTime),
+    Column("accepted_at", DateTime),
+    Column("locked_at", DateTime),
+    Column("locked_by", String),
+    Column("error_classification", String),
+    Column("last_error", Text),
+    Column("created_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    Column("updated_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    UniqueConstraint("notification_id", "channel", "target_key"),
+    CheckConstraint("channel IN ('in_app','local','push')", name="ck_notification_deliveries_channel"),
+    CheckConstraint("status IN ('queued','sent','delivered','failed','cancelled')", name="ck_notification_deliveries_status"),
+    CheckConstraint("retry_count >= 0", name="ck_notification_deliveries_retries"),
+)
+Index("idx_notification_deliveries_notification", notification_deliveries.c.notification_id)
+Index("idx_notification_deliveries_device", notification_deliveries.c.device_id)
+Index("idx_notification_deliveries_push_ready", notification_deliveries.c.channel, notification_deliveries.c.status, notification_deliveries.c.next_attempt_at)
+Index("idx_notification_deliveries_lease", notification_deliveries.c.channel, notification_deliveries.c.locked_at)
+
+notification_local_schedules = Table(
+    "notification_local_schedules", metadata,
+    Column("local_schedule_id", String, primary_key=True),
+    Column("notification_id", String, ForeignKey("notifications.notification_id", ondelete="CASCADE"), nullable=False),
+    Column("user_id", String, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False),
+    Column("device_id", String, ForeignKey("notification_devices.device_id", ondelete="SET NULL")),
+    Column("target_key", String, nullable=False, server_default="account"),
+    Column("task_id", Integer),
+    Column("segment_id", Integer),
+    Column("segment_index", Integer),
+    Column("schedule_revision", Integer),
+    Column("schedule_operation_id", String),
+    Column("trigger_type", String, nullable=False, server_default="time"),
+    Column("scheduled_fire_at", DateTime, nullable=False),
+    Column("expires_at", DateTime, nullable=False),
+    Column("status", String, nullable=False, server_default="scheduled"),
+    Column("payload", Text, nullable=False, server_default="{}"),
+    Column("locale", String, nullable=False),
+    Column("timezone", String, nullable=False),
+    Column("cancelled_at", DateTime),
+    Column("cancellation_reason", String),
+    Column("created_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    Column("updated_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    UniqueConstraint("notification_id", "target_key"),
+    CheckConstraint("status IN ('scheduled','cancelled','expired','fired')", name="ck_local_schedule_status"),
+    CheckConstraint("locale IN ('ar','en')", name="ck_local_schedule_locale"),
+    CheckConstraint("segment_index IS NULL OR segment_index >= 0", name="ck_local_schedule_segment_index"),
+)
+Index("idx_local_schedules_user_fire", notification_local_schedules.c.user_id, notification_local_schedules.c.status, notification_local_schedules.c.scheduled_fire_at)
+Index("idx_local_schedules_task", notification_local_schedules.c.user_id, notification_local_schedules.c.task_id, notification_local_schedules.c.status)
+
+notification_sync_state = Table(
+    "notification_sync_state", metadata,
+    Column("user_id", String, ForeignKey("users.user_id", ondelete="CASCADE"), primary_key=True),
+    Column("sync_revision", Integer, nullable=False, server_default="0"),
+    Column("updated_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    CheckConstraint("sync_revision >= 0", name="ck_notification_sync_revision"),
+)
+
+task_notification_state = Table(
+    "task_notification_state", metadata,
+    Column("user_id", String, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False),
+    Column("task_id", Integer, ForeignKey("tasks.task_id", ondelete="CASCADE"), nullable=False),
+    Column("state", String, nullable=False, server_default="SAFE"),
+    Column("last_evaluated_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    Column("last_transition_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    UniqueConstraint("user_id", "task_id"),
+    CheckConstraint("state IN ('SAFE','AT_RISK','CRITICAL','PASSED')", name="ck_task_notification_state"),
+)
+Index("idx_task_notification_state_user", task_notification_state.c.user_id)
 
 user_profiles = Table(
     "user_profiles", metadata,
@@ -241,14 +544,16 @@ DB_NAME: str = "coach_ai.db"
 SCHEMA_FILE: str = "schema.sql"
 
 # Set DATABASE_URL to point at Postgres in production, e.g.:
-#   postgresql+psycopg2://user:password@host:5432/coachai
+#   postgresql+psycopg2://<USER>:<PASSWORD>@host:5432/coachai
 # Left unset (the default), CoachAI keeps using a local SQLite file — no
 # other code in this file, or anywhere else in the project, needs to change
 # to switch between the two.
-DEFAULT_SQLITE_PATH: str = os.path.abspath(DB_NAME)
-DATABASE_URL: str = os.environ.get(
-    "DATABASE_URL", f"sqlite:///{DEFAULT_SQLITE_PATH}"
-)
+load_dotenv(Path(__file__).with_name(".env"), override=False)
+
+# No implicit SQLite fallback: production/development entry points must name
+# their PostgreSQL database explicitly. Tests that intentionally exercise
+# SQLite pass an explicit sqlite:/// URL to Database(...).
+DATABASE_URL: Optional[str] = os.environ.get("DATABASE_URL")
 
 
 # ---------------------------------------------------------------------------
@@ -259,8 +564,9 @@ class Database:
     """
     Database manager for CoachAI, backed by SQLAlchemy.
 
-    Talks to SQLite by default (for local development) or Postgres when
-    DATABASE_URL is set (for production). Every method below this class's
+    Uses the explicitly configured DATABASE_URL (PostgreSQL for normal
+    development/runtime) or an explicit per-instance URL used by tests.
+    Every method below this class's
     connection-management section is UNCHANGED from the original sqlite3
     version — same names, same SQL, same ``?`` placeholders — because the
     low-level execute()/fetch_one()/fetch_all() helpers now translate
@@ -276,13 +582,20 @@ class Database:
         Initialise the database manager.
 
         Args:
-            db_url: Optional SQLAlchemy connection URL. Defaults to
-                    DATABASE_URL (env var), which itself defaults to a
-                    local ``coach_ai.db`` SQLite file.
+            db_url: Optional explicit SQLAlchemy connection URL. When omitted,
+                    DATABASE_URL must be configured in the environment or .env.
         """
-        self.db_url: str = db_url or DATABASE_URL
+        selected_url = db_url or DATABASE_URL
+        if not selected_url:
+            raise RuntimeError(
+                "DATABASE_URL is required. Configure a PostgreSQL URL in the "
+                "environment or the repository-local .env file."
+            )
+        self.db_url: str = selected_url
         self.engine: Optional[Engine] = None
         self.connection: Optional[Connection] = None
+        self._transaction_depth: int = 0
+        self._transaction_failed: bool = False
         self._connect()
 
     # ------------------------------------------------------------------
@@ -291,7 +604,17 @@ class Database:
 
     def _connect(self) -> None:
         """Open the engine/connection and enable foreign keys (SQLite)."""
-        self.engine = create_engine(self.db_url, future=True)
+        engine_options: dict[str, Any] = {
+            "future": True,
+            "pool_pre_ping": True,
+        }
+        if make_url(self.db_url).get_backend_name() == "postgresql":
+            # CoachAI persists instants as UTC and applies the user's IANA
+            # timezone at the service/UI boundary. Pinning each PostgreSQL
+            # session to UTC prevents machine-local timezone settings from
+            # changing aware-datetime input or timestamp comparisons.
+            engine_options["connect_args"] = {"options": "-c timezone=UTC"}
+        self.engine = create_engine(self.db_url, **engine_options)
         self.connection = self.engine.connect()
         if self.is_sqlite:
             self.connection.execute(text("PRAGMA foreign_keys = ON"))
@@ -321,6 +644,13 @@ class Database:
                 pass
             finally:
                 self.connection = None
+        if self.engine:
+            try:
+                self.engine.dispose()
+            except SQLAlchemyError:
+                pass
+            finally:
+                self.engine = None
 
     def __enter__(self) -> "Database":
         """Context manager entry."""
@@ -378,6 +708,9 @@ class Database:
             self._maybe_migrate_task_pause_count()
             self._maybe_migrate_task_pause_duration_fields()
             self._maybe_migrate_task_timer_version()
+            self._maybe_create_smart_scheduling_schema()
+            self._maybe_create_future_planning_schema()
+            self._maybe_create_notification_schema()
             return  # Schema already applied
 
         schema_path = Path(__file__).with_name(SCHEMA_FILE)
@@ -408,6 +741,207 @@ class Database:
         self._maybe_migrate_task_pause_duration_fields()
         self._maybe_migrate_task_timer_version()
         self._maybe_migrate_user_password_hash()
+        self._maybe_create_smart_scheduling_schema()
+        self._maybe_create_future_planning_schema()
+        self._maybe_create_notification_schema()
+
+    def _maybe_create_smart_scheduling_schema(self) -> None:
+        """Create the segmented scheduler schema and safely backfill valid rows.
+
+        This intentionally has no migration ledger.  Every statement and the
+        segment-0 insert are idempotent, so startup is restart-safe even after
+        an interrupted run.  A legacy interval is copied only when both values
+        parse and end is strictly after start; missing, partial, overnight, and
+        otherwise invalid values remain identifiable on ``tasks`` and receive
+        no fabricated segment.
+        """
+        raw = self._raw_dbapi()
+        plan_columns = {row[1] for row in raw.execute("PRAGMA table_info(plans)").fetchall()}
+        if "schedule_revision" not in plan_columns:
+            raw.execute("ALTER TABLE plans ADD COLUMN schedule_revision INTEGER NOT NULL DEFAULT 0")
+
+        raw.executescript("""
+            CREATE TABLE IF NOT EXISTS task_segments (
+                segment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER NOT NULL,
+                segment_index INTEGER NOT NULL CHECK (segment_index >= 0),
+                scheduled_start TIME NOT NULL,
+                scheduled_end TIME NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                google_event_id TEXT,
+                google_calendar_id TEXT,
+                calendar_provenance TEXT NOT NULL DEFAULT 'legacy_unknown'
+                    CHECK (calendar_provenance IN ('imported','coachai_created','legacy_unknown')),
+                calendar_sync_status TEXT NOT NULL DEFAULT 'not_synced',
+                calendar_sync_error TEXT,
+                FOREIGN KEY (task_id) REFERENCES tasks(task_id) ON DELETE CASCADE,
+                UNIQUE(task_id, segment_index),
+                CHECK (scheduled_end > scheduled_start)
+            );
+            CREATE INDEX IF NOT EXISTS idx_task_segments_task_id ON task_segments(task_id);
+            CREATE INDEX IF NOT EXISTS idx_task_segments_google_event ON task_segments(google_event_id);
+            CREATE TRIGGER IF NOT EXISTS trg_task_segments_valid_time_insert
+            BEFORE INSERT ON task_segments
+            WHEN time(NEW.scheduled_start) IS NULL
+              OR time(NEW.scheduled_end) IS NULL
+              OR time(NEW.scheduled_start) >= time(NEW.scheduled_end)
+              OR time(NEW.scheduled_end) > '23:59:59'
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid same-day task segment');
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_task_segments_valid_time_update
+            BEFORE UPDATE OF scheduled_start, scheduled_end ON task_segments
+            WHEN time(NEW.scheduled_start) IS NULL
+              OR time(NEW.scheduled_end) IS NULL
+              OR time(NEW.scheduled_start) >= time(NEW.scheduled_end)
+              OR time(NEW.scheduled_end) > '23:59:59'
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid same-day task segment');
+            END;
+
+            CREATE TABLE IF NOT EXISTS schedule_operations (
+                operation_id TEXT PRIMARY KEY,
+                plan_id INTEGER NOT NULL,
+                user_id TEXT NOT NULL,
+                base_revision INTEGER NOT NULL,
+                result_revision INTEGER NOT NULL,
+                before_state TEXT NOT NULL,
+                after_state TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'applied' CHECK (status IN ('applied','undone')),
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                undone_at DATETIME,
+                calendar_reconciled_at DATETIME,
+                calendar_reconciliation_error TEXT,
+                FOREIGN KEY (plan_id) REFERENCES plans(plan_id) ON DELETE CASCADE,
+                FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_schedule_operations_plan
+                ON schedule_operations(plan_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_schedule_operations_user
+                ON schedule_operations(user_id);
+        """)
+        operation_columns = {
+            row[1] for row in raw.execute("PRAGMA table_info(schedule_operations)").fetchall()
+        }
+        if "calendar_reconciled_at" not in operation_columns:
+            raw.execute("ALTER TABLE schedule_operations ADD COLUMN calendar_reconciled_at DATETIME")
+        if "calendar_reconciliation_error" not in operation_columns:
+            raw.execute("ALTER TABLE schedule_operations ADD COLUMN calendar_reconciliation_error TEXT")
+
+        rows = raw.execute("""
+            SELECT task_id, scheduled_start, scheduled_end, google_event_id
+            FROM tasks
+            WHERE scheduled_start IS NOT NULL AND scheduled_end IS NOT NULL
+        """).fetchall()
+        for task_id, start_value, end_value, google_event_id in rows:
+            start = self._parse_legacy_time(start_value)
+            end = self._parse_legacy_time(end_value)
+            if start is None or end is None or end <= start:
+                continue
+            raw.execute("""
+                INSERT OR IGNORE INTO task_segments
+                    (task_id, segment_index, scheduled_start, scheduled_end,
+                     google_event_id, calendar_provenance)
+                VALUES (?, 0, ?, ?, ?, 'legacy_unknown')
+            """, (task_id, start.strftime("%H:%M:%S"), end.strftime("%H:%M:%S"), google_event_id))
+        raw.commit()
+
+    def _maybe_create_future_planning_schema(self) -> None:
+        """Add restart-safe future-planning metadata without rewriting data."""
+        raw = self._raw_dbapi()
+        task_columns = {row[1] for row in raw.execute("PRAGMA table_info(tasks)").fetchall()}
+        if "earliest_start" not in task_columns:
+            raw.execute("ALTER TABLE tasks ADD COLUMN earliest_start DATETIME")
+        if "deadline" not in task_columns:
+            raw.execute("ALTER TABLE tasks ADD COLUMN deadline DATETIME")
+        segment_columns = {
+            row[1] for row in raw.execute("PRAGMA table_info(task_segments)").fetchall()
+        }
+        if "scheduled_date" not in segment_columns:
+            raw.execute("ALTER TABLE task_segments ADD COLUMN scheduled_date DATE")
+        # Existing same-day segments inherit their logical task's plan date.
+        # The predicate makes this safe to resume after interruption.
+        raw.execute("""
+            UPDATE task_segments
+               SET scheduled_date = (
+                   SELECT p.plan_date
+                     FROM tasks t JOIN plans p ON p.plan_id=t.plan_id
+                    WHERE t.task_id=task_segments.task_id
+               )
+             WHERE scheduled_date IS NULL
+        """)
+        raw.execute(
+            "CREATE INDEX IF NOT EXISTS idx_task_segments_date ON task_segments(scheduled_date)"
+        )
+        raw.commit()
+
+    def _maybe_create_notification_schema(self) -> None:
+        """Create Patch 1 notification tables additively on SQLite.
+
+        There is no historical notification schema to rewrite or backfill.
+        ``checkfirst`` makes startup idempotent, and using the same SQLAlchemy
+        definitions as fresh PostgreSQL prevents a second divergent schema.
+        No Firebase/APNs calls or fabricated notification history occur here.
+        """
+        metadata.create_all(
+            bind=self.connection,
+            tables=[
+                notification_preferences,
+                notification_type_preferences,
+                notification_devices,
+                notification_outbox,
+                notifications,
+                notification_deliveries,
+                notification_local_schedules,
+                notification_sync_state,
+                task_notification_state,
+            ],
+            checkfirst=True,
+        )
+        raw = self._raw_dbapi()
+        outbox_columns = {row[1] for row in raw.execute("PRAGMA table_info(notification_outbox)").fetchall()}
+        if "locked_by" not in outbox_columns:
+            raw.execute("ALTER TABLE notification_outbox ADD COLUMN locked_by TEXT")
+        if "expires_at" not in outbox_columns:
+            raw.execute("ALTER TABLE notification_outbox ADD COLUMN expires_at DATETIME")
+        notification_columns = {row[1] for row in raw.execute("PRAGMA table_info(notifications)").fetchall()}
+        if "sync_revision" not in notification_columns:
+            raw.execute("ALTER TABLE notifications ADD COLUMN sync_revision INTEGER NOT NULL DEFAULT 0")
+        device_columns = {row[1] for row in raw.execute("PRAGMA table_info(notification_devices)").fetchall()}
+        if "app_identifier" not in device_columns:
+            raw.execute("ALTER TABLE notification_devices ADD COLUMN app_identifier TEXT")
+        if "provider_metadata" not in device_columns:
+            raw.execute("ALTER TABLE notification_devices ADD COLUMN provider_metadata TEXT NOT NULL DEFAULT '{}'")
+        delivery_columns = {row[1] for row in raw.execute("PRAGMA table_info(notification_deliveries)").fetchall()}
+        for column, definition in (
+            ("provider", "TEXT"),
+            ("next_attempt_at", "DATETIME"),
+            ("last_attempt_at", "DATETIME"),
+            ("accepted_at", "DATETIME"),
+            ("locked_at", "DATETIME"),
+            ("locked_by", "TEXT"),
+            ("error_classification", "TEXT"),
+        ):
+            if column not in delivery_columns:
+                raw.execute(f"ALTER TABLE notification_deliveries ADD COLUMN {column} {definition}")
+        raw.execute("UPDATE notification_deliveries SET next_attempt_at=COALESCE(next_attempt_at,queued_at,CURRENT_TIMESTAMP)")
+        raw.execute("CREATE INDEX IF NOT EXISTS idx_notification_outbox_lease ON notification_outbox(status,locked_at)")
+        raw.execute("CREATE INDEX IF NOT EXISTS idx_notifications_sync ON notifications(user_id,sync_revision)")
+        raw.execute("CREATE INDEX IF NOT EXISTS idx_notification_deliveries_push_ready ON notification_deliveries(channel,status,next_attempt_at)")
+        raw.execute("CREATE INDEX IF NOT EXISTS idx_notification_deliveries_lease ON notification_deliveries(channel,locked_at)")
+        self.connection.commit()
+
+    @staticmethod
+    def _parse_legacy_time(value: Any):
+        if value is None:
+            return None
+        candidate = str(value).strip()
+        for fmt in ("%H:%M:%S", "%H:%M"):
+            try:
+                return datetime.strptime(candidate, fmt).time()
+            except ValueError:
+                pass
+        return None
 
     def _maybe_migrate_user_password_hash(self) -> None:
         """Add ``password_hash`` column to ``users`` if missing."""
@@ -866,15 +1400,23 @@ class Database:
                 # at this point; reconnect once and retry this one
                 # statement rather than leaving every future call on
                 # this thread broken until the process restarts.
-                try:
-                    self.connection.close()
-                except SQLAlchemyError:
-                    pass
-                self._connect()
+                if self._transaction_depth > 0:
+                    # Retrying only this statement would silently discard all
+                    # earlier statements from the invalidated transaction and
+                    # could commit a partial schedule/Undo.  The transaction
+                    # context will roll back and reconnect after aborting the
+                    # complete unit of work.
+                    self._transaction_failed = True
+                    raise
+                self._reconnect_after_invalidation()
                 return self.connection.execute(stmt, params)
+            if self._transaction_depth > 0:
+                self._transaction_failed = True
             self.connection.rollback()
             raise
         except SQLAlchemyError as exc:
+            if self._transaction_depth > 0:
+                self._transaction_failed = True
             self.connection.rollback()
             raise exc
 
@@ -918,7 +1460,11 @@ class Database:
 
     def commit(self) -> None:
         """Commit the current transaction."""
-        self.connection.commit()
+        # Public mutation helpers call commit() for standalone use.  When one
+        # of those helpers participates in a larger domain transaction, the
+        # outer transaction must remain the only commit boundary.
+        if self._transaction_depth == 0:
+            self.connection.commit()
 
     def _insert_and_get_id(
         self,
@@ -969,12 +1515,121 @@ class Database:
                 db.execute("UPDATE ...", (value,))
             # Committed on success, rolled back on exception.
         """
+        outermost = self._transaction_depth == 0
+        if outermost:
+            self._transaction_failed = False
+        self._transaction_depth += 1
         try:
             yield
-            self.connection.commit()
         except Exception:
-            self.connection.rollback()
+            self._transaction_failed = True
             raise
+        finally:
+            self._transaction_depth -= 1
+            if outermost:
+                try:
+                    if self._transaction_failed:
+                        self.connection.rollback()
+                    else:
+                        self.connection.commit()
+                finally:
+                    invalidated = bool(
+                        self.connection is None
+                        or getattr(self.connection, "invalidated", False)
+                        or getattr(self.connection, "closed", False)
+                    )
+                    self._transaction_failed = False
+                    if invalidated:
+                        self._reconnect_after_invalidation()
+
+    def _enqueue_notification_event_no_commit(
+        self,
+        *,
+        user_id: str,
+        event_type: str,
+        payload: Optional[dict] = None,
+        task_id: Optional[int] = None,
+        segment_id: Optional[int] = None,
+        scheduled_date: Optional[date | str] = None,
+        segment_index: Optional[int] = None,
+        schedule_revision: Optional[int] = None,
+        schedule_operation_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        bump_sync_revision: bool = False,
+    ) -> tuple[str, bool, int]:
+        """Insert one provider-independent event on this transaction.
+
+        The local imports keep ``database`` independent from notification
+        policy/delivery modules at import time while still sharing this exact
+        connection and rollback boundary.
+        """
+        from notifications.domain import DomainEvent
+        from notifications.repository import NotificationRepository
+
+        event = DomainEvent.create(
+            user_id=user_id,
+            event_type=event_type,
+            payload=payload,
+            task_id=task_id,
+            segment_id=segment_id,
+            scheduled_date=scheduled_date,
+            segment_index=segment_index,
+            schedule_revision=schedule_revision,
+            schedule_operation_id=schedule_operation_id,
+            idempotency_key=idempotency_key,
+        )
+        return NotificationRepository(self).enqueue_event(
+            event, bump_sync_revision=bump_sync_revision,
+        )
+
+    @staticmethod
+    def _schedule_notification_payload(before_state: dict, after_state: dict) -> dict:
+        """Summarize one schedule operation without producing per-task events."""
+        def windows(state: dict) -> dict[int, tuple]:
+            grouped: dict[int, list[tuple]] = {}
+            for segment in state.get("segments", []):
+                task_id = int(segment["task_id"])
+                grouped.setdefault(task_id, []).append((
+                    str(segment.get("scheduled_date") or segment.get("effective_date") or ""),
+                    int(segment.get("segment_index") or 0),
+                    str(segment.get("scheduled_start") or ""),
+                    str(segment.get("scheduled_end") or ""),
+                ))
+            return {task_id: tuple(sorted(items)) for task_id, items in grouped.items()}
+
+        before = windows(before_state)
+        after = windows(after_state)
+        created = {int(task_id) for task_id in before_state.get("created_task_ids", [])}
+        task_ids = sorted(set(before) | set(after) | created)
+        adjusted = [task_id for task_id in task_ids if before.get(task_id) != after.get(task_id)]
+        unplaced = [
+            task_id for task_id in task_ids
+            if (before.get(task_id) or task_id in created) and not after.get(task_id)
+        ]
+        return {
+            "adjusted_count": len(adjusted),
+            "adjusted_task_ids": adjusted,
+            "unplaced_count": len(unplaced),
+            "unplaced_task_ids": unplaced,
+            "batched": True,
+            "actions": {"view_changes": True, "undo": True},
+        }
+
+    def _reconnect_after_invalidation(self) -> None:
+        """Replace an unusable connection outside an explicit transaction."""
+        if self.connection is not None:
+            try:
+                self.connection.close()
+            except SQLAlchemyError:
+                pass
+        if self.engine is not None:
+            try:
+                self.engine.dispose()
+            except SQLAlchemyError:
+                pass
+        self.connection = None
+        self.engine = None
+        self._connect()
 
     # =====================================================================
     # USERS
@@ -986,42 +1641,88 @@ class Database:
         email: str,
         display_name: str,
         timezone: str = "UTC",
-    ) -> str:
+        password_hash: Optional[str] = None,
+    ) -> Any:
         """
         Register a new user and initialise an empty profile.
 
-        Identity is owned by Firebase Auth, not this database — user_id
-        is the Firebase uid, passed in explicitly rather than generated
-        here. No password is stored; Firebase handles credentials.
+        Current databases use the caller-provided text identity. Historical
+        CoachAI SQLite databases used an auto-increment integer identity and
+        a required password column; those files are supported without a
+        destructive schema rewrite.
 
         Args:
-            user_id: The Firebase uid for this user.
+            user_id: Preferred external/text identity for this user.
             email: Unique email address.
             display_name: Human-readable name.
             timezone: IANA timezone name (default ``UTC``).
+            password_hash: Optional hash for local email/password login.
 
         Returns:
-            The ``user_id`` that was inserted (same value passed in).
+            The inserted identity. Historical SQLite schemas return their
+            generated integer identity; current schemas return ``user_id``.
 
         Raises:
             sqlite3.IntegrityError: If the user_id or email already exists.
         """
+        columns = {
+            column["name"]: column for column in inspect(self.engine).get_columns("users")
+        }
+        user_id_type = str(columns["user_id"]["type"]).upper()
+        legacy_integer_identity = self.is_sqlite and "INT" in user_id_type
+        password_column = columns.get("password_hash")
+
         with self.transaction():
-            self.execute(
-                """
-                INSERT INTO users (user_id, email, display_name, timezone)
-                VALUES (?, ?, ?, ?)
-                """,
-                (user_id, email, display_name, timezone),
-            )
+            if legacy_integer_identity:
+                if password_column is not None:
+                    # This marker is deliberately not a valid CoachAI password
+                    # hash, so a guest/Firebase-only identity cannot use local
+                    # email/password authentication.
+                    stored_hash = password_hash if password_hash is not None else "!"
+                    actual_user_id = self._insert_and_get_id(
+                        """
+                        INSERT INTO users (email, password_hash, display_name, timezone)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (email, stored_hash, display_name, timezone),
+                        "user_id",
+                    )
+                else:
+                    actual_user_id = self._insert_and_get_id(
+                        """
+                        INSERT INTO users (email, display_name, timezone)
+                        VALUES (?, ?, ?)
+                        """,
+                        (email, display_name, timezone),
+                        "user_id",
+                    )
+            else:
+                actual_user_id = user_id
+                if password_column is not None and password_hash is not None:
+                    self.execute(
+                        """
+                        INSERT INTO users
+                            (user_id, email, display_name, timezone, password_hash)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (actual_user_id, email, display_name, timezone, password_hash),
+                    )
+                else:
+                    self.execute(
+                        """
+                        INSERT INTO users (user_id, email, display_name, timezone)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (actual_user_id, email, display_name, timezone),
+                    )
 
             # Initialise empty profile so AI always has a row to read
             self.execute(
                 "INSERT INTO user_profiles (user_id) VALUES (?)",
-                (user_id,),
+                (actual_user_id,),
             )
 
-        return user_id
+        return actual_user_id
 
     def get_or_create_user(
         self,
@@ -1052,13 +1753,13 @@ class Database:
         if existing is not None:
             return existing
 
-        self.create_user(
+        created_user_id = self.create_user(
             user_id=user_id,
             email=email,
             display_name=display_name,
             timezone=timezone,
         )
-        return self.get_user(user_id)
+        return self.get_user(created_user_id)
 
     def get_user(self, user_id: str) -> Optional[sqlite3.Row]:
         """
@@ -1279,6 +1980,53 @@ class Database:
         order_index: int = 0,
         is_fixed_time: bool = False,
         is_break: bool = False,
+        calendar_provenance: str = "legacy_unknown",
+        google_event_id: Optional[str] = None,
+        google_calendar_id: Optional[str] = None,
+        earliest_start: Optional[datetime] = None,
+        deadline: Optional[datetime] = None,
+    ) -> int:
+        """Add a task and its domain event in one rollback boundary."""
+        with self.transaction():
+            return self._add_task_no_commit(
+                plan_id=plan_id,
+                user_id=user_id,
+                title=title,
+                category_id=category_id,
+                description=description,
+                priority=priority,
+                estimated_minutes=estimated_minutes,
+                scheduled_start=scheduled_start,
+                scheduled_end=scheduled_end,
+                order_index=order_index,
+                is_fixed_time=is_fixed_time,
+                is_break=is_break,
+                calendar_provenance=calendar_provenance,
+                google_event_id=google_event_id,
+                google_calendar_id=google_calendar_id,
+                earliest_start=earliest_start,
+                deadline=deadline,
+            )
+
+    def _add_task_no_commit(
+        self,
+        plan_id: int,
+        user_id: str,
+        title: str,
+        category_id: Optional[int] = None,
+        description: Optional[str] = None,
+        priority: int = 3,
+        estimated_minutes: int = 30,
+        scheduled_start: Optional[str] = None,
+        scheduled_end: Optional[str] = None,
+        order_index: int = 0,
+        is_fixed_time: bool = False,
+        is_break: bool = False,
+        calendar_provenance: str = "legacy_unknown",
+        google_event_id: Optional[str] = None,
+        google_calendar_id: Optional[str] = None,
+        earliest_start: Optional[datetime] = None,
+        deadline: Optional[datetime] = None,
     ) -> int:
         """
         Add a task to an existing plan.
@@ -1317,22 +2065,29 @@ class Database:
                 user_id.
         """
         owner_row = self.fetch_one(
-            "SELECT plan_id FROM plans WHERE plan_id = ? AND user_id = ?",
+            "SELECT plan_id,plan_date FROM plans WHERE plan_id = ? AND user_id = ?",
             (plan_id, user_id),
         )
         if owner_row is None:
             raise OwnershipError(
                 f"Plan {plan_id} not found or not owned by user {user_id!r}."
             )
+        earliest_value = self._parse_local_planning_datetime(earliest_start)
+        deadline_value = self._parse_local_planning_datetime(deadline)
+        self._validate_user_local_planning_datetime(user_id, earliest_value)
+        self._validate_user_local_planning_datetime(user_id, deadline_value)
+        if earliest_value and deadline_value and earliest_value > deadline_value:
+            raise ValueError("earliest_start must be on or before deadline.")
 
         task_id = self._insert_and_get_id(
             """
             INSERT INTO tasks (
                 plan_id, category_id, title, description,
                 priority, estimated_minutes, scheduled_start,
-                scheduled_end, order_index, is_fixed_time, is_break
+                scheduled_end, order_index, is_fixed_time, is_break, google_event_id,
+                earliest_start, deadline
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 plan_id,
@@ -1346,11 +2101,77 @@ class Database:
                 order_index,
                 1 if is_fixed_time else 0,
                 1 if is_break else 0,
+                google_event_id,
+                earliest_value.isoformat(sep=" ") if earliest_value else None,
+                deadline_value.isoformat(sep=" ") if deadline_value else None,
             ),
             pk_column="task_id",
         )
+        start_t = self._parse_legacy_time(scheduled_start)
+        end_t = self._parse_legacy_time(scheduled_end)
+        if (scheduled_start is None) != (scheduled_end is None):
+            self.connection.rollback()
+            raise ValueError("New scheduled tasks require both start and end times.")
+        if scheduled_start is not None and (start_t is None or end_t is None or end_t <= start_t):
+            self.connection.rollback()
+            raise ValueError("New scheduled tasks require a valid same-day interval.")
+        if start_t is not None and end_t is not None and end_t > start_t:
+            if calendar_provenance not in {"imported", "coachai_created", "legacy_unknown"}:
+                self.connection.rollback()
+                raise ValueError(f"Invalid Calendar provenance: {calendar_provenance!r}")
+            self.execute(
+                """INSERT INTO task_segments
+                   (task_id,segment_index,scheduled_start,scheduled_end,scheduled_date,google_event_id,
+                    google_calendar_id,calendar_provenance)
+                   VALUES (?,0,?,?,?,?,?,?)""",
+                (
+                    task_id, start_t.strftime("%H:%M:%S"), end_t.strftime("%H:%M:%S"),
+                    str(owner_row["plan_date"]), google_event_id, google_calendar_id, calendar_provenance,
+                ),
+            )
+        self.execute(
+            "UPDATE plans SET schedule_revision=schedule_revision+1 WHERE plan_id=? AND user_id=?",
+            (plan_id, user_id),
+        )
+        revision = self.fetch_one(
+            "SELECT schedule_revision FROM plans WHERE plan_id=? AND user_id=?",
+            (plan_id, user_id),
+        )
+        self._enqueue_notification_event_no_commit(
+            user_id=user_id,
+            event_type="TASK_CREATED",
+            task_id=task_id,
+            scheduled_date=str(owner_row["plan_date"]),
+            schedule_revision=int(revision["schedule_revision"]),
+            payload={"task_title": title, "plan_id": plan_id},
+            idempotency_key=f"task-created:{task_id}",
+            bump_sync_revision=True,
+        )
         self.commit()
         return task_id
+
+    @staticmethod
+    def _parse_local_planning_datetime(value: Any) -> Optional[datetime]:
+        if value is None or value == "":
+            return None
+        parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+        if parsed.tzinfo is not None:
+            raise ValueError("Planning constraints must be user-local wall times without a UTC offset.")
+        return parsed.replace(microsecond=0)
+
+    def _validate_user_local_planning_datetime(
+        self, user_id: str, value: Optional[datetime],
+    ) -> None:
+        """Reject nonexistent DST wall times in the task owner's timezone."""
+        if value is None:
+            return
+        zone = safe_zoneinfo(get_user_timezone(self, user_id))
+        aware = value.replace(tzinfo=zone, fold=0)
+        round_trip = aware.astimezone(timezone.utc).astimezone(zone).replace(tzinfo=None)
+        if round_trip != value:
+            raise ValueError(
+                f"The local planning time {value.isoformat()} does not exist in timezone {zone.key}."
+            )
 
     def _update_task_no_commit(
         self,
@@ -1387,6 +2208,10 @@ class Database:
             "order_index",
             "category_id",
             "plan_id",
+            "is_fixed_time",
+            "is_break",
+            "earliest_start",
+            "deadline",
         }
         updates = {k: v for k, v in kwargs.items() if k in allowed}
         if not updates:
@@ -1452,12 +2277,107 @@ class Database:
                 user_id, or (when moving a task) if the destination
                 plan_id isn't owned by user_id either.
         """
+        if "scheduled_start" in kwargs or "scheduled_end" in kwargs:
+            raise ValueError(
+                "scheduled_start/end are compatibility projections; use segment persistence APIs."
+            )
+        if "plan_id" in kwargs:
+            raise ValueError("Use move_task_unscheduled() when moving a task between plans.")
+        for key in ("earliest_start", "deadline"):
+            if key in kwargs:
+                parsed = self._parse_local_planning_datetime(kwargs[key])
+                kwargs[key] = parsed.isoformat(sep=" ") if parsed else None
+        if "earliest_start" in kwargs or "deadline" in kwargs:
+            current = self.get_task(task_id, user_id)
+            if current is None:
+                raise OwnershipError(f"Task {task_id} not found or not owned by user {user_id!r}.")
+            earliest = self._parse_local_planning_datetime(
+                kwargs.get("earliest_start", current["earliest_start"])
+            )
+            deadline = self._parse_local_planning_datetime(kwargs.get("deadline", current["deadline"]))
+            self._validate_user_local_planning_datetime(user_id, earliest)
+            self._validate_user_local_planning_datetime(user_id, deadline)
+            if earliest and deadline and earliest > deadline:
+                raise ValueError("earliest_start must be on or before deadline.")
         try:
-            self._update_task_no_commit(task_id, user_id, **kwargs)
+            original = self.get_task(task_id, user_id)
+            if original is None:
+                raise OwnershipError(
+                    f"Task {task_id} not found or not owned by user {user_id!r}."
+                )
+            with self.transaction():
+                self._update_task_no_commit(task_id, user_id, **kwargs)
+                resulting_fixed = bool(kwargs.get("is_fixed_time", original["is_fixed_time"]))
+                scheduling_shape_changed = (
+                    "estimated_minutes" in kwargs
+                    or "is_fixed_time" in kwargs
+                    or "is_break" in kwargs
+                )
+                if scheduling_shape_changed:
+                    existing_segments = self.get_task_segments(task_id, user_id)
+                    self.execute("DELETE FROM task_segments WHERE task_id=?", (task_id,))
+                    replacement = None
+                    if resulting_fixed and len(existing_segments) == 1:
+                        start = self._parse_legacy_time(existing_segments[0]["scheduled_start"])
+                        duration = int(kwargs.get("estimated_minutes", original["estimated_minutes"]))
+                        end_dt = datetime.combine(date.min, start) + timedelta(minutes=duration)
+                        if end_dt.date() == date.min and end_dt.time() <= WORK_DAY_END:
+                            replacement = (start, end_dt.time(), existing_segments[0])
+                    if replacement is not None:
+                        start, end, old_segment = replacement
+                        self.execute(
+                            """INSERT INTO task_segments
+                               (task_id,segment_index,scheduled_start,scheduled_end,scheduled_date,google_event_id,
+                                google_calendar_id,calendar_provenance,calendar_sync_status,calendar_sync_error)
+                               VALUES (?,0,?,?,?,?,?,?,?,?)""",
+                            (
+                                task_id, start.strftime("%H:%M:%S"), end.strftime("%H:%M:%S"),
+                                str(old_segment["effective_date"]),
+                                old_segment["google_event_id"], old_segment["google_calendar_id"],
+                                old_segment["calendar_provenance"],
+                                "pending_update" if old_segment["calendar_provenance"] == "coachai_created" else old_segment["calendar_sync_status"],
+                                old_segment["calendar_sync_error"],
+                            ),
+                        )
+                        self._update_task_no_commit(
+                            task_id, user_id,
+                            scheduled_start=start.strftime("%H:%M:%S"),
+                            scheduled_end=end.strftime("%H:%M:%S"),
+                        )
+                    else:
+                        self._update_task_no_commit(
+                            task_id, user_id, scheduled_start=None, scheduled_end=None,
+                        )
+
+                affected_plans = {int(original["plan_id"])}
+                if "plan_id" in kwargs:
+                    affected_plans.add(int(kwargs["plan_id"]))
+                for plan_id in affected_plans:
+                    self.execute(
+                        "UPDATE plans SET schedule_revision=schedule_revision+1 WHERE plan_id=? AND user_id=?",
+                        (plan_id, user_id),
+                    )
+                plan_after = self.get_plan_by_id(int(original["plan_id"]), user_id)
+                self._enqueue_notification_event_no_commit(
+                    user_id=user_id,
+                    event_type="TASK_UPDATED",
+                    task_id=task_id,
+                    scheduled_date=str(plan_after["plan_date"]),
+                    schedule_revision=int(plan_after["schedule_revision"] or 0),
+                    payload={
+                        "task_title": str(kwargs.get("title", original["title"])),
+                        "plan_id": int(original["plan_id"]),
+                        "changed_fields": sorted(kwargs),
+                    },
+                    idempotency_key=(
+                        f"task-updated:{task_id}:{plan_after['schedule_revision']}:"
+                        f"{','.join(sorted(kwargs))}"
+                    ),
+                    bump_sync_revision=True,
+                )
         except OwnershipError:
             self.connection.rollback()
             raise
-        self.commit()
 
     def delete_task(self, task_id: int, user_id: str) -> None:
         """
@@ -1472,20 +2392,40 @@ class Database:
             OwnershipError: If task_id doesn't exist or isn't owned by
                 user_id.
         """
-        result = self.execute(
-            """
-            DELETE FROM tasks
-            WHERE task_id = ?
-              AND plan_id IN (SELECT plan_id FROM plans WHERE user_id = ?)
-            """,
-            (task_id, user_id),
-        )
-        if result.rowcount == 0:
-            self.connection.rollback()
-            raise OwnershipError(
-                f"Task {task_id} not found or not owned by user {user_id!r}."
+        with self.transaction():
+            task = self.get_task(task_id, user_id)
+            if task is None:
+                raise OwnershipError(
+                    f"Task {task_id} not found or not owned by user {user_id!r}."
+                )
+            plan = self.get_plan_by_id(int(task["plan_id"]), user_id)
+            result = self.execute(
+                """
+                DELETE FROM tasks
+                WHERE task_id = ?
+                  AND plan_id IN (SELECT plan_id FROM plans WHERE user_id = ?)
+                """,
+                (task_id, user_id),
             )
-        self.commit()
+            if result.rowcount == 0:
+                raise OwnershipError(
+                    f"Task {task_id} not found or not owned by user {user_id!r}."
+                )
+            self.execute(
+                "UPDATE plans SET schedule_revision=schedule_revision+1 WHERE plan_id=? AND user_id=?",
+                (task["plan_id"], user_id),
+            )
+            revision = int(plan["schedule_revision"] or 0) + 1
+            self._enqueue_notification_event_no_commit(
+                user_id=user_id,
+                event_type="TASK_DELETED",
+                task_id=task_id,
+                scheduled_date=str(plan["plan_date"]),
+                schedule_revision=revision,
+                payload={"task_title": str(task["title"]), "plan_id": int(task["plan_id"])},
+                idempotency_key=f"task-deleted:{task_id}:{revision}",
+                bump_sync_revision=True,
+            )
 
     def get_tasks_by_plan(self, plan_id: int, user_id: str) -> list[sqlite3.Row]:
         """
@@ -1502,8 +2442,9 @@ class Database:
         """
         return self.fetch_all(
             """
-            SELECT t.* FROM tasks t
+            SELECT t.*, c.name AS category_name FROM tasks t
             JOIN plans p ON t.plan_id = p.plan_id
+            LEFT JOIN categories c ON t.category_id = c.category_id
             WHERE t.plan_id = ? AND p.user_id = ?
             ORDER BY t.order_index ASC, t.task_id ASC
             """,
@@ -1815,6 +2756,22 @@ class Database:
         failure_reason: Optional[str] = None,
         actual_minutes: Optional[int] = None,
     ) -> None:
+        """Update lifecycle state and enqueue its event atomically."""
+        with self.transaction():
+            self._update_task_status_no_commit(
+                task_id, user_id, status,
+                failure_reason=failure_reason,
+                actual_minutes=actual_minutes,
+            )
+
+    def _update_task_status_no_commit(
+        self,
+        task_id: int,
+        user_id: str,
+        status: str,
+        failure_reason: Optional[str] = None,
+        actual_minutes: Optional[int] = None,
+    ) -> None:
         """
         Update a task's status.
 
@@ -1842,6 +2799,12 @@ class Database:
             OwnershipError: If task_id doesn't exist or isn't owned by
                 user_id.
         """
+        before_task = self.get_task(task_id, user_id)
+        if before_task is None:
+            raise OwnershipError(
+                f"Task {task_id} not found or not owned by user {user_id!r}."
+            )
+        previous_status = str(before_task["status"])
         now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
         now_utc_str = now_utc.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1858,9 +2821,17 @@ class Database:
                 (status, now_utc_str, now_utc_str, task_id, user_id),
             )
             if result.rowcount == 0:
-                self.connection.rollback()
                 raise OwnershipError(
                     f"Task {task_id} not found or not owned by user {user_id!r}."
+                )
+            if previous_status != status:
+                self._enqueue_notification_event_no_commit(
+                    user_id=user_id,
+                    event_type="TASK_STARTED",
+                    task_id=task_id,
+                    payload={"task_title": str(before_task["title"]), "previous_status": previous_status},
+                    idempotency_key=f"task-status:{task_id}:{status}:{now_utc.isoformat()}",
+                    bump_sync_revision=True,
                 )
             self.commit()
             return
@@ -1896,9 +2867,23 @@ class Database:
             (status, failure_reason, actual_minutes, completed_at, now_utc_str, task_id, user_id),
         )
         if result.rowcount == 0:
-            self.connection.rollback()
             raise OwnershipError(
                 f"Task {task_id} not found or not owned by user {user_id!r}."
+            )
+        event_type = {"completed": "TASK_COMPLETED", "failed": "TASK_FAILED"}.get(status)
+        if event_type and previous_status != status:
+            self._enqueue_notification_event_no_commit(
+                user_id=user_id,
+                event_type=event_type,
+                task_id=task_id,
+                payload={
+                    "task_title": str(before_task["title"]),
+                    "previous_status": previous_status,
+                    "actual_minutes": actual_minutes,
+                    "failure_reason": failure_reason,
+                },
+                idempotency_key=f"task-status:{task_id}:{status}:{now_utc.isoformat()}",
+                bump_sync_revision=True,
             )
         self.commit()
 
@@ -2522,7 +3507,7 @@ class Database:
     def mark_task_exported(self, task_id: int, user_id: str) -> None:
         """
         Stamp a task as freshly exported to Google Calendar (its
-        scheduled_start/scheduled_end at this exact moment are now
+        Segment identities at this exact moment are now
         reflected there). Used for the "update an existing event" export
         path, where google_event_id doesn't change but the export
         timestamp still needs to move forward — this is what lets the
@@ -2707,3 +3692,1077 @@ class Database:
             """,
             (plan_id, user_id),
         )
+
+    # ------------------------------------------------------------------
+    # Segmented Smart Scheduling
+    # ------------------------------------------------------------------
+
+    def get_task_segments(self, task_id: int, user_id: str) -> list[sqlite3.Row]:
+        """Return a task's ordered segments without leaking cross-tenant rows."""
+        return self.fetch_all(
+            """
+            SELECT s.*, COALESCE(s.scheduled_date,p.plan_date) AS effective_date FROM task_segments s
+            JOIN tasks t ON t.task_id = s.task_id
+            JOIN plans p ON p.plan_id = t.plan_id
+            WHERE s.task_id = ? AND p.user_id = ?
+            ORDER BY s.segment_index
+            """,
+            (task_id, user_id),
+        )
+
+    def get_plan_segments(self, plan_id: int, user_id: str) -> list[sqlite3.Row]:
+        """Return every segment for an owned plan in chronological order."""
+        return self.fetch_all(
+            """
+            SELECT s.*, COALESCE(s.scheduled_date,p.plan_date) AS effective_date,
+                   t.plan_id, t.title, t.is_fixed_time, t.is_break,
+                   t.estimated_minutes, t.category_id, t.order_index
+            FROM task_segments s
+            JOIN tasks t ON t.task_id = s.task_id
+            JOIN plans p ON p.plan_id = t.plan_id
+            WHERE t.plan_id = ? AND p.user_id = ?
+            ORDER BY effective_date, s.scheduled_start, t.order_index, s.segment_index
+            """,
+            (plan_id, user_id),
+        )
+
+    def get_tasks_with_segments(self, plan_id: int, user_id: str) -> list[dict]:
+        """Load logical tasks once, each with a nested ordered segment list."""
+        result: list[dict] = []
+        for row in self.get_tasks_by_plan(plan_id, user_id):
+            task = dict(row)
+            task["segments"] = [dict(segment) for segment in self.get_task_segments(task["task_id"], user_id)]
+            # Never expose a divergent legacy cache as authoritative.  The
+            # envelope is projected from segments at the read boundary; zero
+            # segments means unscheduled even if an invalid legacy value is
+            # intentionally retained on the raw row for diagnostics.
+            task["scheduled_start"] = (
+                task["segments"][0]["scheduled_start"] if task["segments"] else None
+            )
+            task["scheduled_end"] = (
+                task["segments"][-1]["scheduled_end"] if task["segments"] else None
+            )
+            result.append(task)
+        return result
+
+    def get_segments_by_task_ids(self, task_ids: list[int], user_id: str) -> list[sqlite3.Row]:
+        """Batch-load segments for owned logical tasks without duplicating tasks."""
+        if not task_ids:
+            return []
+        placeholders = ",".join("?" for _ in task_ids)
+        return self.fetch_all(
+            f"""SELECT s.*, COALESCE(s.scheduled_date,p.plan_date) AS effective_date FROM task_segments s
+                JOIN tasks t ON t.task_id=s.task_id
+                JOIN plans p ON p.plan_id=t.plan_id
+                WHERE s.task_id IN ({placeholders}) AND p.user_id=?
+                ORDER BY s.task_id,effective_date,s.segment_index""",
+            (*task_ids, user_id),
+        )
+
+    def _schedule_snapshot(self, plan_id: int, user_id: str) -> dict:
+        plan = self.get_plan_by_id(plan_id, user_id)
+        if plan is None:
+            raise OwnershipError(f"Plan {plan_id} not found or not owned by user {user_id!r}.")
+        tasks_state = []
+        for task in self.get_tasks_by_plan(plan_id, user_id):
+            tasks_state.append({
+                "task_id": task["task_id"],
+                "scheduled_start": str(task["scheduled_start"]) if task["scheduled_start"] is not None else None,
+                "scheduled_end": str(task["scheduled_end"]) if task["scheduled_end"] is not None else None,
+            })
+        segment_state = []
+        for segment in self.get_plan_segments(plan_id, user_id):
+            segment_state.append({
+                key: (str(segment[key]) if segment[key] is not None else None)
+                for key in (
+                    "task_id", "segment_index", "scheduled_start", "scheduled_end",
+                    "effective_date",
+                    "google_event_id", "google_calendar_id", "calendar_provenance",
+                    "calendar_sync_status", "calendar_sync_error",
+                )
+            })
+        return {"tasks": tasks_state, "segments": segment_state}
+
+    def replace_plan_segments(
+        self,
+        plan_id: int,
+        user_id: str,
+        segments_by_task: dict[int, list[dict]],
+        expected_revision: int,
+        before_state_override: Optional[dict] = None,
+    ) -> str:
+        """Atomically replace an owned plan's schedule and record one Undo unit.
+
+        ``segments_by_task`` must contain every logical task in the plan.  An
+        empty list explicitly leaves a task unplaced.  Calendar identity is
+        retained only when task, segment index, start, and end are unchanged.
+        """
+        operation_id = uuid.uuid4().hex
+        with self.transaction():
+            plan = self.get_plan_by_id(plan_id, user_id)
+            if plan is None:
+                raise OwnershipError(f"Plan {plan_id} not found or not owned by user {user_id!r}.")
+            current_revision = int(plan["schedule_revision"] or 0)
+            if current_revision != int(expected_revision):
+                raise StaleScheduleError(
+                    f"Plan {plan_id} changed from revision {expected_revision} to {current_revision}."
+                )
+            tasks_for_plan = {int(row["task_id"]): row for row in self.get_tasks_by_plan(plan_id, user_id)}
+            if set(segments_by_task) != set(tasks_for_plan):
+                raise ValueError("A complete plan schedule must include every logical task exactly once.")
+            self._validate_segment_payload(segments_by_task, tasks_for_plan)
+            before_state = (
+                before_state_override
+                if before_state_override is not None
+                else self._schedule_snapshot(plan_id, user_id)
+            )
+            old_segments = {
+                (int(row["task_id"]), int(row["segment_index"])): row
+                for row in self.get_plan_segments(plan_id, user_id)
+            }
+
+            revision_update = self.execute(
+                """UPDATE plans SET schedule_revision = schedule_revision + 1
+                   WHERE plan_id = ? AND user_id = ? AND schedule_revision = ?""",
+                (plan_id, user_id, current_revision),
+            )
+            if revision_update.rowcount != 1:
+                raise StaleScheduleError(f"Plan {plan_id} changed while its schedule was being saved.")
+
+            self.execute(
+                "DELETE FROM task_segments WHERE task_id IN (SELECT task_id FROM tasks WHERE plan_id = ?)",
+                (plan_id,),
+            )
+            for task_id, proposed in segments_by_task.items():
+                ordered = sorted(proposed, key=lambda item: int(item["segment_index"]))
+                for expected_index, segment in enumerate(ordered):
+                    if int(segment["segment_index"]) != expected_index:
+                        raise ValueError(f"Task {task_id} segment indexes must be contiguous from zero.")
+                    key = (task_id, expected_index)
+                    old = old_segments.get(key)
+                    provenance = segment.get("calendar_provenance") or (
+                        old["calendar_provenance"] if old is not None else "legacy_unknown"
+                    )
+                    if provenance not in {"imported", "coachai_created", "legacy_unknown"}:
+                        raise ValueError(f"Invalid Calendar provenance: {provenance!r}")
+                    sync_status = segment.get(
+                        "calendar_sync_status",
+                        old["calendar_sync_status"] if old is not None else "not_synced",
+                    )
+                    if (
+                        old is not None
+                        and old["calendar_provenance"] == "coachai_created"
+                        and (
+                            str(old["scheduled_start"]) != str(segment["scheduled_start"])
+                            or str(old["scheduled_end"]) != str(segment["scheduled_end"])
+                        )
+                    ):
+                        sync_status = "pending_update"
+                    self.execute(
+                        """INSERT INTO task_segments
+                           (task_id,segment_index,scheduled_start,scheduled_end,
+                            scheduled_date,google_event_id,google_calendar_id,calendar_provenance,
+                            calendar_sync_status,calendar_sync_error)
+                           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            task_id, expected_index, segment["scheduled_start"], segment["scheduled_end"],
+                            segment.get("scheduled_date") or str(plan["plan_date"]),
+                            segment.get("google_event_id", old["google_event_id"] if old is not None else None),
+                            segment.get("google_calendar_id", old["google_calendar_id"] if old is not None else None),
+                            provenance,
+                            sync_status,
+                            segment.get("calendar_sync_error", old["calendar_sync_error"] if old is not None else None),
+                        ),
+                    )
+                start_cache = ordered[0]["scheduled_start"] if ordered else None
+                end_cache = ordered[-1]["scheduled_end"] if ordered else None
+                self._update_task_no_commit(
+                    task_id, user_id, scheduled_start=start_cache, scheduled_end=end_cache
+                )
+
+            after_state = self._schedule_snapshot(plan_id, user_id)
+            self.execute(
+                """INSERT INTO schedule_operations
+                   (operation_id,plan_id,user_id,base_revision,result_revision,
+                    before_state,after_state,status)
+                   VALUES (?,?,?,?,?,?,?,'applied')""",
+                (
+                    operation_id, plan_id, user_id, current_revision, current_revision + 1,
+                    json.dumps(before_state, sort_keys=True), json.dumps(after_state, sort_keys=True),
+                ),
+            )
+            payload = self._schedule_notification_payload(before_state, after_state)
+            payload.update({
+                "plan_id": plan_id,
+                "base_revision": current_revision,
+                "result_revision": current_revision + 1,
+            })
+            self._enqueue_notification_event_no_commit(
+                user_id=user_id,
+                event_type="SCHEDULE_OPERATION_APPLIED",
+                scheduled_date=str(plan["plan_date"]),
+                schedule_revision=current_revision + 1,
+                schedule_operation_id=operation_id,
+                payload=payload,
+                idempotency_key=f"schedule-applied:{operation_id}",
+                bump_sync_revision=True,
+            )
+        return operation_id
+
+    def _validate_segment_payload(
+        self,
+        segments_by_task: dict[int, list[dict]],
+        tasks_for_plan: dict[int, dict],
+    ) -> None:
+        """Reject invalid schedules at the persistence boundary.
+
+        The minimum-duration rule applies to newly allocated flexible-task
+        segments.  Fixed tasks and preserved historical rows may legitimately
+        be shorter and are not retroactively rewritten.
+        """
+        intervals: list[tuple[time, time, int, bool]] = []
+        boundary = WORK_DAY_END
+        for task_id, proposed in segments_by_task.items():
+            task = tasks_for_plan[task_id]
+            is_fixed = bool(task.get("is_fixed_time"))
+            if len(proposed) > MAX_SEGMENTS_PER_TASK:
+                raise ValueError(f"Task {task_id} exceeds MAX_SEGMENTS_PER_TASK.")
+            if is_fixed and len(proposed) != 1:
+                raise ValueError(f"Fixed task {task_id} must retain exactly one immutable segment.")
+
+            total_seconds = 0
+            task_intervals: list[tuple[time, time]] = []
+            ordered = sorted(proposed, key=lambda item: int(item.get("segment_index", -1)))
+            for expected_index, segment in enumerate(ordered):
+                if int(segment.get("segment_index", -1)) != expected_index:
+                    raise ValueError(f"Task {task_id} segment indexes must be contiguous from zero.")
+                start = self._parse_legacy_time(segment.get("scheduled_start"))
+                end = self._parse_legacy_time(segment.get("scheduled_end"))
+                if start is None or end is None or end <= start or end > boundary:
+                    raise ValueError(f"Task {task_id} contains an invalid same-day segment.")
+                seconds = int(
+                    (datetime.combine(date.min, end) - datetime.combine(date.min, start)).total_seconds()
+                )
+                if not is_fixed and seconds < MIN_SEGMENT_MINUTES * 60:
+                    raise ValueError(f"Task {task_id} contains a newly allocated segment below the minimum.")
+                if task_intervals and start < task_intervals[-1][1]:
+                    raise ValueError(f"Task {task_id} contains overlapping segments.")
+                task_intervals.append((start, end))
+                intervals.append((start, end, task_id, is_fixed))
+                total_seconds += seconds
+
+            if proposed and not is_fixed and total_seconds != int(task["estimated_minutes"]) * 60:
+                raise ValueError(f"Task {task_id} segments do not preserve its estimated duration.")
+            if is_fixed:
+                cached_start = self._parse_legacy_time(task.get("scheduled_start"))
+                cached_end = self._parse_legacy_time(task.get("scheduled_end"))
+                if cached_start is None or cached_end is None:
+                    raise ValueError(f"Fixed task {task_id} has no valid immutable window.")
+                if task_intervals[0] != (cached_start, cached_end):
+                    raise ValueError(f"Fixed task {task_id} cannot be moved by Smart Scheduling.")
+
+        intervals.sort(key=lambda item: (item[0], item[1], item[2]))
+        for index, (start, end, task_id, fixed) in enumerate(intervals):
+            for other_start, other_end, other_id, other_fixed in intervals[index + 1:]:
+                if other_start >= end:
+                    break
+                if task_id != other_id and start < other_end and not (fixed and other_fixed):
+                    raise ValueError(f"Tasks {task_id} and {other_id} overlap illegally.")
+
+    def get_plans_in_range(self, user_id: str, start_date: date, end_date: date) -> list[sqlite3.Row]:
+        """Return tenant-owned daily plans in an inclusive local-date range."""
+        return self.fetch_all(
+            """SELECT * FROM plans WHERE user_id=? AND plan_date BETWEEN ? AND ?
+               ORDER BY plan_date,plan_id""",
+            (user_id, start_date.isoformat(), end_date.isoformat()),
+        )
+
+    def get_future_planning_tasks(
+        self, user_id: str, start_date: date, end_date: date,
+    ) -> list[dict]:
+        """Load each logical task once with date-aware physical segments."""
+        plans_in_scope = self.get_plans_in_range(user_id, start_date, end_date)
+        result: list[dict] = []
+        for plan in plans_in_scope:
+            for row in self.get_tasks_by_plan(int(plan["plan_id"]), user_id):
+                task = dict(row)
+                task["plan_date"] = str(plan["plan_date"])
+                task["schedule_revision"] = int(plan["schedule_revision"] or 0)
+                task["segments"] = [dict(s) for s in self.get_task_segments(int(task["task_id"]), user_id)]
+                result.append(task)
+        return result
+
+    def get_segments_in_date_range(
+        self, user_id: str, start_date: date, end_date: date,
+    ) -> list[sqlite3.Row]:
+        """Load tenant-owned physical occupancy by effective local date."""
+        return self.fetch_all(
+            """SELECT s.*,COALESCE(s.scheduled_date,p.plan_date) AS effective_date,
+                      t.plan_id,t.is_fixed_time,t.is_break,t.status,t.started_at
+               FROM task_segments s JOIN tasks t ON t.task_id=s.task_id
+               JOIN plans p ON p.plan_id=t.plan_id
+               WHERE p.user_id=? AND COALESCE(s.scheduled_date,p.plan_date) BETWEEN ? AND ?
+               ORDER BY effective_date,s.scheduled_start,s.task_id,s.segment_index""",
+            (user_id, start_date.isoformat(), end_date.isoformat()),
+        )
+
+    def _future_schedule_snapshot(
+        self, plan_ids: list[int], task_ids: list[int], user_id: str,
+    ) -> dict:
+        revisions = {}
+        for plan_id in plan_ids:
+            plan = self.get_plan_by_id(plan_id, user_id)
+            if plan is None:
+                raise OwnershipError("Future-planning scope is not owned by this user.")
+            revisions[str(plan_id)] = int(plan["schedule_revision"] or 0)
+        task_state = []
+        segment_state = []
+        for task_id in sorted(task_ids):
+            task = self.get_task(task_id, user_id)
+            if task is None:
+                raise OwnershipError("A future-planning task is not owned by this user.")
+            task_state.append({
+                "task_id": task_id,
+                "scheduled_start": str(task["scheduled_start"]) if task["scheduled_start"] is not None else None,
+                "scheduled_end": str(task["scheduled_end"]) if task["scheduled_end"] is not None else None,
+                "estimated_minutes": int(task["estimated_minutes"]),
+                "priority": int(task["priority"]),
+                "earliest_start": str(task["earliest_start"]) if task["earliest_start"] is not None else None,
+                "deadline": str(task["deadline"]) if task["deadline"] is not None else None,
+                "status": str(task["status"]),
+                "actual_minutes": task["actual_minutes"],
+                "started_at": str(task["started_at"]) if task["started_at"] is not None else None,
+            })
+            for segment in self.get_task_segments(task_id, user_id):
+                segment_state.append({
+                    "task_id": task_id,
+                    "segment_index": int(segment["segment_index"]),
+                    "scheduled_start": str(segment["scheduled_start"]),
+                    "scheduled_end": str(segment["scheduled_end"]),
+                    "scheduled_date": str(segment["effective_date"]),
+                    "google_event_id": segment["google_event_id"],
+                    "google_calendar_id": segment["google_calendar_id"],
+                    "calendar_provenance": segment["calendar_provenance"],
+                    "calendar_sync_status": segment["calendar_sync_status"],
+                    "calendar_sync_error": segment["calendar_sync_error"],
+                })
+        return {
+            "kind": "future_planning_v1", "plan_revisions": revisions,
+            "tasks": task_state, "segments": segment_state,
+        }
+
+    def apply_future_plan(
+        self,
+        user_id: str,
+        segments_by_task: dict[int, list[dict]],
+        expected_revisions: dict[int, int],
+        expected_task_states: dict[int, dict],
+        task_updates: Optional[dict[int, dict]] = None,
+        *,
+        draft_tasks: Optional[dict[str, dict]] = None,
+        draft_segments: Optional[dict[str, list[dict]]] = None,
+        anchor_plan_date: Optional[date] = None,
+        expected_anchor_plan_id: Optional[int] = None,
+    ) -> str:
+        """Atomically materialize drafts and persist one future-plan Undo unit."""
+        drafts = {str(key): dict(value) for key, value in (draft_tasks or {}).items()}
+        draft_payloads = {str(key): list(value) for key, value in (draft_segments or {}).items()}
+        if set(drafts) != set(draft_payloads):
+            raise ValueError("Every draft task requires exactly one preview segment payload.")
+        if not expected_revisions and not drafts:
+            raise ValueError("A future plan requires an owned plan or at least one draft task.")
+        if drafts and anchor_plan_date is None:
+            raise ValueError("Draft tasks require an anchor planning date.")
+        operation_id = uuid.uuid4().hex
+        effective_revisions = {int(key): int(value) for key, value in expected_revisions.items()}
+        plan_ids = sorted(effective_revisions)
+        normalized_updates = {int(key): dict(value) for key, value in (task_updates or {}).items()}
+        existing_task_ids = sorted(int(value) for value in segments_by_task)
+        if set(normalized_updates) - set(existing_task_ids):
+            raise ValueError("Task constraints may only be updated for tasks in the future plan.")
+        with self.transaction():
+            if self.fetch_one("SELECT user_id FROM users WHERE user_id=?", (user_id,)) is None:
+                raise OwnershipError("Future-planning user does not exist.")
+            for plan_id in list(plan_ids):
+                plan = self.get_plan_by_id(plan_id, user_id)
+                if plan is None:
+                    raise OwnershipError("Future-planning scope is not owned by this user.")
+                actual = int(plan["schedule_revision"] or 0)
+                if actual != effective_revisions[plan_id]:
+                    raise StaleScheduleError(
+                        f"Plan {plan_id} changed from revision {effective_revisions[plan_id]} to {actual}."
+                    )
+
+            created_plan_ids: list[int] = []
+            anchor_plan_id = expected_anchor_plan_id
+            if drafts:
+                current_anchor = self.get_plan_by_date(user_id, anchor_plan_date)
+                if expected_anchor_plan_id is None:
+                    if current_anchor is not None:
+                        raise StaleScheduleError(
+                            "The anchor day was created after Preview; calculate a new preview."
+                        )
+                    anchor_plan_id = self._insert_and_get_id(
+                        """INSERT INTO plans (user_id,plan_date,raw_input,status)
+                           VALUES (?,?,?,'active')""",
+                        (user_id, anchor_plan_date.isoformat(), "Future Planning"),
+                        pk_column="plan_id",
+                    )
+                    created_plan_ids.append(int(anchor_plan_id))
+                    effective_revisions[int(anchor_plan_id)] = 0
+                    plan_ids = sorted(set(plan_ids) | {int(anchor_plan_id)})
+                elif current_anchor is None or int(current_anchor["plan_id"]) != int(expected_anchor_plan_id):
+                    raise StaleScheduleError(
+                        "The anchor day changed after Preview; calculate a new preview."
+                    )
+                elif int(expected_anchor_plan_id) not in effective_revisions:
+                    raise StaleScheduleError("The anchor plan revision was not captured by Preview.")
+
+            tasks_for_plan: dict[int, dict] = {}
+            for task_id in existing_task_ids:
+                row = self.get_task(task_id, user_id)
+                if row is None:
+                    raise StaleScheduleError("A task was deleted after the preview was calculated.")
+                task = dict(row)
+                expected = expected_task_states.get(task_id)
+                actual_state = {
+                    "status": task["status"], "estimated_minutes": int(task["estimated_minutes"]),
+                    "actual_minutes": task["actual_minutes"], "started_at": str(task["started_at"]) if task["started_at"] else None,
+                    "priority": int(task["priority"]),
+                    "earliest_start": str(task.get("earliest_start")) if task.get("earliest_start") else None,
+                    "deadline": str(task.get("deadline")) if task.get("deadline") else None,
+                }
+                if expected != actual_state:
+                    raise StaleScheduleError(f"Task {task_id} changed after preview calculation.")
+                if int(task["plan_id"]) not in effective_revisions:
+                    raise OwnershipError("A proposed task is outside the owned planning scope.")
+                update = normalized_updates.get(task_id, {})
+                unknown = set(update) - {"estimated_minutes", "priority", "earliest_start", "deadline"}
+                if unknown:
+                    raise ValueError(f"Unsupported future-planning task update: {', '.join(sorted(unknown))}.")
+                if "estimated_minutes" in update:
+                    update["estimated_minutes"] = int(update["estimated_minutes"])
+                    if update["estimated_minutes"] < int(task["actual_minutes"] or 0):
+                        raise ValueError("Estimated minutes cannot be less than completed work.")
+                if "priority" in update:
+                    update["priority"] = int(update["priority"])
+                    if not 1 <= update["priority"] <= 5:
+                        raise ValueError("Priority must be between 1 and 5.")
+                for field in ("earliest_start", "deadline"):
+                    if field in update:
+                        parsed = self._parse_local_planning_datetime(update[field])
+                        self._validate_user_local_planning_datetime(user_id, parsed)
+                        update[field] = parsed.isoformat(sep=" ") if parsed else None
+                earliest = self._parse_local_planning_datetime(update.get("earliest_start", task.get("earliest_start")))
+                deadline = self._parse_local_planning_datetime(update.get("deadline", task.get("deadline")))
+                if earliest and deadline and earliest > deadline:
+                    raise ValueError("earliest_start must be on or before deadline.")
+                task.update(update)
+                tasks_for_plan[task_id] = task
+
+            before = self._future_schedule_snapshot(plan_ids, existing_task_ids, user_id)
+            before["created_plan_ids"] = created_plan_ids
+
+            draft_id_map: dict[str, int] = {}
+            if drafts:
+                order_row = self.fetch_one(
+                    "SELECT COALESCE(MAX(order_index),-1) AS max_order FROM tasks WHERE plan_id=?",
+                    (anchor_plan_id,),
+                )
+                next_order = int(order_row["max_order"]) + 1
+                for offset, (temporary_id, draft) in enumerate(drafts.items()):
+                    title = str(draft.get("title") or "").strip()
+                    description = draft.get("description")
+                    remaining = int(draft.get("remaining_minutes") or 0)
+                    priority = int(draft.get("priority") or 3)
+                    if not title or remaining <= 0:
+                        raise ValueError("Every draft task requires a title and positive duration.")
+                    if not 1 <= priority <= 5:
+                        raise ValueError("Priority must be between 1 and 5.")
+                    earliest = self._parse_local_planning_datetime(draft.get("earliest_start"))
+                    deadline = self._parse_local_planning_datetime(draft.get("deadline"))
+                    self._validate_user_local_planning_datetime(user_id, earliest)
+                    self._validate_user_local_planning_datetime(user_id, deadline)
+                    if earliest and deadline and earliest > deadline:
+                        raise ValueError("earliest_start must be on or before deadline.")
+                    task_id = int(self._insert_and_get_id(
+                        """INSERT INTO tasks
+                           (plan_id,title,description,priority,estimated_minutes,order_index,
+                            is_fixed_time,is_break,earliest_start,deadline)
+                           VALUES (?,?,?,?,?,?,0,0,?,?)""",
+                        (
+                            anchor_plan_id, title, description, priority, remaining,
+                            next_order + offset,
+                            earliest.isoformat(sep=" ") if earliest else None,
+                            deadline.isoformat(sep=" ") if deadline else None,
+                        ),
+                        pk_column="task_id",
+                    ))
+                    draft_id_map[temporary_id] = task_id
+                    tasks_for_plan[task_id] = dict(self.get_task(task_id, user_id))
+
+            combined_segments = {int(key): list(value) for key, value in segments_by_task.items()}
+            for temporary_id, payload in draft_payloads.items():
+                combined_segments[draft_id_map[temporary_id]] = payload
+            all_task_ids = sorted(combined_segments)
+            self._validate_future_segment_payload(combined_segments, tasks_for_plan, user_id)
+            before["created_task_ids"] = sorted(draft_id_map.values())
+            before["draft_task_ids"] = draft_id_map
+            old_segments = {
+                (int(s["task_id"]), int(s["segment_index"])): s
+                for task_id in existing_task_ids for s in self.get_task_segments(task_id, user_id)
+            }
+            for plan_id in plan_ids:
+                expected = effective_revisions[plan_id]
+                updated = self.execute(
+                    """UPDATE plans SET schedule_revision=schedule_revision+1
+                       WHERE plan_id=? AND user_id=? AND schedule_revision=?""",
+                    (plan_id, user_id, expected),
+                )
+                if updated.rowcount != 1:
+                    raise StaleScheduleError("The future schedule changed while it was being saved.")
+            for task_id, update in normalized_updates.items():
+                self._update_task_no_commit(task_id, user_id, **update)
+            for task_id, proposed in combined_segments.items():
+                self.execute("DELETE FROM task_segments WHERE task_id=?", (task_id,))
+                ordered = sorted(proposed, key=lambda item: int(item["segment_index"]))
+                for segment in ordered:
+                    key = (task_id, int(segment["segment_index"]))
+                    old = old_segments.get(key)
+                    unchanged = old is not None and (
+                        str(old["effective_date"]) == str(segment["scheduled_date"])
+                        and
+                        str(old["scheduled_start"]) == str(segment["scheduled_start"])
+                        and str(old["scheduled_end"]) == str(segment["scheduled_end"])
+                    )
+                    owned = (
+                        old is not None
+                        and old["calendar_provenance"] == "coachai_created"
+                        and old["google_event_id"]
+                    )
+                    preserve_identity = unchanged or owned
+                    provenance = old["calendar_provenance"] if preserve_identity else "legacy_unknown"
+                    event_id = old["google_event_id"] if preserve_identity else None
+                    calendar_id = old["google_calendar_id"] if preserve_identity else None
+                    sync_status = (
+                        old["calendar_sync_status"] if unchanged
+                        else ("pending_update" if owned else "not_synced")
+                    )
+                    self.execute(
+                        """INSERT INTO task_segments
+                           (task_id,segment_index,scheduled_start,scheduled_end,scheduled_date,
+                            google_event_id,google_calendar_id,calendar_provenance,calendar_sync_status)
+                           VALUES (?,?,?,?,?,?,?,?,?)""",
+                        (task_id, int(segment["segment_index"]), segment["scheduled_start"],
+                         segment["scheduled_end"], str(segment["scheduled_date"]), event_id,
+                         calendar_id, provenance, sync_status),
+                    )
+                self._update_task_no_commit(
+                    task_id, user_id,
+                    scheduled_start=ordered[0]["scheduled_start"] if ordered else None,
+                    scheduled_end=ordered[-1]["scheduled_end"] if ordered else None,
+                )
+            after = self._future_schedule_snapshot(plan_ids, all_task_ids, user_id)
+            after["created_plan_ids"] = created_plan_ids
+            after["created_task_ids"] = sorted(draft_id_map.values())
+            after["draft_task_ids"] = draft_id_map
+            anchor = int(anchor_plan_id) if drafts else plan_ids[0]
+            self.execute(
+                """INSERT INTO schedule_operations
+                   (operation_id,plan_id,user_id,base_revision,result_revision,before_state,after_state,status)
+                   VALUES (?,?,?,?,?,?,?,'applied')""",
+                (operation_id, anchor, user_id, effective_revisions[anchor],
+                 effective_revisions[anchor] + 1, json.dumps(before, sort_keys=True),
+                  json.dumps(after, sort_keys=True)),
+            )
+            payload = self._schedule_notification_payload(before, after)
+            payload.update({
+                "plan_ids": plan_ids,
+                "created_task_ids": sorted(draft_id_map.values()),
+                "base_revisions": effective_revisions,
+                "result_revisions": {
+                    plan_id: effective_revisions[plan_id] + 1 for plan_id in plan_ids
+                },
+            })
+            self._enqueue_notification_event_no_commit(
+                user_id=user_id,
+                event_type="SCHEDULE_OPERATION_APPLIED",
+                schedule_revision=max(effective_revisions.values()) + 1,
+                schedule_operation_id=operation_id,
+                payload=payload,
+                idempotency_key=f"schedule-applied:{operation_id}",
+                bump_sync_revision=True,
+            )
+        return operation_id
+
+    def _validate_future_segment_payload(
+        self, segments_by_task: dict[int, list[dict]], tasks_by_id: dict[int, dict], user_id: str,
+    ) -> None:
+        """Enforce multi-day invariants at the persistence boundary."""
+        proposed_ids = set(segments_by_task)
+        occupied: dict[str, list[tuple[time, time, int]]] = {}
+        rows = self.fetch_all(
+            """SELECT s.*,COALESCE(s.scheduled_date,p.plan_date) effective_date
+               FROM task_segments s JOIN tasks t ON t.task_id=s.task_id
+               JOIN plans p ON p.plan_id=t.plan_id WHERE p.user_id=?""", (user_id,),
+        )
+        for row in rows:
+            if int(row["task_id"]) not in proposed_ids:
+                occupied.setdefault(str(row["effective_date"]), []).append((
+                    self._parse_legacy_time(row["scheduled_start"]),
+                    self._parse_legacy_time(row["scheduled_end"]), int(row["task_id"])))
+        for task_id, proposed in segments_by_task.items():
+            task = tasks_by_id[task_id]
+            if bool(task["is_fixed_time"]) or task["status"] in {"completed", "failed"} or task["started_at"]:
+                raise ValueError(f"Task {task_id} is protected and cannot be future-planned.")
+            if len(proposed) > MAX_SEGMENTS_PER_TASK:
+                raise ValueError(f"Task {task_id} exceeds MAX_SEGMENTS_PER_TASK.")
+            remaining = max(0, int(task["estimated_minutes"]) - int(task["actual_minutes"] or 0))
+            total = 0
+            last = None
+            for expected_index, segment in enumerate(sorted(proposed, key=lambda x: int(x["segment_index"]))):
+                if int(segment["segment_index"]) != expected_index:
+                    raise ValueError("Future segment indexes must be contiguous from zero.")
+                day = date.fromisoformat(str(segment["scheduled_date"]))
+                start = self._parse_legacy_time(segment["scheduled_start"])
+                end = self._parse_legacy_time(segment["scheduled_end"])
+                if start is None or end is None or end <= start or end > WORK_DAY_END:
+                    raise ValueError(f"Task {task_id} contains an invalid same-day segment.")
+                duration = int((datetime.combine(day, end) - datetime.combine(day, start)).total_seconds() // 60)
+                if duration < MIN_SEGMENT_MINUTES:
+                    raise ValueError(f"Task {task_id} contains a segment below the minimum.")
+                start_dt, end_dt = datetime.combine(day, start), datetime.combine(day, end)
+                if task.get("earliest_start") and start_dt < datetime.fromisoformat(str(task["earliest_start"])):
+                    raise ValueError(f"Task {task_id} violates earliest_start.")
+                if task.get("deadline") and end_dt > datetime.fromisoformat(str(task["deadline"])):
+                    raise ValueError(f"Task {task_id} violates its deadline.")
+                if last is not None and start_dt < last:
+                    raise ValueError(f"Task {task_id} has overlapping or unordered segments.")
+                for other_start, other_end, other_id in occupied.setdefault(day.isoformat(), []):
+                    if start < other_end and end > other_start:
+                        raise ValueError(f"Task {task_id} overlaps protected task {other_id}.")
+                occupied[day.isoformat()].append((start, end, task_id))
+                last, total = end_dt, total + duration
+            if proposed and total != remaining:
+                raise ValueError(f"Task {task_id} segments do not equal remaining work ({remaining} minutes).")
+
+    def undo_schedule_operation(self, operation_id: str, user_id: str) -> None:
+        """Restore one complete Smart Scheduling operation in one transaction."""
+        with self.transaction():
+            operation = self.fetch_one(
+                """SELECT so.* FROM schedule_operations so
+                   JOIN plans p ON p.plan_id=so.plan_id
+                   WHERE so.operation_id=? AND so.user_id=? AND p.user_id=?""",
+                (operation_id, user_id, user_id),
+            )
+            if operation is None:
+                raise OwnershipError("Scheduling operation not found or not owned by this user.")
+            if operation["status"] != "applied":
+                raise StaleScheduleError("This scheduling operation has already been undone.")
+            state = json.loads(operation["before_state"])
+            if state.get("kind") == "future_planning_v1":
+                self._undo_future_schedule_operation(operation, state, user_id)
+                return
+            plan = self.get_plan_by_id(int(operation["plan_id"]), user_id)
+            if int(plan["schedule_revision"] or 0) != int(operation["result_revision"]):
+                raise StaleScheduleError("The plan changed after this operation; Undo would overwrite newer work.")
+            plan_id = int(operation["plan_id"])
+            owned_ids = {int(row["task_id"]) for row in self.get_tasks_by_plan(plan_id, user_id)}
+            snapshot_ids = {int(row["task_id"]) for row in state["tasks"]}
+            created_ids = {int(task_id) for task_id in state.get("created_task_ids", [])}
+            if owned_ids != snapshot_ids | created_ids:
+                raise StaleScheduleError("The plan's task set changed after this operation.")
+            self.execute(
+                "DELETE FROM task_segments WHERE task_id IN (SELECT task_id FROM tasks WHERE plan_id=?)",
+                (plan_id,),
+            )
+            if created_ids:
+                placeholders = ",".join("?" for _ in created_ids)
+                self.execute(
+                    f"""DELETE FROM tasks WHERE task_id IN ({placeholders})
+                        AND plan_id=? AND plan_id IN (
+                            SELECT plan_id FROM plans WHERE user_id=?
+                        )""",
+                    (*sorted(created_ids), plan_id, user_id),
+                )
+            for segment in state["segments"]:
+                self.execute(
+                    """INSERT INTO task_segments
+                       (task_id,segment_index,scheduled_start,scheduled_end,
+                        scheduled_date,google_event_id,google_calendar_id,calendar_provenance,
+                        calendar_sync_status,calendar_sync_error)
+                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    tuple(segment.get(key) for key in (
+                        "task_id", "segment_index", "scheduled_start", "scheduled_end",
+                        "effective_date",
+                        "google_event_id", "google_calendar_id", "calendar_provenance",
+                        "calendar_sync_status", "calendar_sync_error",
+                    )),
+                )
+            for task in state["tasks"]:
+                self._update_task_no_commit(
+                    int(task["task_id"]), user_id,
+                    scheduled_start=task["scheduled_start"], scheduled_end=task["scheduled_end"],
+                )
+            # Google is an external system and cannot participate in this DB
+            # transaction.  Restored CoachAI-owned identities are therefore
+            # explicitly retryable until the next reconciliation confirms
+            # their remote window matches the restored segment.
+            self.execute(
+                """UPDATE task_segments SET calendar_sync_status='pending_update'
+                   WHERE task_id IN (SELECT task_id FROM tasks WHERE plan_id=?)
+                     AND calendar_provenance='coachai_created'
+                     AND google_event_id IS NOT NULL""",
+                (plan_id,),
+            )
+            self.execute(
+                "UPDATE plans SET schedule_revision=schedule_revision+1 WHERE plan_id=? AND user_id=?",
+                (plan_id, user_id),
+            )
+            self.execute(
+                """UPDATE schedule_operations SET status='undone', undone_at=CURRENT_TIMESTAMP
+                   WHERE operation_id=? AND status='applied'""",
+                (operation_id,),
+            )
+            restored_revision = int(operation["result_revision"]) + 1
+            after_state = json.loads(operation["after_state"])
+            payload = self._schedule_notification_payload(after_state, state)
+            payload.update({"plan_id": plan_id, "restored_revision": restored_revision})
+            self._enqueue_notification_event_no_commit(
+                user_id=user_id,
+                event_type="SCHEDULE_OPERATION_UNDONE",
+                scheduled_date=str(plan["plan_date"]),
+                schedule_revision=restored_revision,
+                schedule_operation_id=operation_id,
+                payload=payload,
+                idempotency_key=f"schedule-undone:{operation_id}",
+                bump_sync_revision=True,
+            )
+
+    def _undo_future_schedule_operation(self, operation, state: dict, user_id: str) -> None:
+        """Restore the exact multi-plan snapshot without rerunning the planner."""
+        after = json.loads(operation["after_state"])
+        expected_revisions = {int(k): int(v) for k, v in after["plan_revisions"].items()}
+        for plan_id, expected in expected_revisions.items():
+            plan = self.get_plan_by_id(plan_id, user_id)
+            if plan is None or int(plan["schedule_revision"] or 0) != expected:
+                raise StaleScheduleError(
+                    "The future schedule changed after this operation; Undo would overwrite newer work."
+                )
+        task_ids = {int(row["task_id"]) for row in state["tasks"]}
+        created_task_ids = {int(value) for value in state.get("created_task_ids", [])}
+        all_task_ids = task_ids | created_task_ids
+        if any(self.get_task(task_id, user_id) is None for task_id in all_task_ids):
+            raise StaleScheduleError("A future-planned task changed or was deleted after this operation.")
+        after_tasks = {int(row["task_id"]): row for row in after.get("tasks", [])}
+        for task_id in created_task_ids:
+            current = dict(self.get_task(task_id, user_id))
+            expected = after_tasks.get(task_id, {})
+            for field in (
+                "estimated_minutes", "priority", "earliest_start", "deadline",
+                "status", "actual_minutes", "started_at",
+            ):
+                current_value = current.get(field)
+                if field in {"estimated_minutes", "priority"}:
+                    current_value = int(current_value)
+                elif current_value is not None:
+                    current_value = str(current_value)
+                if current_value != expected.get(field):
+                    raise StaleScheduleError(
+                        "A newly created future task changed after Apply; Undo would lose progress."
+                    )
+        for task_id in all_task_ids:
+            self.execute("DELETE FROM task_segments WHERE task_id=?", (task_id,))
+        for segment in state["segments"]:
+            self.execute(
+                """INSERT INTO task_segments
+                   (task_id,segment_index,scheduled_start,scheduled_end,scheduled_date,
+                    google_event_id,google_calendar_id,calendar_provenance,
+                    calendar_sync_status,calendar_sync_error)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                tuple(segment.get(key) for key in (
+                    "task_id", "segment_index", "scheduled_start", "scheduled_end", "scheduled_date",
+                    "google_event_id", "google_calendar_id", "calendar_provenance",
+                    "calendar_sync_status", "calendar_sync_error",
+                )),
+            )
+        for task in state["tasks"]:
+            restored = {
+                "scheduled_start": task["scheduled_start"],
+                "scheduled_end": task["scheduled_end"],
+            }
+            # Patch 5 operations created before structured requests contain
+            # only the compatibility cache.  Restore newer constraint fields
+            # when present while remaining able to Undo those older records.
+            for field in ("estimated_minutes", "priority", "earliest_start", "deadline"):
+                if field in task:
+                    restored[field] = task[field]
+            self._update_task_no_commit(int(task["task_id"]), user_id, **restored)
+        for task_id in sorted(created_task_ids):
+            deleted = self.execute(
+                """DELETE FROM tasks WHERE task_id=? AND plan_id IN
+                   (SELECT plan_id FROM plans WHERE user_id=?)""",
+                (task_id, user_id),
+            )
+            if deleted.rowcount != 1:
+                raise StaleScheduleError("A newly created future task could not be removed safely.")
+        self.execute(
+            """UPDATE task_segments SET calendar_sync_status='pending_update'
+               WHERE task_id IN (
+                   SELECT t.task_id FROM tasks t JOIN plans p ON p.plan_id=t.plan_id
+                   WHERE p.user_id=?
+               ) AND calendar_provenance='coachai_created' AND google_event_id IS NOT NULL""",
+            (user_id,),
+        )
+        for plan_id, expected in expected_revisions.items():
+            updated = self.execute(
+                """UPDATE plans SET schedule_revision=schedule_revision+1
+                   WHERE plan_id=? AND user_id=? AND schedule_revision=?""",
+                (plan_id, user_id, expected),
+            )
+            if updated.rowcount != 1:
+                raise StaleScheduleError("A future plan changed during Undo.")
+        self.execute(
+            """UPDATE schedule_operations SET status='undone',undone_at=CURRENT_TIMESTAMP
+               WHERE operation_id=? AND user_id=? AND status='applied'""",
+            (operation["operation_id"], user_id),
+        )
+        payload = self._schedule_notification_payload(after, state)
+        payload.update({
+            "plan_ids": sorted(expected_revisions),
+            "restored_revisions": {
+                plan_id: expected + 1 for plan_id, expected in expected_revisions.items()
+            },
+        })
+        self._enqueue_notification_event_no_commit(
+            user_id=user_id,
+            event_type="SCHEDULE_OPERATION_UNDONE",
+            schedule_revision=max(expected_revisions.values()) + 1,
+            schedule_operation_id=str(operation["operation_id"]),
+            payload=payload,
+            idempotency_key=f"schedule-undone:{operation['operation_id']}",
+            bump_sync_revision=True,
+        )
+
+    def update_segment_calendar_state(
+        self,
+        segment_id: int,
+        user_id: str,
+        *,
+        google_event_id: Optional[str] = None,
+        google_calendar_id: Optional[str] = None,
+        calendar_provenance: Optional[str] = None,
+        calendar_sync_status: Optional[str] = None,
+        calendar_sync_error: Optional[str] = None,
+    ) -> None:
+        """Update Calendar state for an owned segment only."""
+        if calendar_provenance is not None and calendar_provenance not in {
+            "imported", "coachai_created", "legacy_unknown"
+        }:
+            raise ValueError(f"Invalid Calendar provenance: {calendar_provenance!r}")
+        values = {
+            "google_event_id": google_event_id,
+            "google_calendar_id": google_calendar_id,
+            "calendar_provenance": calendar_provenance,
+            "calendar_sync_status": calendar_sync_status,
+            "calendar_sync_error": calendar_sync_error,
+        }
+        supplied = {key: value for key, value in values.items() if value is not None}
+        # Clearing an old error is a real update and is represented by an
+        # empty string; callers never need to infer ownership from an ID.
+        if not supplied:
+            return
+        with self.transaction():
+            before = self.fetch_one(
+                """SELECT s.*,t.title,p.plan_id,p.schedule_revision,
+                          COALESCE(s.scheduled_date,p.plan_date) effective_date
+                   FROM task_segments s
+                   JOIN tasks t ON t.task_id=s.task_id
+                   JOIN plans p ON p.plan_id=t.plan_id
+                   WHERE s.segment_id=? AND p.user_id=?""",
+                (segment_id, user_id),
+            )
+            if before is None:
+                raise OwnershipError("Segment not found or not owned by this user.")
+            result = self.execute(
+                f"""UPDATE task_segments SET {', '.join(f'{key}=?' for key in supplied)}
+                    WHERE segment_id=? AND task_id IN (
+                        SELECT t.task_id FROM tasks t JOIN plans p ON p.plan_id=t.plan_id
+                        WHERE p.user_id=?
+                    )""",
+                (*supplied.values(), segment_id, user_id),
+            )
+            if result.rowcount != 1:
+                raise OwnershipError("Segment not found or not owned by this user.")
+
+            previous_status = str(before["calendar_sync_status"] or "")
+            previous_error = str(before["calendar_sync_error"] or "")
+            next_status = str(supplied.get("calendar_sync_status", previous_status) or "")
+            next_error = str(supplied.get("calendar_sync_error", previous_error) or "")
+            was_attention = bool(previous_error) or "error" in previous_status or "failed" in previous_status
+            needs_attention = bool(next_error) or "error" in next_status or "failed" in next_status
+            event_type = None
+            if needs_attention and (not was_attention or next_error != previous_error):
+                event_type = "CALENDAR_ATTENTION_REQUIRED"
+            elif was_attention and not needs_attention and next_status == "synced":
+                event_type = "CALENDAR_RECONCILED"
+            if event_type:
+                self._enqueue_notification_event_no_commit(
+                    user_id=user_id,
+                    event_type=event_type,
+                    task_id=int(before["task_id"]),
+                    segment_id=segment_id,
+                    scheduled_date=str(before["effective_date"]),
+                    segment_index=int(before["segment_index"]),
+                    schedule_revision=int(before["schedule_revision"] or 0),
+                    payload={
+                        "task_title": str(before["title"]),
+                        "plan_id": int(before["plan_id"]),
+                        "calendar_sync_status": next_status,
+                        "calendar_sync_error": next_error or None,
+                    },
+                    idempotency_key=(
+                        f"calendar-segment:{event_type}:{before['task_id']}:"
+                        f"{before['effective_date']}:{before['segment_index']}:"
+                        f"{before['schedule_revision']}"
+                    ),
+                    bump_sync_revision=False,
+                )
+
+    def get_schedule_operation(self, operation_id: str, user_id: str) -> Optional[sqlite3.Row]:
+        return self.fetch_one(
+            "SELECT * FROM schedule_operations WHERE operation_id=? AND user_id=?",
+            (operation_id, user_id),
+        )
+
+    def count_stale_segment_exports(self, plan_id: int, user_id: str) -> int:
+        row = self.fetch_one(
+            """SELECT COUNT(*) AS n FROM task_segments s
+               JOIN tasks t ON t.task_id=s.task_id
+               JOIN plans p ON p.plan_id=t.plan_id
+               WHERE t.plan_id=? AND p.user_id=?
+                 AND s.calendar_provenance='coachai_created'
+                 AND s.google_event_id IS NOT NULL
+                 AND s.calendar_sync_status!='synced'""",
+            (plan_id, user_id),
+        )
+        return int(row["n"] if row else 0)
+
+    def mark_schedule_calendar_reconciliation(
+        self, operation_id: str, user_id: str, error: Optional[str] = None,
+    ) -> None:
+        with self.transaction():
+            before = self.get_schedule_operation(operation_id, user_id)
+            if before is None:
+                raise OwnershipError("Scheduling operation not found or not owned by this user.")
+            result = self.execute(
+                """UPDATE schedule_operations
+                   SET calendar_reconciled_at=CASE WHEN ? IS NULL THEN CURRENT_TIMESTAMP ELSE NULL END,
+                       calendar_reconciliation_error=?
+                   WHERE operation_id=? AND user_id=?""",
+                (error, error, operation_id, user_id),
+            )
+            if result.rowcount != 1:
+                raise OwnershipError("Scheduling operation not found or not owned by this user.")
+            previous_error = str(before["calendar_reconciliation_error"] or "")
+            event_type = None
+            if error and error != previous_error:
+                event_type = "CALENDAR_ATTENTION_REQUIRED"
+            elif previous_error and error is None:
+                event_type = "CALENDAR_RECONCILED"
+            if event_type:
+                self._enqueue_notification_event_no_commit(
+                    user_id=user_id,
+                    event_type=event_type,
+                    schedule_revision=int(before["result_revision"] or 0),
+                    schedule_operation_id=operation_id,
+                    payload={
+                        "plan_id": int(before["plan_id"]),
+                        "calendar_reconciliation_error": error,
+                    },
+                    idempotency_key=f"calendar-operation:{event_type}:{operation_id}",
+                    bump_sync_revision=False,
+                )
+
+    def set_single_task_segment(
+        self, task_id: int, user_id: str, scheduled_start: str, scheduled_end: str,
+    ) -> None:
+        """Atomically set one manual/fixed window and invalidate stale schedules."""
+        start = self._parse_legacy_time(scheduled_start)
+        end = self._parse_legacy_time(scheduled_end)
+        if start is None or end is None or end <= start:
+            raise ValueError("Task interval must be valid and same-day.")
+        with self.transaction():
+            task = self.get_task(task_id, user_id)
+            if task is None:
+                raise OwnershipError("Task not found or not owned by this user.")
+            old = self.fetch_one(
+                "SELECT * FROM task_segments WHERE task_id=? AND segment_index=0", (task_id,)
+            )
+            self.execute("DELETE FROM task_segments WHERE task_id=?", (task_id,))
+            self.execute(
+                """INSERT INTO task_segments
+                   (task_id,segment_index,scheduled_start,scheduled_end,google_event_id,
+                    google_calendar_id,calendar_provenance,calendar_sync_status,calendar_sync_error)
+                   VALUES (?,0,?,?,?,?,?,?,?)""",
+                (
+                    task_id, start.strftime("%H:%M:%S"), end.strftime("%H:%M:%S"),
+                    old["google_event_id"] if old else None,
+                    old["google_calendar_id"] if old else None,
+                    old["calendar_provenance"] if old else "legacy_unknown",
+                    (
+                        "pending_update"
+                        if old and old["calendar_provenance"] == "coachai_created"
+                        else old["calendar_sync_status"] if old else "not_synced"
+                    ),
+                    old["calendar_sync_error"] if old else None,
+                ),
+            )
+            self._update_task_no_commit(
+                task_id, user_id,
+                scheduled_start=start.strftime("%H:%M:%S"),
+                scheduled_end=end.strftime("%H:%M:%S"),
+            )
+            self.execute(
+                "UPDATE plans SET schedule_revision=schedule_revision+1 WHERE plan_id=? AND user_id=?",
+                (task["plan_id"], user_id),
+            )
+
+    def move_task_unscheduled(
+        self, task_id: int, user_id: str, destination_plan_id: int, order_index: int,
+    ) -> None:
+        """Move a logical task between owned plans and remove its date-bound segments."""
+        with self.transaction():
+            task = self.get_task(task_id, user_id)
+            destination = self.get_plan_by_id(destination_plan_id, user_id)
+            if task is None or destination is None:
+                raise OwnershipError("Task or destination plan is not owned by this user.")
+            source_plan_id = int(task["plan_id"])
+            self.execute("DELETE FROM task_segments WHERE task_id=?", (task_id,))
+            self._update_task_no_commit(
+                task_id, user_id, plan_id=destination_plan_id, order_index=order_index,
+                scheduled_start=None, scheduled_end=None,
+            )
+            for plan_id in {source_plan_id, destination_plan_id}:
+                self.execute(
+                    "UPDATE plans SET schedule_revision=schedule_revision+1 WHERE plan_id=? AND user_id=?",
+                    (plan_id, user_id),
+                )
+            destination_after = self.get_plan_by_id(destination_plan_id, user_id)
+            self._enqueue_notification_event_no_commit(
+                user_id=user_id,
+                event_type="TASK_DEFERRED",
+                task_id=task_id,
+                scheduled_date=str(destination["plan_date"]),
+                schedule_revision=int(destination_after["schedule_revision"] or 0),
+                payload={
+                    "task_title": str(task["title"]),
+                    "source_plan_id": source_plan_id,
+                    "destination_plan_id": destination_plan_id,
+                },
+                idempotency_key=(
+                    f"task-deferred:{task_id}:{source_plan_id}:{destination_plan_id}:"
+                    f"{destination_after['schedule_revision']}"
+                ),
+                bump_sync_revision=True,
+            )

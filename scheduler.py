@@ -16,6 +16,8 @@ class ScheduledTask:
     scheduled_start: Optional[time] = None
     scheduled_end: Optional[time] = None
     order_index: int = 0
+    earliest_start: Optional[datetime] = None
+    deadline: Optional[datetime] = None
 
     # Preserves the database task_id this ScheduledTask was built from,
     # so persistence (scheduler_service._save_schedule) can update the
@@ -37,6 +39,10 @@ class ScheduledTask:
     # ordinary fixed tasks colliding with each other.
     is_break: bool = False
 
+    # Populated by SmartScheduler.  Kept on the logical task so timers,
+    # completion, history, and analytics never mistake segments for tasks.
+    segments: list = field(default_factory=list)
+
     @staticmethod
     def _parse_hhmm(value) -> Optional[time]:
         """Parse an 'HH:MM' string (or pass through a time/None) safely."""
@@ -47,6 +53,21 @@ class ScheduledTask:
             return time(int(parts[0]), int(parts[1]))
         except (ValueError, IndexError):
             return None
+
+    @staticmethod
+    def _parse_local_datetime(value) -> Optional[datetime]:
+        if value is None or value == "":
+            return None
+        if isinstance(value, datetime):
+            parsed = value
+        else:
+            try:
+                parsed = datetime.fromisoformat(str(value))
+            except ValueError as exc:
+                raise ValueError(f"Invalid local scheduling constraint: {value!r}") from exc
+        if parsed.tzinfo is not None and parsed.utcoffset() is not None:
+            raise ValueError("Scheduling constraints must use naive user-local date/time values.")
+        return parsed.replace(microsecond=0)
 
     @classmethod
     def from_task(cls, task, order_index: int = 0) -> "ScheduledTask":
@@ -65,6 +86,8 @@ class ScheduledTask:
             priority=_get("priority", 3),
             description=_get("description", ""),
             order_index=order_index,
+            earliest_start=cls._parse_local_datetime(_get("earliest_start", None)),
+            deadline=cls._parse_local_datetime(_get("deadline", None)),
             task_id=_get("task_id", None),
             is_fixed_time=bool(_get("is_fixed_time", False)),
             fixed_start=cls._parse_hhmm(_get("fixed_start", None)),
@@ -110,6 +133,8 @@ class SchedulingConflict:
     fixed_task_title: str
     fixed_task_start: time
     fixed_task_end: time
+    break_task_id: Optional[int] = None
+    fixed_task_id: Optional[int] = None
 
 
 @dataclass
@@ -127,6 +152,8 @@ class FixedTaskConflict:
     task_b_title: str
     task_b_start: time
     task_b_end: time
+    task_a_id: Optional[int] = None
+    task_b_id: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------

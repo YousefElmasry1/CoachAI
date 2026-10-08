@@ -154,6 +154,10 @@ class TaskSnapshot:
     created_at: str
     weekday: int
     hour: Optional[int]
+    segments: tuple[tuple[str, str], ...] = ()
+    dated_segments: tuple[tuple[str, str, str], ...] = ()
+    is_break: bool = False
+    is_fixed_time: bool = False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -283,11 +287,29 @@ class AnalyticsLoader:
             >>> snaps = loader.load_snapshots(user_id=1, window_days=30)
         """
         from timezone_utils import user_today
-        since_date = user_today(self._db, user_id) - timedelta(days=window_days)
+        # The current local day is part of the requested window.  Subtracting
+        # ``window_days`` would therefore include N+1 calendar dates.
+        since_date = user_today(self._db, user_id) - timedelta(
+            days=max(0, int(window_days) - 1)
+        )
         rows = self._db.get_recent_tasks_for_user(
             user_id=user_id,
             since_date=since_date,
         )
+        segment_rows = self._db.get_segments_by_task_ids(
+            [int(self._safe_get(row, "task_id", 0)) for row in rows], user_id,
+        )
+        segments_by_task: dict[int, list[tuple[str, str]]] = {}
+        dated_segments_by_task: dict[int, list[tuple[str, str, str]]] = {}
+        for segment in segment_rows:
+            task_id = int(segment["task_id"])
+            segments_by_task.setdefault(task_id, []).append((
+                str(segment["scheduled_start"]), str(segment["scheduled_end"]),
+            ))
+            dated_segments_by_task.setdefault(task_id, []).append((
+                str(segment["effective_date"]), str(segment["scheduled_start"]),
+                str(segment["scheduled_end"]),
+            ))
 
         sg = self._safe_get
         snapshots: list[TaskSnapshot] = []
@@ -301,6 +323,9 @@ class AnalyticsLoader:
             actual_val = sg(row, "actual_minutes")
             scheduled_start_val = sg(row, "scheduled_start")
             scheduled_end_val = sg(row, "scheduled_end")
+            task_windows = segments_by_task.get(int(sg(row, "task_id", 0)), [])
+            scheduled_start_val = task_windows[0][0] if task_windows else None
+            scheduled_end_val = task_windows[-1][1] if task_windows else None
             status_val = sg(row, "status", "pending")
             failure_reason_val = sg(row, "failure_reason")
             completed_at_val = sg(row, "completed_at")
@@ -332,6 +357,10 @@ class AnalyticsLoader:
                 hour=AnalyticsLoader._parse_hour(
                     str(scheduled_start_val) if scheduled_start_val else None
                 ),
+                segments=tuple(task_windows),
+                dated_segments=tuple(dated_segments_by_task.get(int(sg(row, "task_id", 0)), [])),
+                is_break=bool(sg(row, "is_break", 0)),
+                is_fixed_time=bool(sg(row, "is_fixed_time", 0)),
             ))
 
         return snapshots
@@ -418,7 +447,12 @@ class IntermediateStats:
     active_days: int                # days with >= 1 completed task
 
     # --- All snapshots (for calculators that need raw iteration) ---
+    # Logical work only; breaks never count as tasks/completions/failures.
     all_snapshots: tuple[TaskSnapshot, ...]
+
+    # Physical schedule rows, including breaks.  Only occupancy/recovery/
+    # chronological switching calculations should use this collection.
+    schedule_snapshots: tuple[TaskSnapshot, ...]
 
     # --- Reference "today" ---
     # The plan owner's own local "today" (see AnalyticsEngine.build_profile
@@ -592,7 +626,9 @@ def build_intermediate_stats(
         >>> stats.completion_rate
         0.75
     """
-    total = len(snapshots)
+    schedule_snapshots = tuple(snapshots)
+    logical_snapshots = [snapshot for snapshot in snapshots if not snapshot.is_break]
+    total = len(logical_snapshots)
     resolved_today: date = today if today is not None else date.today()
 
     completed: list[TaskSnapshot] = []
@@ -620,7 +656,7 @@ def build_intermediate_stats(
 
     by_duration_bucket: dict[str, list[TaskSnapshot]] = defaultdict(list)
 
-    for snap in snapshots:
+    for snap in logical_snapshots:
         # --- Status counts ---
         if snap.status == "completed":
             completed.append(snap)
@@ -695,7 +731,7 @@ def build_intermediate_stats(
     )
 
     # --- Date coverage ---
-    unique_dates_sorted = sorted(set(snap.plan_date for snap in snapshots))
+    unique_dates_sorted = sorted(set(snap.plan_date for snap in logical_snapshots))
     observation_days = len(unique_dates_sorted)
 
     # --- Finalised groupings ---
@@ -755,7 +791,8 @@ def build_intermediate_stats(
         longest_streak=longest_streak,
         trend_score=trend_score,
         active_days=active_days,
-        all_snapshots=tuple(snapshots),
+        all_snapshots=tuple(logical_snapshots),
+        schedule_snapshots=schedule_snapshots,
         today=resolved_today,
     )
 
@@ -1163,8 +1200,8 @@ class BurnoutAnalysis(BaseModel):
     schedule_density: float = Field(
         default=0.0,
         description=(
-            "Average total estimated minutes per day.  "
-            "High density signals potential overload."
+            "Average merged occupied segment minutes per observed day.  "
+            "Overlapping or touching windows are counted once."
         ),
     )
     recovery_time: float = Field(
@@ -2751,17 +2788,39 @@ class BurnoutCalculator:
         - Single day → limited metrics.
     """
 
-    def compute(self, stats: IntermediateStats) -> BurnoutAnalysis:
-        if stats.total_tasks == 0:
-            return BurnoutAnalysis()
+    @staticmethod
+    def _schedule_source(stats: IntermediateStats) -> tuple[TaskSnapshot, ...]:
+        """Return physical schedule rows, with compatibility for direct callers."""
+        rows = getattr(stats, "schedule_snapshots", None)
+        if rows is not None:
+            return tuple(rows)
+        grouped = getattr(stats, "tasks_by_date", {})
+        return tuple(task for tasks in grouped.values() for task in tasks)
 
-        # Schedule density: avg total estimated minutes per day
+    def compute(self, stats: IntermediateStats) -> BurnoutAnalysis:
+        # Schedule density: actual occupied segment minutes per day.  Merge
+        # overlaps/touching intervals so fixed conflicts never double-count
+        # physical calendar occupancy; unscheduled tasks contribute zero.
+        schedule_by_date: dict[str, list[tuple[str, str]]] = defaultdict(list)
+        for snapshot in self._schedule_source(stats):
+            dated = snapshot.dated_segments or tuple(
+                (snapshot.plan_date, start, end) for start, end in snapshot.segments
+            )
+            for segment_date, start, end in dated:
+                schedule_by_date[segment_date].append((start, end))
         daily_load: list[float] = []
-        for tasks in stats.tasks_by_date.values():
-            daily_load.append(sum(t.estimated_minutes for t in tasks))
+        for windows in schedule_by_date.values():
+            daily_load.append(self._occupied_window_minutes(windows))
         schedule_density = (
             sum(daily_load) / len(daily_load) if daily_load else 0.0
         )
+
+        if stats.total_tasks == 0:
+            return BurnoutAnalysis(
+                schedule_density=round(schedule_density, 2),
+                recovery_time=round(self._compute_recovery_time(stats), 2),
+                context_switching_score=round(self._compute_context_switching(stats), 2),
+            )
 
         # Planning reliability = planning_accuracy
         planning_reliability = stats.planning_accuracy
@@ -2782,11 +2841,11 @@ class BurnoutCalculator:
         # Context switching: avg category switches per day
         switching = self._compute_context_switching(stats)
 
-        # Time fragmentation: fraction of tasks <= 15 min
-        short_tasks = sum(
-            1 for t in stats.all_snapshots if t.estimated_minutes <= 15
-        )
-        time_fragmentation = short_tasks / stats.total_tasks
+        # Scheduling fragmentation is segment-level; task completion remains
+        # logical-task-level everywhere else.
+        segment_count = sum(len(t.segments) for t in stats.all_snapshots)
+        extra_segments = sum(max(0, len(t.segments) - 1) for t in stats.all_snapshots)
+        time_fragmentation = extra_segments / segment_count if segment_count else 0.0
 
         # Habit stability: 1 - CV of daily task counts
         daily_counts = [len(tasks) for tasks in stats.tasks_by_date.values()]
@@ -2826,6 +2885,33 @@ class BurnoutCalculator:
         )
 
     @staticmethod
+    def _occupied_minutes(tasks: list[TaskSnapshot]) -> float:
+        return BurnoutCalculator._occupied_window_minutes(
+            [window for task in tasks for window in task.segments]
+        )
+
+    @staticmethod
+    def _occupied_window_minutes(windows) -> float:
+        intervals: list[tuple[int, int]] = []
+        for start, end in windows:
+                try:
+                    sh, sm = str(start).split(":")[:2]
+                    eh, em = str(end).split(":")[:2]
+                    start_min = int(sh) * 60 + int(sm)
+                    end_min = int(eh) * 60 + int(em)
+                    if end_min > start_min:
+                        intervals.append((start_min, end_min))
+                except (ValueError, IndexError):
+                    continue
+        merged: list[list[int]] = []
+        for start, end in sorted(intervals):
+            if not merged or start > merged[-1][1]:
+                merged.append([start, end])
+            else:
+                merged[-1][1] = max(merged[-1][1], end)
+        return float(sum(end - start for start, end in merged))
+
+    @staticmethod
     def _compute_recovery_time(stats: IntermediateStats) -> float:
         """
         Average gap between consecutive tasks in a day (minutes).
@@ -2833,40 +2919,59 @@ class BurnoutCalculator:
         Uses scheduled_start/end times.  If unavailable, returns 0.
         """
         gaps: list[float] = []
-        for tasks in stats.tasks_by_date.values():
-            sorted_tasks = sorted(
-                [t for t in tasks if t.scheduled_start and t.scheduled_end],
-                key=lambda t: t.scheduled_start,
-            )
-            for i in range(1, len(sorted_tasks)):
-                prev_end = sorted_tasks[i - 1].scheduled_end
-                curr_start = sorted_tasks[i].scheduled_start
-                if prev_end and curr_start:
+        schedule_by_date: dict[str, list[tuple[str, str]]] = defaultdict(list)
+        for task in BurnoutCalculator._schedule_source(stats):
+            dated = task.dated_segments or tuple((task.plan_date, s, e) for s, e in task.segments)
+            for segment_date, start, end in dated:
+                schedule_by_date[segment_date].append((start, end))
+        for windows in schedule_by_date.values():
+            intervals: list[tuple[int, int]] = []
+            for start, end in windows:
                     try:
-                        end_parts = prev_end.split(":")
-                        start_parts = curr_start.split(":")
-                        end_min = int(end_parts[0]) * 60 + int(end_parts[1])
-                        start_min = int(start_parts[0]) * 60 + int(start_parts[1])
-                        gap = start_min - end_min
-                        if gap >= 0:
-                            gaps.append(gap)
+                        sh, sm = str(start).split(":")[:2]
+                        eh, em = str(end).split(":")[:2]
+                        start_min = int(sh) * 60 + int(sm)
+                        end_min = int(eh) * 60 + int(em)
+                        if end_min > start_min:
+                            intervals.append((start_min, end_min))
                     except (ValueError, IndexError):
                         continue
+            merged: list[list[int]] = []
+            for start, end in sorted(intervals):
+                if not merged or start > merged[-1][1]:
+                    merged.append([start, end])
+                else:
+                    merged[-1][1] = max(merged[-1][1], end)
+            gaps.extend(merged[index][0] - merged[index - 1][1] for index in range(1, len(merged)))
         return sum(gaps) / len(gaps) if gaps else 0.0
 
     @staticmethod
     def _compute_context_switching(stats: IntermediateStats) -> float:
         """Average number of category switches per day."""
         switches: list[int] = []
-        for tasks in stats.tasks_by_date.values():
-            sorted_tasks = sorted(
-                tasks,
-                key=lambda t: t.scheduled_start or "",
-            )
+        schedule_by_date: dict[str, list[tuple[str, str, TaskSnapshot]]] = defaultdict(list)
+        for task in BurnoutCalculator._schedule_source(stats):
+            dated = task.dated_segments or tuple((task.plan_date, s, e) for s, e in task.segments)
+            for segment_date, start, end in dated:
+                schedule_by_date[segment_date].append((start, end, task))
+        for sequence in schedule_by_date.values():
+            sequence.sort(key=lambda item: (item[0], item[1], item[2].task_id))
             day_switches = 0
-            for i in range(1, len(sorted_tasks)):
-                if sorted_tasks[i].category_name != sorted_tasks[i - 1].category_name:
+            last_work = None
+            last_end = None
+            for start, end, task in sequence:
+                if task.is_break:
+                    continue
+                if last_work is not None and last_end is not None and start < last_end and task.is_fixed_time:
+                    continue
+                if (
+                    last_work is not None
+                    and task.task_id != last_work.task_id
+                    and task.category_name != last_work.category_name
+                ):
                     day_switches += 1
+                last_work = task
+                last_end = end
             switches.append(day_switches)
         return sum(switches) / len(switches) if switches else 0.0
 

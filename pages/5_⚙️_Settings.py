@@ -160,9 +160,10 @@ with tabs[2]:
     e1, e2, e3 = st.columns(3)
     e1.metric("Python", sys_info.get("python_version", "—"))
     e2.metric("Streamlit", sys_info.get("streamlit_version", "—"))
-    e3.metric("SQLite", sys_info.get("sqlite_version", "—"))
+    database_label = sys_info.get("database_backend", "Database").title()
+    e3.metric(database_label, sys_info.get("database_version", "—"))
 
-    with st.expander("📄 Database file path"):
+    with st.expander("📄 Database connection"):
         st.code(db_status.get("path", "—"))
 
 

@@ -10,6 +10,8 @@ Never imports backend modules — this is a pure-config file.
 
 from __future__ import annotations
 
+from datetime import time
+
 # ─────────────────────────────────────────────────────────────
 # Application Metadata
 # ─────────────────────────────────────────────────────────────
@@ -33,6 +35,13 @@ APP_DESCRIPTION: str = (
 # and guest UUIDs already are everywhere else in the app.
 DEFAULT_USER_ID: str = "1"
 DEFAULT_ANALYTICS_WINDOW: int = 30  # days
+
+# Smart Scheduling is strictly same-day.  The boundary is exclusive:
+# every stored segment must end at or before 23:59:59 and may never wrap.
+WORK_DAY_END: time = time(23, 59, 59)
+MAX_SEGMENTS_PER_TASK: int = 3
+MIN_SEGMENT_MINUTES: int = 15
+MAX_FUTURE_PLANNING_WEEKS: int = 12
 
 # ─────────────────────────────────────────────────────────────
 # Color Palette — Dark Theme

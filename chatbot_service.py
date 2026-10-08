@@ -410,6 +410,11 @@ def _impl_get_today_tasks(user_id: str) -> dict:
             "estimated_minutes": t.get("estimated_minutes", 0),
             "scheduled_start": t.get("scheduled_start"),
             "scheduled_end": t.get("scheduled_end"),
+            "segments": [
+                {"date": s.get("effective_date") or s.get("scheduled_date") or str(plan.get("plan_date", "")),
+                 "start": s.get("scheduled_start"), "end": s.get("scheduled_end")}
+                for s in (t.get("segments") or [])
+            ],
             "description": t.get("description", ""),
             "category": cat_map.get(cat_id) if cat_id else None,
             "failure_reason": t.get("failure_reason"),

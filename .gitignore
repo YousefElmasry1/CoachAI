@@ -1,16 +1,23 @@
 __pycache__/
 *.pyc
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+*.log
 .env
 .venv/
 venv/
 .vscode/
 .idea/
+.ipynb_checkpoints/
+/tmp/
+/output/
 
-# Local database files -- never commit real or stale application data.
-# The app auto-creates/migrates this file on first run (see
-# Database._maybe_create_schema in database.py); it must never be
-# tracked, since it can contain real user emails/password hashes and
-# its schema can silently drift from schema.sql over time.
+# Legacy/local SQLite files -- never commit real or stale application data.
+# PostgreSQL is the documented runtime; explicit SQLite URLs remain useful for
+# isolated tests. The old coach_ai.db is retained only as an ignored backup.
 *.db
 *.db-journal
 *.sqlite
@@ -19,6 +26,11 @@ venv/
 # OAuth / credential artifacts that must never be committed.
 *.pem
 *.key
+*.p8
 credentials.json
+*service-account*.json
+firebase-adminsdk-*.json
 token.json
 *.token
+/credentials/
+/secrets/

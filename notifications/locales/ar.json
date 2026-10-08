@@ -1,0 +1,54 @@
+{
+  "task_reminder": {
+    "neutral": [
+      {"id": "task.reminder.ar.neutral.1", "version": 1, "title": "مهمة قريبة", "body": "ستبدأ {task_title} قريبًا."},
+      {"id": "task.reminder.ar.neutral.2", "version": 1, "title": "المهمة القادمة", "body": "اقتربت جلستك الخاصة بـ {task_title}."}
+    ],
+    "friendly": [{"id": "task.reminder.ar.friendly.1", "version": 1, "title": "المهمة التالية اقتربت", "body": "اقترب وقت بدء {task_title}."}],
+    "coach": [{"id": "task.reminder.ar.coach.1", "version": 1, "title": "استعد للتركيز", "body": "ستبدأ {task_title} قريبًا. استعد للجلسة."}]
+  },
+  "schedule_updated": {
+    "neutral": [
+      {"id": "schedule.updated.ar.neutral.1", "version": 1, "title": "تم تحديث الجدول", "body": "تم تعديل {adjusted_count} مهام في جدولك."},
+      {"id": "schedule.updated.ar.neutral.2", "version": 1, "title": "تم تجديد الخطة", "body": "يحتوي جدولك الآن على {adjusted_count} تعديلات للمهام."}
+    ],
+    "friendly": [{"id": "schedule.updated.ar.friendly.1", "version": 1, "title": "جدولك اتحدّث", "body": "عدّلنا {adjusted_count} مهام علشان الخطة تفضل مناسبة."}],
+    "coach": [{"id": "schedule.updated.ar.coach.1", "version": 1, "title": "تم ضبط الخطة", "body": "حرّكنا {adjusted_count} مهام للحفاظ على خطة قابلة للتنفيذ."}]
+  },
+  "schedule_undone": {
+    "neutral": [{"id": "schedule.undone.ar.1", "version": 1, "title": "تمت استعادة الجدول", "body": "تمت استعادة حالة الجدول السابقة."}]
+  },
+  "task_unplaced": {
+    "neutral": [{"id": "task.unplaced.ar.1", "version": 1, "title": "المهمة تحتاج مراجعة", "body": "تعذر جدولة {task_title} بسبب {reason}."}]
+  },
+  "deadline_risk": {
+    "neutral": [{"id": "deadline.risk.ar.1", "version": 1, "title": "قد يتأثر الموعد النهائي", "body": "قد لا تتسع الخطة الحالية لإنهاء {task_title} قبل الموعد."}],
+    "friendly": [{"id": "deadline.risk.ar.friendly.1", "version": 1, "title": "خلّينا نحافظ على الموعد", "body": "قد تحتاج {task_title} إلى تعديل في الخطة."}],
+    "coach": [{"id": "deadline.risk.ar.coach.1", "version": 1, "title": "يُفضّل إعادة التخطيط", "body": "الخطة الحالية قد لا تنهي {task_title} قبل الموعد النهائي."}]
+  },
+  "deadline_passed": {
+    "neutral": [{"id": "deadline.passed.ar.1", "version": 1, "title": "انتهى الموعد النهائي", "body": "ما زالت {task_title} غير مكتملة. راجعها أو أعد تخطيطها."}]
+  },
+  "calendar_attention": {
+    "neutral": [{"id": "calendar.attention.ar.1", "version": 1, "title": "التقويم يحتاج مراجعة", "body": "تعذر إكمال مزامنة آخر تغيير في الجدول."}]
+  },
+  "calendar_reconciled": {
+    "neutral": [{"id": "calendar.reconciled.ar.1", "version": 1, "title": "التقويم محدّث", "body": "تمت معالجة تغيير التقويم المعلّق."}]
+  },
+  "daily_summary": {
+    "neutral": [{"id": "daily.summary.ar.1", "version": 1, "title": "ملخص اليوم", "body": "أنجزت {completed_count} من {total_count} مهام وركزت لمدة {focused_duration}."}]
+  },
+  "focus_started": {
+    "neutral": [{"id": "focus.started.ar.1", "version": 1, "title": "بدأت جلسة التركيز", "body": "جلسة {task_title} بدأت الآن."}]
+  },
+  "focus_ended": {
+    "neutral": [{"id": "focus.ended.ar.1", "version": 1, "title": "انتهت جلسة التركيز", "body": "راجع تقدمك في {task_title}."}]
+  },
+  "task_created": {"neutral": [{"id": "task.created.ar.1", "version": 1, "title": "تمت إضافة المهمة", "body": "تمت إضافة {task_title}."}]},
+  "task_started": {"neutral": [{"id": "task.started.ar.1", "version": 1, "title": "بدأت المهمة", "body": "بدأ العمل على {task_title}."}]},
+  "task_completed": {"neutral": [{"id": "task.completed.ar.1", "version": 1, "title": "اكتملت المهمة", "body": "تم إنجاز {task_title}."}]},
+  "task_failed": {"neutral": [{"id": "task.failed.ar.1", "version": 1, "title": "تم إغلاق المهمة", "body": "تم تسجيل {task_title} كغير مكتملة."}]},
+  "task_deleted": {"neutral": [{"id": "task.deleted.ar.1", "version": 1, "title": "تم حذف المهمة", "body": "تمت إزالة {task_title}."}]},
+  "task_deferred": {"neutral": [{"id": "task.deferred.ar.1", "version": 1, "title": "تم تأجيل المهمة", "body": "تم نقل {task_title} إلى خطة أخرى."}]},
+  "task_updated": {"neutral": [{"id": "task.updated.ar.1", "version": 1, "title": "تم تحديث المهمة", "body": "تم تعديل {task_title}."}]}
+}

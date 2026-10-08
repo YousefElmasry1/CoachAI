@@ -14,7 +14,12 @@ import streamlit as st
 
 from layout import page_setup, page_title, empty_state
 from helpers import format_date_long, format_duration, get_status_icon
-from services import get_current_user_id, load_recent_plans, load_recommendations_for_plan
+from services import (
+    get_current_user_id,
+    load_recent_plans,
+    load_recommendations_for_plan,
+    summarize_plan_history,
+)
 from charts import create_area_chart
 
 
@@ -79,7 +84,7 @@ st.markdown("<div style='height:0.8rem;'></div>", unsafe_allow_html=True)
 # Plan Cards
 # ─────────────────────────────────────────────────────────────
 
-st.markdown(f"#### 🗂️ {len(plans)} Plan(s)")
+st.markdown(f"#### 🗂️ {len(plans)} Planning Batch(es)")
 
 for plan in plans:
     tasks = plan.get("tasks", [])
@@ -87,11 +92,12 @@ for plan in plans:
     completed = sum(1 for t in tasks if t.get("status") == "completed")
     failed = sum(1 for t in tasks if t.get("status") == "failed")
     pending = total - completed - failed
-    total_minutes = sum(t.get("estimated_minutes", 0) for t in tasks)
+    history_summary = summarize_plan_history(plan)
+    total_minutes = history_summary["logical_estimated_minutes"]
     completion_pct = (completed / total * 100) if total else 0.0
 
     header = (
-        f"📅 {format_date_long(plan['plan_date'])}  ·  "
+        f"📅 Planning batch anchored {format_date_long(plan['plan_date'])}  ·  "
         f"{total} tasks  ·  {completion_pct:.0f}% completed  ·  "
         f"{plan.get('status', 'active').title()}"
     )
@@ -101,7 +107,17 @@ for plan in plans:
         m1.metric("Total Tasks", total)
         m2.metric("Completed", completed)
         m3.metric("Failed", failed)
-        m4.metric("Total Time Planned", format_duration(total_minutes))
+        m4.metric("Logical Task Estimate", format_duration(total_minutes))
+        st.caption(
+            "Physical scheduled occupancy: "
+            + (
+                " · ".join(
+                    f"{format_date_long(day)}: {format_duration(minutes)}"
+                    for day, minutes in history_summary["scheduled_minutes_by_date"].items()
+                )
+                or "No scheduled segments"
+            )
+        )
 
         if plan.get("ai_summary"):
             st.markdown(
@@ -118,6 +134,11 @@ for plan in plans:
                         "Priority": t.get("priority", 3),
                         "Est. Min": t.get("estimated_minutes", 0),
                         "Actual Min": t.get("actual_minutes") or "—",
+                        "Scheduled Windows": " · ".join(
+                            f"{format_date_long(segment.get('effective_date') or segment.get('scheduled_date') or plan['plan_date'])} "
+                            f"{str(segment.get('scheduled_start'))[:5]}–{str(segment.get('scheduled_end'))[:5]}"
+                            for segment in (t.get("segments") or [])
+                        ) or "Unscheduled",
                         "Failure Reason": t.get("failure_reason") or "—",
                     }
                     for t in tasks
