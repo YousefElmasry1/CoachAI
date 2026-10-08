@@ -213,7 +213,7 @@ class NotificationPolicy:
             preferences.get("quiet_hours_end"),
         )
         if quiet_end is not None and urgency in {Urgency.NORMAL, Urgency.LOW}:
-            scheduled_for = quiet_end
+            scheduled_for = max(scheduled_for, quiet_end)
 
         explicit_expiry = event.payload.get("expires_at")
         expires_at = (

@@ -171,8 +171,10 @@ class NotificationService:
         )
         for row in claimed:
             self.logger.info(
-                "notification_event_claimed outbox_id=%s user_id=%s worker_id=%s attempt=%s",
-                row["outbox_id"], row["user_id"], owner, row["attempts"],
+                "notification_event_claimed outbox_id=%s user_id=%s worker_id=%s "
+                "event_type=%s attempt=%s operation_id=%s",
+                row["outbox_id"], row["user_id"], owner, row["event_type"],
+                row["attempts"], row.get("schedule_operation_id"),
             )
             try:
                 with self.db.transaction():
@@ -213,7 +215,10 @@ class NotificationService:
                         row["outbox_id"], row["user_id"], worker_id=owner,
                     )
                 processed += 1
-                self.logger.info("notification_event_processed outbox_id=%s user_id=%s", row["outbox_id"], row["user_id"])
+                self.logger.info(
+                    "notification_event_processed outbox_id=%s user_id=%s event_type=%s result=processed",
+                    row["outbox_id"], row["user_id"], row["event_type"],
+                )
             except Exception as exc:
                 self.db.connection.rollback()
                 permanent = isinstance(exc, (ValueError, OwnershipError, json.JSONDecodeError))
@@ -309,6 +314,11 @@ class NotificationService:
         )
         if task is None or task["status"] in {"completed", "failed"}:
             return False
+        if (
+            row.get("notification_type") == "task_reminder"
+            and task["status"] != "pending"
+        ):
+            return False
         revision = row.get("schedule_revision")
         return revision is None or int(revision) == int(task["schedule_revision"] or 0)
 
@@ -383,10 +393,14 @@ class NotificationService:
                     summary["retrying" if outcome["retrying"] else "failed"] += 1
             self.logger.info(
                 "push_delivery_result notification_id=%s delivery_id=%s user_id=%s provider=%s "
-                "platform=%s attempt=%s accepted=%s classification=%s latency_ms=%.2f",
+                "platform=%s notification_type=%s operation_id=%s attempt=%s accepted=%s "
+                "classification=%s result=%s latency_ms=%.2f",
                 row["notification_id"], row["delivery_id"], row["user_id"],
-                provider_name, row.get("platform"), row["retry_count"], result.accepted,
-                result.classification.value if result.classification else "accepted", latency_ms,
+                provider_name, row.get("platform"), row.get("notification_type"),
+                row.get("schedule_operation_id"), row["retry_count"], result.accepted,
+                result.classification.value if result.classification else "accepted",
+                "accepted" if result.accepted else ("retrying" if outcome["retrying"] else "failed"),
+                latency_ms,
             )
         summary["provider_latency_ms"] = round(summary["provider_latency_ms"], 3)
         return summary

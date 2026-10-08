@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import base64
+from email.utils import parsedate_to_datetime
 import json
+import math
 from pathlib import Path
 import time
 from typing import Any
@@ -69,15 +71,28 @@ class APNsProvider:
     def classify_response(cls, status: int, reason: str | None) -> ErrorClassification:
         if reason in cls._PERMANENT_TOKEN:
             return ErrorClassification.PERMANENT_TOKEN
+        if status == 410:
+            return ErrorClassification.PERMANENT_TOKEN
         if reason in cls._AUTH or status == 403:
             return ErrorClassification.AUTHENTICATION
         if status == 429:
             return ErrorClassification.RATE_LIMITED
         if status >= 500:
             return ErrorClassification.TRANSIENT
-        if reason in cls._PERMANENT_REQUEST or status in {400, 404, 405, 410, 413}:
+        if reason in cls._PERMANENT_REQUEST or status in {400, 404, 405, 413}:
             return ErrorClassification.PERMANENT_REQUEST
         return ErrorClassification.UNKNOWN
+
+    def _retry_after_seconds(self, value: str | None) -> int | None:
+        if not value:
+            return None
+        if value.isdigit():
+            return max(1, int(value))
+        try:
+            retry_at = parsedate_to_datetime(value)
+            return max(1, math.ceil(retry_at.timestamp() - float(self._clock())))
+        except (TypeError, ValueError, OverflowError):
+            return None
 
     def send(self, message: PushMessage) -> ProviderResult:
         invalid = self._configuration_error()
@@ -107,7 +122,7 @@ class APNsProvider:
             return ProviderResult(
                 False, classification=self.classify_response(response.status_code, reason),
                 error_code=reason or f"http_{response.status_code}",
-                retry_after_seconds=int(retry_after) if retry_after and retry_after.isdigit() else None,
+                retry_after_seconds=self._retry_after_seconds(retry_after),
             )
         except (httpx.TimeoutException, httpx.NetworkError):
             return ProviderResult(False, classification=ErrorClassification.TRANSIENT, error_code="network_error")

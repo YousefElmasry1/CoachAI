@@ -901,12 +901,20 @@ class NotificationRepository:
     # ------------------------------------------------------------------
     def delivery_targets(self, user_id: str, *, channel: DeliveryChannel | str) -> list[Optional[str]]:
         preferences = self.get_preferences(user_id)
+        channel_value = DeliveryChannel(channel)
         devices = [
             row for row in self.list_devices(user_id, enabled_only=True)
             if row.get("token_invalidated_at") is None
+            and (
+                channel_value is not DeliveryChannel.PUSH
+                or (
+                    row.get("provider") in {"fcm", "apns"}
+                    and bool(row.get("push_token"))
+                )
+            )
         ]
         if not devices:
-            return [] if DeliveryChannel(channel) is DeliveryChannel.PUSH else [None]
+            return [] if channel_value is DeliveryChannel.PUSH else [None]
         policy = str(preferences.get("multi_device_policy") or "primary")
         if policy == "all":
             return [str(row["device_id"]) for row in devices]

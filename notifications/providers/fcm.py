@@ -31,7 +31,9 @@ class FCMProvider:
                 from firebase_admin import credentials, messaging
                 self._firebase, self._messaging = firebase_admin, messaging
                 self._credentials = credentials
-            options = {"projectId": self.config.project_id} if self.config.project_id else None
+            options = {"httpTimeout": self.config.timeout_seconds}
+            if self.config.project_id:
+                options["projectId"] = self.config.project_id
             credential = None
             if self.config.credentials_path:
                 path = Path(self.config.credentials_path)
@@ -60,9 +62,16 @@ class FCMProvider:
             return ErrorClassification.RATE_LIMITED
         if name in {"ThirdPartyAuthError", "UnauthenticatedError"} or code in {"unauthenticated", "authentication-error"}:
             return ErrorClassification.AUTHENTICATION
+        if name in {"RefreshError", "InvalidCredentialsError"}:
+            return ErrorClassification.AUTHENTICATION
+        if name in {"DefaultCredentialsError"}:
+            return ErrorClassification.CONFIGURATION
         if name in {"InvalidArgumentError", "ValueError"} or code == "invalid-argument":
             return ErrorClassification.PERMANENT_REQUEST
-        if name in {"UnavailableError", "InternalError", "DeadlineExceededError", "TimeoutError", "ConnectionError"}:
+        if name in {
+            "UnavailableError", "InternalError", "DeadlineExceededError",
+            "TimeoutError", "ConnectionError", "TransportError",
+        }:
             return ErrorClassification.TRANSIENT
         return ErrorClassification.UNKNOWN
 

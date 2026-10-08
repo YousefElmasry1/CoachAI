@@ -117,6 +117,21 @@ class NotificationPolicyTests(unittest.TestCase):
         self.assertEqual(datetime(2026, 10, 9, 7, 0), normal.scheduled_for)
         self.assertEqual(at_night, high.scheduled_for)
 
+    def test_quiet_hours_never_move_a_later_explicit_schedule_earlier(self):
+        preferences = dict(
+            self.preferences, timezone="UTC",
+            quiet_hours_start="22:00", quiet_hours_end="07:00",
+        )
+        decision = self.policy.decide(
+            self.event(
+                NotificationEventType.TASK_REMINDER_DUE,
+                scheduled_for="2026-10-09T08:50:00",
+                expires_at="2026-10-09T10:00:00",
+            ),
+            preferences, now_utc=datetime(2026, 10, 8, 23, 0),
+        )
+        self.assertEqual(datetime(2026, 10, 9, 8, 50), decision.scheduled_for)
+
     def test_explicit_timing_expiration_and_dedupe(self):
         scheduled = self.now + timedelta(hours=2)
         expires = scheduled + timedelta(minutes=30)

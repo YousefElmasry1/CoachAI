@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
+import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import httpx
 from cryptography.hazmat.primitives import serialization
@@ -90,6 +93,20 @@ class ProviderContractTests(unittest.TestCase):
         self.assertTrue(result.accepted)
         self.assertEqual("projects/test/messages/1", result.provider_message_id)
         self.assertEqual("test-token", _FakeMessaging.last_message.values["token"])
+        self.assertEqual(10.0, provider._app["options"]["httpTimeout"])
+
+    def test_provider_timeout_configuration_is_bounded_and_failure_safe(self):
+        for raw in ("not-a-number", "nan", "inf", "0", "-1"):
+            with self.subTest(raw=raw), patch.dict(
+                os.environ, {"COACHAI_PUSH_TIMEOUT_SECONDS": raw}, clear=False,
+            ):
+                self.assertEqual(10.0, FCMConfig.from_env().timeout_seconds)
+                self.assertEqual(10.0, APNsConfig.from_env().timeout_seconds)
+        with patch.dict(
+            os.environ, {"COACHAI_PUSH_TIMEOUT_SECONDS": "2.5"}, clear=False,
+        ):
+            self.assertEqual(2.5, FCMConfig.from_env().timeout_seconds)
+            self.assertEqual(2.5, APNsConfig.from_env().timeout_seconds)
 
     def test_fcm_missing_credential_file_is_configuration_error(self):
         provider = FCMProvider(
@@ -105,8 +122,11 @@ class ProviderContractTests(unittest.TestCase):
             "SenderIdMismatchError": ErrorClassification.PERMANENT_TOKEN,
             "QuotaExceededError": ErrorClassification.RATE_LIMITED,
             "ThirdPartyAuthError": ErrorClassification.AUTHENTICATION,
+            "RefreshError": ErrorClassification.AUTHENTICATION,
+            "DefaultCredentialsError": ErrorClassification.CONFIGURATION,
             "InvalidArgumentError": ErrorClassification.PERMANENT_REQUEST,
             "UnavailableError": ErrorClassification.TRANSIENT,
+            "TransportError": ErrorClassification.TRANSIENT,
             "UnexpectedProviderError": ErrorClassification.UNKNOWN,
         }
         for name, expected in cases.items():
@@ -160,6 +180,7 @@ class ProviderContractTests(unittest.TestCase):
         cases = [
             (400, "BadDeviceToken", ErrorClassification.PERMANENT_TOKEN),
             (410, "Unregistered", ErrorClassification.PERMANENT_TOKEN),
+            (410, None, ErrorClassification.PERMANENT_TOKEN),
             (403, "InvalidProviderToken", ErrorClassification.AUTHENTICATION),
             (429, "TooManyRequests", ErrorClassification.RATE_LIMITED),
             (500, "InternalServerError", ErrorClassification.TRANSIENT),
@@ -180,6 +201,22 @@ class ProviderContractTests(unittest.TestCase):
             def post(*args, **kwargs): return Response()
         result = APNsProvider(self.apns_config(), client=Client()).send(self.message())
         self.assertEqual(ErrorClassification.RATE_LIMITED, result.classification)
+        self.assertEqual(120, result.retry_after_seconds)
+
+    def test_apns_http_date_retry_after_is_preserved(self):
+        now = 1_800_000_000
+        retry_at = datetime.fromtimestamp(now + 120, timezone.utc)
+        class Response:
+            status_code = 429
+            headers = {"retry-after": format_datetime(retry_at, usegmt=True)}
+            @staticmethod
+            def json(): return {"reason": "TooManyRequests"}
+        class Client:
+            @staticmethod
+            def post(*args, **kwargs): return Response()
+        result = APNsProvider(
+            self.apns_config(), client=Client(), clock=lambda: now,
+        ).send(self.message())
         self.assertEqual(120, result.retry_after_seconds)
 
     def test_apns_timeout_is_transient(self):
@@ -331,6 +368,29 @@ class PushDeliveryRuntimeTests(NotificationTestCase):
         deliveries = self.repo.list_push_deliveries("u1")
         self.assertEqual(["primary"], [row["device_id"] for row in deliveries])
 
+    def test_push_routing_skips_devices_without_push_capability(self):
+        self.repo.update_preferences("u1", multi_device_policy="all")
+        self.repo.register_device(
+            "u1", device_id="missing-token", platform="android", provider="fcm",
+        )
+        self.repo.register_device(
+            "u1", device_id="local-only", platform="android", provider="none",
+            push_token="not-a-provider-token",
+        )
+        self.repo.register_device(
+            "u1", device_id="valid", platform="ios", provider="apns",
+            push_token="valid-token",
+        )
+        self.repo.set_type_preference(
+            "u1", NotificationType.TASK_UNPLACED,
+            preferred_channel=DeliveryChannel.PUSH,
+        )
+        self.create_push("eligible-targets")
+        self.assertEqual(
+            ["valid"],
+            [row["device_id"] for row in self.repo.list_push_deliveries("u1")],
+        )
+
     def test_push_claim_lease_and_recovery(self):
         self.configure_push()
         self.create_push()
@@ -353,6 +413,30 @@ class PushDeliveryRuntimeTests(NotificationTestCase):
         self.db.commit()
         provider = _SequenceProvider("fcm", ProviderResult(True))
         result = NotificationService(self.db, push_providers={"fcm": provider}).process_push_deliveries(now_utc=self.NOW)
+        self.assertEqual(1, result["cancelled"])
+        self.assertEqual([], provider.messages)
+
+    def test_started_task_reminder_is_cancelled_before_provider(self):
+        self.repo.register_device(
+            "u1", device_id="phone", platform="android", provider="fcm",
+            push_token="opaque", is_primary=True,
+        )
+        self.repo.set_type_preference(
+            "u1", NotificationType.TASK_REMINDER,
+            preferred_channel=DeliveryChannel.PUSH,
+        )
+        task_id = self.direct_task(title="Already started")
+        self.service.process_event(DomainEvent.create(
+            user_id="u1", event_type=NotificationEventType.TASK_REMINDER_DUE,
+            task_id=task_id, payload={"task_title": "Already started"},
+            idempotency_key="started-reminder", occurred_at=self.NOW,
+        ), now_utc=self.NOW)
+        self.db.execute("UPDATE tasks SET status='in_progress' WHERE task_id=?", (task_id,))
+        self.db.commit()
+        provider = _SequenceProvider("fcm", ProviderResult(True))
+        result = NotificationService(
+            self.db, push_providers={"fcm": provider},
+        ).process_push_deliveries(now_utc=self.NOW)
         self.assertEqual(1, result["cancelled"])
         self.assertEqual([], provider.messages)
 

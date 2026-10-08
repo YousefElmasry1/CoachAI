@@ -34,7 +34,7 @@ APNs uses HTTP/2 token authentication with an ES256 `.p8` key:
 - `COACHAI_APNS_BUNDLE_ID`
 - `COACHAI_APNS_PRIVATE_KEY`
 
-`COACHAI_PUSH_TIMEOUT_SECONDS` bounds APNs network requests. FCM timeouts and transport are managed by the official Admin SDK.
+`COACHAI_PUSH_TIMEOUT_SECONDS` bounds both APNs and FCM network requests. Invalid, non-finite, zero, or negative values safely fall back to 10 seconds instead of preventing the notification worker from starting.
 
 ## Delivery and retry lifecycle
 
