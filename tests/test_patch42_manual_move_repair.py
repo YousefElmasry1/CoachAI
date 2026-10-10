@@ -596,7 +596,10 @@ class Patch42ManualMoveRepairTests(unittest.TestCase):
             services.get_database = original
         self.assertTrue(reconciliation["errors"])
         operation = self.db.get_schedule_operation(result.operation_id, "a")
-        self.assertIn("temporary failure", operation["calendar_reconciliation_error"])
+        self.assertEqual(
+            "Calendar provider operation failed.",
+            operation["calendar_reconciliation_error"],
+        )
 
     # 45
     def test_45_validation_failure_rolls_back_everything(self):

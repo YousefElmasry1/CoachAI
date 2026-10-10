@@ -73,7 +73,11 @@ users = Table(
     Column("email", String, nullable=False, unique=True),
     Column("display_name", String, nullable=False),
     Column("timezone", String, nullable=False, server_default="UTC"),
+    Column("password_hash", Text),
+    Column("is_disabled", Integer, nullable=False, server_default="0"),
     Column("created_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    Column("updated_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    CheckConstraint("is_disabled IN (0, 1)", name="ck_users_disabled"),
 )
 Index("idx_users_email", users.c.email)
 
@@ -130,6 +134,7 @@ tasks = Table(
     Column("paused_at", DateTime),
     Column("timer_total_paused_seconds", Integer, nullable=False, server_default="0"),
     Column("timer_version", Integer, nullable=False, server_default="0"),
+    Column("version", Integer, nullable=False, server_default="0"),
     Column("created_at", DateTime, nullable=False, server_default=func.current_timestamp()),
     Column("updated_at", DateTime, nullable=False, server_default=func.current_timestamp()),
     Column("google_event_id", String),
@@ -147,6 +152,7 @@ tasks = Table(
     CheckConstraint("actual_minutes >= 0", name="ck_tasks_actual_minutes"),
     CheckConstraint("is_fixed_time IN (0, 1)", name="ck_tasks_is_fixed_time"),
     CheckConstraint("is_break IN (0, 1)", name="ck_tasks_is_break"),
+    CheckConstraint("version >= 0", name="ck_tasks_version"),
 )
 Index("idx_tasks_plan_id", tasks.c.plan_id)
 Index("idx_tasks_category_id", tasks.c.category_id)
@@ -535,6 +541,112 @@ google_calendar_events = Table(
 )
 Index("idx_gcal_events_user_date", google_calendar_events.c.user_id, google_calendar_events.c.event_date)
 
+# Mobile-safe command replay and application-data synchronization.  These are
+# deliberately separate from notification sync: application changes include
+# plans/tasks/segments/settings/calendar state and deletion tombstones.
+idempotency_records = Table(
+    "idempotency_records", metadata,
+    Column("record_id", String, primary_key=True),
+    Column("user_id", String, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False),
+    Column("operation", String, nullable=False),
+    Column("idempotency_key", String, nullable=False),
+    Column("request_hash", String, nullable=False),
+    Column("response_json", Text),
+    Column("created_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    Column("completed_at", DateTime),
+    UniqueConstraint("user_id", "operation", "idempotency_key"),
+)
+Index("idx_idempotency_user_created", idempotency_records.c.user_id, idempotency_records.c.created_at)
+
+# Shared fixed-window counters for paid/high-cost operations.  Unlike the
+# legacy process-local limiter, these rows coordinate every API/worker replica
+# through the canonical database and survive process restarts.
+rate_limit_buckets = Table(
+    "rate_limit_buckets", metadata,
+    Column("user_id", String, ForeignKey("users.user_id", ondelete="CASCADE"), primary_key=True),
+    Column("scope", String, primary_key=True),
+    Column("window_key", Integer, primary_key=True),
+    Column("request_count", Integer, nullable=False, server_default="0"),
+    Column("expires_at", DateTime, nullable=False),
+    Column("updated_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    CheckConstraint("request_count >= 0", name="ck_rate_limit_request_count"),
+)
+Index("idx_rate_limit_expiry", rate_limit_buckets.c.expires_at)
+
+application_sync_state = Table(
+    "application_sync_state", metadata,
+    Column("user_id", String, ForeignKey("users.user_id", ondelete="CASCADE"), primary_key=True),
+    Column("sync_revision", Integer, nullable=False, server_default="0"),
+    Column("minimum_available_revision", Integer, nullable=False, server_default="0"),
+    Column("updated_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    CheckConstraint("sync_revision >= 0", name="ck_app_sync_revision"),
+)
+
+application_changes = Table(
+    "application_changes", metadata,
+    Column("sequence_id", Integer, primary_key=True, autoincrement=True),
+    Column("change_id", String, nullable=False, unique=True),
+    Column("user_id", String, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False),
+    Column("sync_revision", Integer, nullable=False),
+    Column("entity_type", String, nullable=False),
+    Column("entity_id", String, nullable=False),
+    Column("change_type", String, nullable=False),
+    Column("entity_version", Integer),
+    Column("payload", Text, nullable=False, server_default="{}"),
+    Column("created_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    UniqueConstraint("user_id", "sync_revision"),
+    CheckConstraint("change_type IN ('upsert','delete')", name="ck_app_changes_type"),
+)
+Index("idx_app_changes_user_revision", application_changes.c.user_id, application_changes.c.sync_revision)
+
+oauth_states = Table(
+    "oauth_states", metadata,
+    Column("state_hash", String, primary_key=True),
+    Column("user_id", String, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False),
+    Column("provider", String, nullable=False),
+    Column("redirect_uri", Text, nullable=False),
+    Column("code_verifier", Text),
+    Column("expires_at", DateTime, nullable=False),
+    Column("used_at", DateTime),
+    Column("created_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+)
+Index("idx_oauth_states_user_expiry", oauth_states.c.user_id, oauth_states.c.expires_at)
+
+calendar_sync_state = Table(
+    "calendar_sync_state", metadata,
+    Column("user_id", String, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False),
+    Column("calendar_id", String, nullable=False),
+    Column("range_start", Date, nullable=False),
+    Column("range_end", Date, nullable=False),
+    Column("sync_token", Text),
+    Column("status", String, nullable=False, server_default="pending"),
+    Column("last_error", Text),
+    Column("last_success_at", DateTime),
+    Column("updated_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    UniqueConstraint("user_id", "calendar_id"),
+    CheckConstraint("status IN ('pending','running','fresh','error')", name="ck_calendar_sync_state_status"),
+)
+
+calendar_operations = Table(
+    "calendar_operations", metadata,
+    Column("operation_id", String, primary_key=True),
+    Column("user_id", String, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False),
+    Column("operation_type", String, nullable=False),
+    Column("idempotency_key", String, nullable=False),
+    Column("payload", Text, nullable=False),
+    Column("status", String, nullable=False, server_default="queued"),
+    Column("attempts", Integer, nullable=False, server_default="0"),
+    Column("available_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    Column("locked_at", DateTime),
+    Column("locked_by", String),
+    Column("last_error", Text),
+    Column("created_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+    Column("completed_at", DateTime),
+    UniqueConstraint("user_id", "operation_type", "idempotency_key"),
+    CheckConstraint("status IN ('queued','processing','completed','failed','cancelled')", name="ck_calendar_operations_status"),
+)
+Index("idx_calendar_operations_ready", calendar_operations.c.status, calendar_operations.c.available_at)
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -542,6 +654,7 @@ Index("idx_gcal_events_user_date", google_calendar_events.c.user_id, google_cale
 
 DB_NAME: str = "coach_ai.db"
 SCHEMA_FILE: str = "schema.sql"
+ALEMBIC_HEAD: str = "20261009_0002"
 
 # Set DATABASE_URL to point at Postgres in production, e.g.:
 #   postgresql+psycopg2://<USER>:<PASSWORD>@host:5432/coachai
@@ -577,7 +690,14 @@ class Database:
         connection: Active SQLAlchemy Connection instance.
     """
 
-    def __init__(self, db_url: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        db_url: Optional[str] = None,
+        *,
+        engine: Optional[Engine] = None,
+        dispose_engine_on_close: bool = True,
+        check_schema: bool = True,
+    ) -> None:
         """
         Initialise the database manager.
 
@@ -585,41 +705,63 @@ class Database:
             db_url: Optional explicit SQLAlchemy connection URL. When omitted,
                     DATABASE_URL must be configured in the environment or .env.
         """
-        selected_url = db_url or DATABASE_URL
+        selected_url = db_url or (str(engine.url) if engine is not None else None) or DATABASE_URL
         if not selected_url:
             raise RuntimeError(
                 "DATABASE_URL is required. Configure a PostgreSQL URL in the "
                 "environment or the repository-local .env file."
             )
         self.db_url: str = selected_url
-        self.engine: Optional[Engine] = None
+        self.engine: Optional[Engine] = engine
         self.connection: Optional[Connection] = None
+        self._dispose_engine_on_close = bool(dispose_engine_on_close)
+        self._check_schema = bool(check_schema)
         self._transaction_depth: int = 0
         self._transaction_failed: bool = False
-        self._connect()
+        try:
+            self._connect()
+        except Exception:
+            self.close()
+            raise
 
     # ------------------------------------------------------------------
     # Connection lifecycle
     # ------------------------------------------------------------------
 
-    def _connect(self) -> None:
-        """Open the engine/connection and enable foreign keys (SQLite)."""
+    @staticmethod
+    def create_pool(db_url: str) -> Engine:
+        """Create the reusable SQLAlchemy pool described by typed settings."""
+        from backend_config import BackendSettings
+
+        settings = BackendSettings.from_env(database_url=db_url)
         engine_options: dict[str, Any] = {
             "future": True,
             "pool_pre_ping": True,
         }
-        if make_url(self.db_url).get_backend_name() == "postgresql":
+        if make_url(db_url).get_backend_name() == "postgresql":
             # CoachAI persists instants as UTC and applies the user's IANA
             # timezone at the service/UI boundary. Pinning each PostgreSQL
             # session to UTC prevents machine-local timezone settings from
             # changing aware-datetime input or timestamp comparisons.
-            engine_options["connect_args"] = {"options": "-c timezone=UTC"}
-        self.engine = create_engine(self.db_url, **engine_options)
+            engine_options.update({
+                "connect_args": {"options": "-c timezone=UTC"},
+                "pool_size": settings.db_pool_size,
+                "max_overflow": settings.db_max_overflow,
+                "pool_timeout": settings.db_pool_timeout_seconds,
+                "pool_recycle": settings.db_pool_recycle_seconds,
+            })
+        return create_engine(db_url, **engine_options)
+
+    def _connect(self) -> None:
+        """Acquire one explicit connection and enable foreign keys (SQLite)."""
+        if self.engine is None:
+            self.engine = self.create_pool(self.db_url)
         self.connection = self.engine.connect()
         if self.is_sqlite:
             self.connection.execute(text("PRAGMA foreign_keys = ON"))
             self.connection.commit()
-        self._maybe_create_schema()
+        if self._check_schema:
+            self._maybe_create_schema()
 
     @property
     def is_sqlite(self) -> bool:
@@ -644,7 +786,7 @@ class Database:
                 pass
             finally:
                 self.connection = None
-        if self.engine:
+        if self.engine and self._dispose_engine_on_close:
             try:
                 self.engine.dispose()
             except SQLAlchemyError:
@@ -679,18 +821,26 @@ class Database:
           below, unchanged from before — this is what your existing
           coach_ai.db already went through, so it keeps working exactly
           as-is.
-        - Any other dialect (Postgres in production): a fresh database
-          is created directly from the ``metadata`` Table objects above
-          via ``metadata.create_all()``. Those definitions already
-          include every column the SQLite migrations add over time
-          (e.g. ``google_event_id``, the updated failure_reason CHECK),
-          so a new Postgres database starts at the final schema and
-          never needs to run the SQLite migration methods at all.
+        - PostgreSQL: startup is validation-only. Alembic must have upgraded
+          the database to the application head before a process can serve
+          work. Runtime code never creates or mutates production schema.
         """
         if not self.is_sqlite:
             inspector = inspect(self.engine)
-            if not inspector.get_table_names():
-                metadata.create_all(self.engine)
+            tables = set(inspector.get_table_names())
+            if "alembic_version" not in tables:
+                raise RuntimeError(
+                    "PostgreSQL schema is not managed by Alembic. Run "
+                    "`python -m alembic upgrade head` before starting CoachAI."
+                )
+            revision = self.connection.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one_or_none()
+            if revision != ALEMBIC_HEAD:
+                raise RuntimeError(
+                    f"PostgreSQL schema revision {revision!r} is not the required "
+                    f"CoachAI revision {ALEMBIC_HEAD!r}. Run Alembic upgrade head."
+                )
             return
 
         cursor = self.connection.execute(
@@ -708,9 +858,11 @@ class Database:
             self._maybe_migrate_task_pause_count()
             self._maybe_migrate_task_pause_duration_fields()
             self._maybe_migrate_task_timer_version()
+            self._maybe_migrate_user_password_hash()
             self._maybe_create_smart_scheduling_schema()
             self._maybe_create_future_planning_schema()
             self._maybe_create_notification_schema()
+            self._maybe_create_mobile_core_schema()
             return  # Schema already applied
 
         schema_path = Path(__file__).with_name(SCHEMA_FILE)
@@ -744,6 +896,7 @@ class Database:
         self._maybe_create_smart_scheduling_schema()
         self._maybe_create_future_planning_schema()
         self._maybe_create_notification_schema()
+        self._maybe_create_mobile_core_schema()
 
     def _maybe_create_smart_scheduling_schema(self) -> None:
         """Create the segmented scheduler schema and safely backfill valid rows.
@@ -1291,6 +1444,42 @@ class Database:
             )
             self.connection.commit()
 
+    def _maybe_create_mobile_core_schema(self) -> None:
+        """Bring explicit-test/legacy SQLite schemas to the mobile-core shape.
+
+        Production PostgreSQL is migrated with Alembic.  This compatibility
+        path remains intentionally SQLite-only so historical local files and
+        isolated tests keep working without becoming the production migration
+        mechanism.
+        """
+        if not self.is_sqlite:
+            return
+        user_columns = {
+            row[1] for row in self.connection.execute(text("PRAGMA table_info(users)")).fetchall()
+        }
+        if "password_hash" not in user_columns:
+            self.connection.execute(text("ALTER TABLE users ADD COLUMN password_hash TEXT"))
+        if "is_disabled" not in user_columns:
+            self.connection.execute(
+                text("ALTER TABLE users ADD COLUMN is_disabled INTEGER NOT NULL DEFAULT 0")
+            )
+        if "updated_at" not in user_columns:
+            # SQLite cannot add a column with a non-constant CURRENT_TIMESTAMP
+            # default. Historical files receive a nullable compatibility
+            # column; fresh schemas and PostgreSQL retain the canonical
+            # non-null/default constraint.
+            self.connection.execute(text("ALTER TABLE users ADD COLUMN updated_at DATETIME"))
+            self.connection.execute(text("UPDATE users SET updated_at=CURRENT_TIMESTAMP"))
+        task_columns = {
+            row[1] for row in self.connection.execute(text("PRAGMA table_info(tasks)")).fetchall()
+        }
+        if "version" not in task_columns:
+            self.connection.execute(
+                text("ALTER TABLE tasks ADD COLUMN version INTEGER NOT NULL DEFAULT 0")
+            )
+        self.connection.commit()
+        metadata.create_all(self.engine)
+
     # ------------------------------------------------------------------
     # Low-level query helpers
     #
@@ -1622,14 +1811,23 @@ class Database:
                 self.connection.close()
             except SQLAlchemyError:
                 pass
-        if self.engine is not None:
+        if self.engine is not None and self._dispose_engine_on_close:
             try:
                 self.engine.dispose()
             except SQLAlchemyError:
                 pass
         self.connection = None
-        self.engine = None
-        self._connect()
+        if self._dispose_engine_on_close:
+            self.engine = None
+        # Schema was already validated when this Database instance started;
+        # reconnecting after a network failure must not run migration checks
+        # inside application work.
+        previous_check = self._check_schema
+        self._check_schema = False
+        try:
+            self._connect()
+        finally:
+            self._check_schema = previous_check
 
     # =====================================================================
     # USERS
@@ -2072,6 +2270,15 @@ class Database:
             raise OwnershipError(
                 f"Plan {plan_id} not found or not owned by user {user_id!r}."
             )
+        if category_id is not None:
+            category = self.fetch_one(
+                "SELECT category_id FROM categories WHERE category_id=? AND user_id=?",
+                (category_id, user_id),
+            )
+            if category is None:
+                raise OwnershipError(
+                    "Category was not found or is not owned by this user."
+                )
         earliest_value = self._parse_local_planning_datetime(earliest_start)
         deadline_value = self._parse_local_planning_datetime(deadline)
         self._validate_user_local_planning_datetime(user_id, earliest_value)
@@ -2226,6 +2433,16 @@ class Database:
                 raise OwnershipError(
                     f"Destination plan {updates['plan_id']!r} not found or "
                     f"not owned by user {user_id!r}."
+                )
+
+        if updates.get("category_id") is not None:
+            category = self.fetch_one(
+                "SELECT category_id FROM categories WHERE category_id=? AND user_id=?",
+                (updates["category_id"], user_id),
+            )
+            if category is None:
+                raise OwnershipError(
+                    "Category was not found or is not owned by this user."
                 )
 
         set_clause = ", ".join(f"{col} = ?" for col in updates)
@@ -2962,6 +3179,85 @@ class Database:
         return None
 
     def close_out_stale_tasks(self, user_id: str) -> int:
+        """CAS-close past-day tasks atomically and emit durable effects.
+
+        This maintenance transition is intentionally separate from the
+        user-command state machine: it is a server-owned end-of-day failure.
+        A concurrent user command wins through the version/status predicate.
+        """
+
+        tz_name = get_user_timezone(self, user_id)
+        today = user_today(self, user_id).isoformat()
+        stale = self.fetch_all(
+            """SELECT t.task_id,t.status,t.version,t.title,t.estimated_minutes,
+                      p.plan_date AS plan_date
+                 FROM tasks t JOIN plans p ON p.plan_id=t.plan_id
+                WHERE p.user_id=? AND p.plan_date<?
+                  AND t.status IN ('pending','in_progress')""",
+            (user_id, today),
+        )
+        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        now_text = now_utc.strftime("%Y-%m-%d %H:%M:%S")
+        closed = 0
+        with self.transaction():
+            for row in stale:
+                task = self.get_task(int(row["task_id"]), user_id)
+                if task is None:
+                    continue
+                actual_minutes = 0
+                if row["status"] == "in_progress":
+                    calculated = self._stale_task_actual_minutes(
+                        task, str(row["plan_date"]), tz_name
+                    )
+                    actual_minutes = int(
+                        calculated
+                        if calculated is not None
+                        else task.get("estimated_minutes") or 0
+                    )
+                result = self.execute(
+                    """UPDATE tasks
+                          SET status='failed',failure_reason='Ran out of time',
+                              actual_minutes=?,completed_at=?,updated_at=?,
+                              timer_accumulated_seconds=?,
+                              timer_segment_started_at=NULL,paused_at=NULL,
+                              timer_version=timer_version+1,version=version+1
+                        WHERE task_id=? AND version=? AND status=?
+                          AND plan_id IN
+                              (SELECT plan_id FROM plans WHERE user_id=?)""",
+                    (
+                        actual_minutes,
+                        now_text,
+                        now_text,
+                        max(0, actual_minutes * 60),
+                        int(row["task_id"]),
+                        int(row.get("version") or 0),
+                        str(row["status"]),
+                        user_id,
+                    ),
+                )
+                if result.rowcount != 1:
+                    continue
+                self._enqueue_notification_event_no_commit(
+                    user_id=user_id,
+                    event_type="TASK_FAILED",
+                    task_id=int(row["task_id"]),
+                    scheduled_date=str(row["plan_date"]),
+                    payload={
+                        "task_title": str(row["title"]),
+                        "previous_status": str(row["status"]),
+                        "actual_minutes": actual_minutes,
+                        "failure_reason": "Ran out of time",
+                    },
+                    idempotency_key=(
+                        f"stale-close:{int(row['task_id'])}:"
+                        f"{int(row.get('version') or 0) + 1}"
+                    ),
+                    bump_sync_revision=True,
+                )
+                closed += 1
+        return closed
+
+    def _legacy_close_out_stale_tasks(self, user_id: str) -> int:
         """
         Auto-close any task left ``pending``/``in_progress`` on a
         past-dated plan for this user, so tasks never sit unresolved
@@ -3180,6 +3476,16 @@ class Database:
         updates = {k: v for k, v in kwargs.items() if k in allowed}
         if not updates:
             return
+
+        if updates.get("favorite_category_id") is not None:
+            category = self.fetch_one(
+                "SELECT category_id FROM categories WHERE category_id=? AND user_id=?",
+                (updates["favorite_category_id"], user_id),
+            )
+            if category is None:
+                raise OwnershipError(
+                    "Favorite category was not found or is not owned by this user."
+                )
 
         set_clause = ", ".join(f"{col} = ?" for col in updates)
         values = list(updates.values()) + [user_id]

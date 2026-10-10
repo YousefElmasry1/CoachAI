@@ -396,6 +396,7 @@ class SchedulerService:
         priority: int = 3,
         order_index: int = 0,
         blocked_slots: Optional[list[tuple]] = None,
+        expected_revision: Optional[int] = None,
     ) -> SchedulingActionResult:
         """Create and place one current-day task as one atomic operation.
 
@@ -416,7 +417,12 @@ class SchedulerService:
         if plan is None:
             raise ValueError("Today's plan was not found for this user.")
         plan_date = self._parse_plan_date(plan)
-        expected_revision = int(plan["schedule_revision"] or 0)
+        current_revision = int(plan["schedule_revision"] or 0)
+        if expected_revision is not None and current_revision != int(expected_revision):
+            raise StaleScheduleError(
+                "Today's schedule changed before the task could be added."
+            )
+        expected_revision = current_revision
         existing_tasks = self.db.get_tasks_with_segments(plan_id, user_id)
         existing_segments = self.db.get_plan_segments(plan_id, user_id)
         progress_state = {
@@ -1054,6 +1060,7 @@ class SchedulerService:
         user_id: str,
         preferences: SchedulingPreferences,
         blocked_slots: Optional[list[tuple]] = None,
+        expected_revision: Optional[int] = None,
     ) -> list[ScheduledTask]:
 
         # Per-run state must never leak across attempts.  In particular, a
@@ -1073,6 +1080,13 @@ class SchedulerService:
         if plan is None:
             raise ValueError(
                 f"No plan found with plan_id {plan_id} for user {user_id!r}."
+            )
+        if (
+            expected_revision is not None
+            and int(plan["schedule_revision"] or 0) != int(expected_revision)
+        ):
+            raise StaleScheduleError(
+                "The schedule changed before this scheduling request was applied."
             )
 
         plan_date = self._parse_plan_date(plan)

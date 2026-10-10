@@ -83,6 +83,18 @@ class DownstreamSegmentContractTests(unittest.TestCase):
         self.assertEqual(2, len(result["tasks"][0]["segments"]))
         self.assertEqual(60, result["total_planned_minutes"])
 
+    def test_chatbot_core_tool_uses_explicit_database_without_streamlit_services(self):
+        with patch.object(
+            services, "get_database", side_effect=AssertionError("legacy DB used")
+        ), patch.object(
+            self.db,
+            "get_today_plan",
+            return_value={"plan_id": self.plan, "plan_date": "2026-09-30"},
+        ):
+            result = chatbot_service._impl_get_today_tasks("u", self.db)
+        self.assertEqual(1, len(result["tasks"]))
+        self.assertEqual(2, len(result["tasks"][0]["segments"]))
+
     def test_recommendation_prompt_has_one_line_and_all_windows(self):
         task = self.db.get_tasks_with_segments(self.plan, "u")[0]
         text = RecommendationService(self.db)._format_schedule_text([task])

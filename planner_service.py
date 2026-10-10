@@ -28,7 +28,9 @@ from planner import PlannerEngine, DayPlanOutput, TaskOutput
 from database import Database
 from config import CHART_COLORS
 from text_matching import normalize_for_matching, is_break_term
-from rate_limiter import RateLimiter
+from backend_errors import InvalidStateTransition, ValidationError
+from domain_validation import MAX_AI_TASKS, validate_ai_input
+from rate_limiter import DatabaseRateLimiter
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -36,12 +38,6 @@ from rate_limiter import RateLimiter
 
 # Fallback color used for a new category if the AI didn't suggest one.
 _DEFAULT_CATEGORY_COLOR: str = CHART_COLORS[0]
-
-# Per-user rate limit on AI planning requests: normal usage is at most
-# a handful of drafts per minute (revise wording, redraft, save); this
-# leaves generous headroom while stopping a rapid-fire loop.
-_PLAN_RATE_LIMITER = RateLimiter(max_requests=6, window_seconds=60.0)
-
 
 # ---------------------------------------------------------------------------
 # Planner Service
@@ -57,6 +53,12 @@ class PlannerService:
         """
         self.db: Database = db
         self._engine: Optional[PlannerEngine] = None
+        self._draft_limiter = DatabaseRateLimiter(
+            db,
+            scope="ai.plan_draft",
+            max_requests=6,
+            window_seconds=60,
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -168,18 +170,16 @@ class PlannerService:
         # Not found - create it, regardless of what is_new_category said,
         # since the lookup is the source of truth for what already exists.
         color = task.suggested_category_color or _DEFAULT_CATEGORY_COLOR
-        try:
-            category_id = self.db.create_category(
-                user_id=user_id,
-                name=name,
-                color=color,
-            )
-        except Exception:
+        category_id = self.db.create_category(
+            user_id=user_id,
+            name=name,
+            color=color,
+        )
+            # Never continue after a write error: PostgreSQL marks the active
+            # transaction failed and the whole explicit Apply must roll back.
             # Name collided with an existing category in a race, or an
             # invalid color was supplied — fall back to no category
             # rather than failing the whole plan.
-            refreshed = self._load_existing_categories(user_id)
-            return refreshed.get(key)
 
         category_lookup[key] = category_id
         return category_id
@@ -264,11 +264,9 @@ class PlannerService:
             ValueError: If raw_input is empty.
             RuntimeError: If the Planner engine fails.
         """
-        cleaned_input = raw_input.strip()
-        if not cleaned_input:
-            raise ValueError("raw_input cannot be empty.")
+        cleaned_input = validate_ai_input(raw_input)
 
-        _PLAN_RATE_LIMITER.check(str(user_id))
+        self._draft_limiter.check(str(user_id))
 
         category_lookup = self._load_existing_categories(user_id)
         engine = self._get_engine()
@@ -282,6 +280,41 @@ class PlannerService:
         )
 
     def save_plan(
+        self,
+        plan_output: DayPlanOutput,
+        raw_input: str,
+        user_id: str,
+    ) -> dict[str, Any]:
+        """Validate a reviewed AI draft and apply it atomically.
+
+        This method performs no model call.  Every category, plan, task,
+        segment, revision, sync change and outbox write either commits as one
+        unit or is rolled back as one unit.
+        """
+
+        cleaned_input = validate_ai_input(raw_input)
+        try:
+            candidate = (
+                plan_output.model_dump(mode="python")
+                if isinstance(plan_output, DayPlanOutput)
+                else plan_output
+            )
+            validated = DayPlanOutput.model_validate(candidate)
+        except Exception as exc:
+            raise ValidationError(
+                "The AI draft is malformed and was not saved."
+            ) from exc
+        if not validated.tasks:
+            raise ValidationError("The AI draft contains no tasks to apply.")
+        if len(validated.tasks) > MAX_AI_TASKS:
+            # Defensive for models constructed without validation.
+            raise ValidationError(
+                f"An AI draft cannot contain more than {MAX_AI_TASKS} tasks."
+            )
+        with self.db.transaction():
+            return self._save_plan_no_commit(validated, cleaned_input, user_id)
+
+    def _save_plan_no_commit(
         self,
         plan_output: DayPlanOutput,
         raw_input: str,
@@ -370,7 +403,10 @@ class PlannerService:
         user_id: str,
     ) -> dict[str, Any]:
         """
-        Turn free-form text into structured tasks and persist them in
+        QUARANTINED: direct model-to-persistence entry point. This method no
+        longer performs either operation; callers must preview then Apply.
+
+        Historically this turned free-form text into tasks and persisted them in
         one call — convenience wrapper for callers that don't need to
         inspect the draft first (e.g. don't need a capacity check).
 
@@ -388,7 +424,8 @@ class PlannerService:
             ValueError: If raw_input is empty.
             RuntimeError: If the Planner engine fails.
         """
-        plan_output = self.draft_plan(raw_input=raw_input, user_id=user_id)
-        return self.save_plan(
-            plan_output=plan_output, raw_input=raw_input, user_id=user_id,
+        raise InvalidStateTransition(
+            "AI planning requires a reviewed draft followed by explicit Apply.",
+            current="draft_not_reviewed",
+            requested="persist",
         )

@@ -20,20 +20,17 @@ import re
 from datetime import date, timedelta
 from typing import Any, Optional
 
-from dotenv import load_dotenv
-
 from text_matching import normalize_for_matching
-from rate_limiter import RateLimiter, RateLimitExceeded
-
-load_dotenv()
+from rate_limiter import DatabaseRateLimiter, RateLimitExceeded
+from backend_errors import ConfigurationError
+from domain_validation import MAX_AI_INPUT_CHARS, MAX_AI_OUTPUT_TOKENS
 
 # ─────────────────────────────────────────────────────────────
 # Logging
 # ─────────────────────────────────────────────────────────────
-# Prints the full exception type/message for any Gemini API error so
-# the real cause (rate limit vs quota vs invalid key, etc.) is visible
-# in the server logs instead of only the generic message shown to the
-# user in the UI.
+# Logs bounded failure categories and exception class names only. Provider
+# messages and tracebacks are deliberately excluded because they may contain
+# request data, account metadata, or credentials.
 logger = logging.getLogger("coachai.chatbot_service")
 if not logger.handlers:
     _handler = logging.StreamHandler()
@@ -258,6 +255,45 @@ def _get_api_key() -> Optional[str]:
     return os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
 
 
+def _ai_timeout_seconds() -> float:
+    try:
+        value = float(os.getenv("COACHAI_AI_TIMEOUT_SECONDS", "20"))
+    except ValueError as exc:
+        raise ConfigurationError("COACHAI_AI_TIMEOUT_SECONDS must be numeric.") from exc
+    if not 0.1 <= value <= 120:
+        raise ConfigurationError(
+            "COACHAI_AI_TIMEOUT_SECONDS must be between 0.1 and 120 seconds."
+        )
+    return value
+
+
+def _resolve_database(db=None):
+    """Resolve the legacy UI database only when no explicit core DB is supplied."""
+    if db is not None:
+        return db
+    from services import get_database
+
+    return get_database()
+
+
+def _build_analytics_profile(user_id: str, db=None):
+    if db is None:
+        from services import load_analytics_profile
+        from config import DEFAULT_ANALYTICS_WINDOW
+
+        return load_analytics_profile(
+            user_id=user_id, window_days=DEFAULT_ANALYTICS_WINDOW,
+        )
+    from analytics import AnalyticsEngine
+    from config import DEFAULT_ANALYTICS_WINDOW
+
+    return AnalyticsEngine(db).build_profile(
+        user_id=user_id,
+        window_days=DEFAULT_ANALYTICS_WINDOW,
+        language="en",
+    )
+
+
 # ─────────────────────────────────────────────────────────────
 # Tool Declarations (Gemini Function Calling)
 # ─────────────────────────────────────────────────────────────
@@ -379,15 +415,26 @@ def _build_tool_declarations():
 # Tool Implementations (reusing existing CoachAI services)
 # ─────────────────────────────────────────────────────────────
 
-def _impl_get_today_tasks(user_id: str) -> dict:
+def _impl_get_today_tasks(user_id: str, db=None) -> dict:
     """Retrieve today's tasks using existing services."""
-    from services import load_today_tasks, load_today_plan, load_categories
+    if db is None:
+        # Keep the historical UI adapter for direct legacy calls and tests.
+        from services import load_today_tasks, load_today_plan, load_categories
 
-    plan = load_today_plan(user_id=user_id)
+        plan = load_today_plan(user_id=user_id)
+        tasks = load_today_tasks(user_id=user_id) if plan is not None else []
+        categories = load_categories(user_id=user_id) if plan is not None else []
+    else:
+        row = db.get_today_plan(user_id)
+        plan = dict(row) if row is not None else None
+        tasks = (
+            db.get_tasks_with_segments(int(plan["plan_id"]), user_id)
+            if plan is not None else []
+        )
+        categories = [dict(row) for row in db.get_categories(user_id)]
     if plan is None:
         return {"has_plan": False, "message": "No plan created for today."}
 
-    tasks = load_today_tasks(user_id=user_id)
     if not tasks:
         return {
             "has_plan": True,
@@ -397,7 +444,6 @@ def _impl_get_today_tasks(user_id: str) -> dict:
         }
 
     # Build category lookup for readable names
-    categories = load_categories(user_id=user_id)
     cat_map = {c["category_id"]: c["name"] for c in categories}
 
     task_list = []
@@ -440,13 +486,12 @@ def _impl_get_today_tasks(user_id: str) -> dict:
     }
 
 
-def _impl_get_task_history(user_id: str, days: int = 14) -> dict:
+def _impl_get_task_history(user_id: str, days: int = 14, db=None) -> dict:
     """Retrieve task history using existing database functions."""
-    from services import get_database
     from timezone_utils import user_today
 
     days = max(1, min(days, 90))
-    db = get_database()
+    db = _resolve_database(db)
     since_date = user_today(db, user_id) - timedelta(days=days)
 
     rows = db.get_recent_tasks_for_user(user_id=user_id, since_date=since_date)
@@ -486,15 +531,10 @@ def _impl_get_task_history(user_id: str, days: int = 14) -> dict:
     }
 
 
-def _impl_get_productivity_summary(user_id: str) -> dict:
+def _impl_get_productivity_summary(user_id: str, db=None) -> dict:
     """Retrieve productivity summary using existing analytics engine."""
-    from services import load_analytics_profile
-    from config import DEFAULT_ANALYTICS_WINDOW
-
     try:
-        profile = load_analytics_profile(
-            user_id=user_id, window_days=DEFAULT_ANALYTICS_WINDOW,
-        )
+        profile = _build_analytics_profile(user_id, db)
     except Exception:
         return {"error": "Could not load analytics. There may not be enough data yet."}
 
@@ -520,15 +560,10 @@ def _impl_get_productivity_summary(user_id: str) -> dict:
     }
 
 
-def _impl_get_productivity_by_hour(user_id: str) -> dict:
+def _impl_get_productivity_by_hour(user_id: str, db=None) -> dict:
     """Retrieve best productivity hour from existing analytics."""
-    from services import load_analytics_profile
-    from config import DEFAULT_ANALYTICS_WINDOW
-
     try:
-        profile = load_analytics_profile(
-            user_id=user_id, window_days=DEFAULT_ANALYTICS_WINDOW,
-        )
+        profile = _build_analytics_profile(user_id, db)
     except Exception:
         return {"error": "Could not load analytics. There may not be enough data yet."}
 
@@ -547,20 +582,17 @@ def _impl_get_productivity_by_hour(user_id: str) -> dict:
     }
 
 
-def _impl_get_completion_rate(user_id: str) -> dict:
+def _impl_get_completion_rate(user_id: str, db=None) -> dict:
     """Retrieve detailed completion/failure breakdown."""
-    from services import load_analytics_profile, get_database
     from config import DEFAULT_ANALYTICS_WINDOW
 
     try:
-        profile = load_analytics_profile(
-            user_id=user_id, window_days=DEFAULT_ANALYTICS_WINDOW,
-        )
+        profile = _build_analytics_profile(user_id, db)
     except Exception:
         return {"error": "Could not load analytics."}
 
     # Get failure reason distribution
-    db = get_database()
+    db = _resolve_database(db)
     from timezone_utils import user_today
     since_date = user_today(db, user_id) - timedelta(days=DEFAULT_ANALYTICS_WINDOW)
     failure_rows = db.get_failure_reason_counts(
@@ -583,15 +615,10 @@ def _impl_get_completion_rate(user_id: str) -> dict:
     }
 
 
-def _impl_get_weekly_analysis(user_id: str) -> dict:
+def _impl_get_weekly_analysis(user_id: str, db=None) -> dict:
     """Retrieve weekly trends and consistency data."""
-    from services import load_analytics_profile
-    from config import DEFAULT_ANALYTICS_WINDOW
-
     try:
-        profile = load_analytics_profile(
-            user_id=user_id, window_days=DEFAULT_ANALYTICS_WINDOW,
-        )
+        profile = _build_analytics_profile(user_id, db)
     except Exception:
         return {"error": "Could not load analytics."}
 
@@ -631,11 +658,18 @@ def _impl_get_weekly_analysis(user_id: str) -> dict:
     return result
 
 
-def _impl_get_daily_analysis(user_id: str) -> dict:
+def _impl_get_daily_analysis(user_id: str, db=None) -> dict:
     """Analyze today's workload vs historical capacity."""
-    from services import load_today_tasks, check_capacity_for_today
+    if db is None:
+        from services import load_today_tasks
 
-    tasks = load_today_tasks(user_id=user_id)
+        tasks = load_today_tasks(user_id=user_id)
+    else:
+        plan = db.get_today_plan(user_id)
+        tasks = (
+            db.get_tasks_with_segments(int(plan["plan_id"]), user_id)
+            if plan is not None else []
+        )
 
     if not tasks:
         return {
@@ -673,10 +707,35 @@ def _impl_get_daily_analysis(user_id: str) -> dict:
 
     # Add capacity analysis from existing service
     try:
-        capacity = check_capacity_for_today(
-            additional_minutes=0,
-            user_id=user_id,
-        )
+        if db is None:
+            from services import check_capacity_for_today
+
+            capacity = check_capacity_for_today(
+                additional_minutes=0,
+                user_id=user_id,
+            )
+        else:
+            from config import (
+                CAPACITY_MIN_CONFIDENCE_TO_WARN,
+                CAPACITY_OVERLOAD_MARGIN,
+            )
+
+            profile = _build_analytics_profile(user_id, db)
+            realistic = profile.capacity
+            recommended = realistic.recommended_daily_minutes
+            overload_fraction = (
+                (total_estimated - recommended) / recommended
+                if recommended > 0 else 0.0
+            )
+            capacity = {
+                "recommended_minutes": recommended,
+                "triggered": (
+                    realistic.confidence.level in CAPACITY_MIN_CONFIDENCE_TO_WARN
+                    and overload_fraction >= CAPACITY_OVERLOAD_MARGIN
+                ),
+                "overload_fraction": overload_fraction,
+                "confidence": realistic.confidence.level,
+            }
         result["recommended_daily_minutes"] = capacity["recommended_minutes"]
         result["is_overloaded"] = capacity["triggered"]
         result["overload_fraction"] = round(capacity["overload_fraction"], 3)
@@ -687,15 +746,13 @@ def _impl_get_daily_analysis(user_id: str) -> dict:
     return result
 
 
-def _impl_get_similar_tasks(user_id: str, task_keyword: str) -> dict:
+def _impl_get_similar_tasks(user_id: str, task_keyword: str, db=None) -> dict:
     """Search task history for similar tasks by keyword."""
-    from services import get_database
-
     if not task_keyword or not task_keyword.strip():
         return {"error": "Please provide a keyword to search for."}
 
     keyword = normalize_for_matching(task_keyword)
-    db = get_database()
+    db = _resolve_database(db)
     from timezone_utils import user_today
     since_date = user_today(db, user_id) - timedelta(days=90)
 
@@ -757,37 +814,41 @@ def _impl_get_similar_tasks(user_id: str, task_keyword: str) -> dict:
 # ─────────────────────────────────────────────────────────────
 
 _TOOL_DISPATCH: dict[str, Any] = {
-    "get_today_tasks": lambda uid, args: _impl_get_today_tasks(uid),
-    "get_task_history": lambda uid, args: _impl_get_task_history(
-        uid, int(args.get("days", 14)),
+    "get_today_tasks": lambda uid, args, db: _impl_get_today_tasks(uid, db),
+    "get_task_history": lambda uid, args, db: _impl_get_task_history(
+        uid, int(args.get("days", 14)), db,
     ),
-    "get_productivity_summary": lambda uid, args: _impl_get_productivity_summary(uid),
-    "get_productivity_by_hour": lambda uid, args: _impl_get_productivity_by_hour(uid),
-    "get_completion_rate": lambda uid, args: _impl_get_completion_rate(uid),
-    "get_weekly_analysis": lambda uid, args: _impl_get_weekly_analysis(uid),
-    "get_daily_analysis": lambda uid, args: _impl_get_daily_analysis(uid),
-    "get_similar_tasks": lambda uid, args: _impl_get_similar_tasks(
-        uid, args.get("task_keyword", ""),
+    "get_productivity_summary": lambda uid, args, db: _impl_get_productivity_summary(uid, db),
+    "get_productivity_by_hour": lambda uid, args, db: _impl_get_productivity_by_hour(uid, db),
+    "get_completion_rate": lambda uid, args, db: _impl_get_completion_rate(uid, db),
+    "get_weekly_analysis": lambda uid, args, db: _impl_get_weekly_analysis(uid, db),
+    "get_daily_analysis": lambda uid, args, db: _impl_get_daily_analysis(uid, db),
+    "get_similar_tasks": lambda uid, args, db: _impl_get_similar_tasks(
+        uid, args.get("task_keyword", ""), db,
     ),
 }
 
 
-def _execute_tool(tool_name: str, tool_args: dict, user_id: str) -> str:
+def _execute_tool(tool_name: str, tool_args: dict, user_id: str, *, db=None) -> str:
     """Execute a chatbot tool by name and return the result as a JSON string."""
     handler = _TOOL_DISPATCH.get(tool_name)
     if handler is None:
-        return json.dumps({"error": f"Unknown tool: {tool_name}"})
+        return json.dumps({
+            "error": "unknown_tool",
+            "message": "The requested operation is not available.",
+        })
 
     try:
-        result = handler(user_id, tool_args)
+        result = handler(user_id, tool_args, db)
         return json.dumps(result, default=str)
     except Exception as exc:
-        logger.exception(
-            "Tool execution failed | tool=%s args=%s user_id=%s",
-            tool_name, tool_args, user_id,
+        logger.warning(
+            "Chatbot tool execution failed | tool=%s error_type=%s",
+            tool_name,
+            type(exc).__name__,
         )
         return json.dumps({
-            "error": f"Tool execution failed: {type(exc).__name__}",
+            "error": "tool_execution_failed",
             "message": "Could not retrieve the requested data.",
         })
 
@@ -798,54 +859,39 @@ def _execute_tool(tool_name: str, tool_args: dict, user_id: str) -> str:
 
 def _classify_and_log_error(exc: Exception, context: str) -> str:
     """
-    Log the full exception (type + message + traceback) so the real
-    cause is visible in the server logs, then return a short, safe
-    error category string ('permission' | 'quota' | 'blocked' | 'other')
-    used to pick the user-facing message.
+    Classify a provider failure and record only bounded diagnostics.
 
-    This does not change what the user sees — it only makes the
-    underlying cause inspectable in the logs (e.g. to tell apart a
-    per-minute rate limit, a daily quota, or a project with no billing
-    enabled, all of which currently surface as the same generic
-    "rate limit reached" message).
+    Provider messages and tracebacks may contain request data, credentials,
+    or account details, so neither is written to application logs.
     """
     error_str = str(exc).lower()
     error_type = type(exc).__name__
 
-    # Log everything we have: exception type, message, and full
-    # traceback, plus which code path triggered it.
-    logger.error(
-        "Gemini API error in %s | type=%s | message=%s",
-        context, error_type, exc,
-    )
-    logger.debug("Full traceback for Gemini API error in %s:", context, exc_info=True)
-
     if "permission" in error_type.lower() or "invalid" in error_str:
-        return "permission"
+        category = "permission"
     elif "resourceexhausted" in error_type.lower() or "quota" in error_str:
-        # Try to surface a retry delay if the SDK/exception exposes one,
-        # since Gemini often includes a suggested wait time.
-        retry_delay = getattr(exc, "retry_delay", None) or getattr(
-            exc, "retry_after", None,
-        )
-        if retry_delay:
-            logger.error(
-                "Quota/rate-limit error suggests retrying after: %s", retry_delay,
-            )
-        return "quota"
+        category = "quota"
     elif "blocked" in error_type.lower() or "blocked" in error_str:
-        return "blocked"
+        category = "blocked"
     else:
-        return "other"
+        category = "other"
+
+    logger.warning(
+        "External AI request failed | context=%s error_type=%s category=%s",
+        context,
+        error_type,
+        category,
+    )
+    return category
 
 
 _ERROR_MESSAGES_EN = {
     "permission": (
-        "⚠️ The API key appears to be invalid or expired. "
-        "Please check your GOOGLE_API_KEY in the .env file."
+        "⚠️ The AI service is not available right now. "
+        "Please try again later."
     ),
     "quota": (
-        "⚠️ The Gemini API rate limit has been reached. "
+        "⚠️ The AI service is busy right now. "
         "Please wait a moment and try again."
     ),
     "blocked": (
@@ -853,18 +899,17 @@ _ERROR_MESSAGES_EN = {
         "Could you try rephrasing your question?"
     ),
     "other": (
-        "⚠️ I encountered an issue connecting to the AI service. "
-        "Please try again in a moment. If the problem persists, "
-        "check that your API key is configured correctly."
+        "⚠️ I encountered a temporary issue with the AI service. "
+        "Please try again in a moment."
     ),
 }
 _ERROR_MESSAGES_AR = {
     "permission": (
-        "⚠️ يبدو إن الـ API key غير صالح أو منتهي. "
-        "من فضلك راجع GOOGLE_API_KEY في ملف .env."
+        "⚠️ خدمة الذكاء الاصطناعي غير متاحة حالياً. "
+        "جرّب مرة أخرى لاحقاً."
     ),
     "quota": (
-        "⚠️ وصلنا للحد الأقصى من الطلبات المسموحة على Gemini API. "
+        "⚠️ خدمة الذكاء الاصطناعي مشغولة حالياً. "
         "استنى لحظة وجرب تاني."
     ),
     "blocked": (
@@ -872,9 +917,8 @@ _ERROR_MESSAGES_AR = {
         "ممكن تجرب تعيد صياغة سؤالك؟"
     ),
     "other": (
-        "⚠️ حصلت مشكلة في الاتصال بخدمة الذكاء الاصطناعي. "
-        "جرب تاني بعد شوية. لو المشكلة استمرت، "
-        "تأكد إن الـ API key متظبط صح."
+        "⚠️ حصلت مشكلة مؤقتة في خدمة الذكاء الاصطناعي. "
+        "جرب تاني بعد شوية."
     ),
 }
 
@@ -895,18 +939,21 @@ class ChatbotService:
     # but each message can still trigger multiple tool-calling round
     # trips to Gemini, so it still needs a ceiling against a rapid-fire
     # loop (accidental or scripted).
-    _RATE_LIMITER: RateLimiter = RateLimiter(max_requests=15, window_seconds=60.0)
-
-    def __init__(self, user_id: str) -> None:
+    def __init__(self, user_id: str, *, db=None) -> None:
         self.user_id = user_id
+        self.db = _resolve_database(db)
+        self._rate_limiter = DatabaseRateLimiter(
+            self.db,
+            scope="ai.chatbot",
+            max_requests=15,
+            window_seconds=60,
+        )
         self._chat: Any = None
         self._client: Any = None
 
         api_key = _get_api_key()
         if not api_key:
-            raise ValueError(
-                "No API key found. Please set GOOGLE_API_KEY in your .env file."
-            )
+            raise ValueError("The AI service is not configured.")
 
         self._init_chat(api_key)
 
@@ -915,13 +962,26 @@ class ChatbotService:
         from google import genai
         from google.genai import types
 
-        self._client = genai.Client(api_key=api_key)
+        self._client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(
+                api_version="v1",
+                timeout=max(100, int(_ai_timeout_seconds() * 1_000)),
+                retry_options=types.HttpRetryOptions(
+                    attempts=3,
+                    initial_delay=0.5,
+                    max_delay=2.0,
+                    exp_base=2.0,
+                    jitter=0.2,
+                    http_status_codes=[408, 429, 500, 502, 503, 504],
+                ),
+            ),
+        )
 
         # Append current date (in the user's own timezone, not the
         # server's) to the system prompt for temporal context.
-        from services import get_database
         from timezone_utils import user_today
-        today_str = user_today(get_database(), self.user_id).isoformat()
+        today_str = user_today(self.db, self.user_id).isoformat()
         system_prompt = (
             _SYSTEM_PROMPT + f"\n\nToday's date is {today_str}."
         )
@@ -929,6 +989,8 @@ class ChatbotService:
         self._config = types.GenerateContentConfig(
             system_instruction=system_prompt,
             tools=[_build_tool_declarations()],
+            temperature=0.2,
+            max_output_tokens=MAX_AI_OUTPUT_TOKENS,
         )
 
         self._chat = self._client.chats.create(
@@ -956,13 +1018,15 @@ class ChatbotService:
                 "you with your productivity today? / يبدو إنك بعتّ رسالة "
                 "فاضية، عايز مساعدة في إيه النهاردة؟"
             )
+        if len(user_message) > MAX_AI_INPUT_CHARS:
+            return "That message is too long to process safely. Please shorten it and try again."
 
         casual_reply = _try_casual_shortcut(user_message)
         if casual_reply is not None:
             return casual_reply
 
         try:
-            self._RATE_LIMITER.check(str(self.user_id))
+            self._rate_limiter.check(str(self.user_id))
         except RateLimitExceeded:
             messages = _ERROR_MESSAGES_AR if _is_arabic(user_message) else _ERROR_MESSAGES_EN
             return messages["quota"]
@@ -1007,12 +1071,13 @@ class ChatbotService:
                 tool_args = dict(fc.args) if fc.args else {}
 
                 logger.info(
-                    "Tool call round %d | tool=%s args=%s user_id=%s",
-                    rounds + 1, tool_name, tool_args, self.user_id,
+                    "Chatbot tool call | round=%d tool=%s",
+                    rounds + 1,
+                    tool_name if tool_name in _TOOL_DISPATCH else "unknown",
                 )
 
                 result_json = _execute_tool(
-                    tool_name, tool_args, self.user_id,
+                    tool_name, tool_args, self.user_id, db=self.db,
                 )
 
                 function_response_parts.append(
@@ -1072,6 +1137,9 @@ class ChatbotService:
                 "How can I help you with your productivity today?"
             )
             return
+        if len(user_message) > MAX_AI_INPUT_CHARS:
+            yield "That message is too long to process safely. Please shorten it and try again."
+            return
 
         casual_reply = _try_casual_shortcut(user_message)
         if casual_reply is not None:
@@ -1079,7 +1147,7 @@ class ChatbotService:
             return
 
         try:
-            self._RATE_LIMITER.check(str(self.user_id))
+            self._rate_limiter.check(str(self.user_id))
         except RateLimitExceeded:
             messages = _ERROR_MESSAGES_AR if _is_arabic(user_message) else _ERROR_MESSAGES_EN
             yield messages["quota"]
@@ -1122,10 +1190,11 @@ class ChatbotService:
                     name = fc.name
                     args = dict(fc.args) if fc.args else {}
                     logger.info(
-                        "Tool call round %d (stream) | tool=%s args=%s user_id=%s",
-                        rounds + 1, name, args, self.user_id,
+                        "Chatbot streaming tool call | round=%d tool=%s",
+                        rounds + 1,
+                        name if name in _TOOL_DISPATCH else "unknown",
                     )
-                    result = _execute_tool(name, args, self.user_id)
+                    result = _execute_tool(name, args, self.user_id, db=self.db)
                     fr_response.append(
                         types.Part(
                             function_response=types.FunctionResponse(
@@ -1168,9 +1237,9 @@ class ChatbotService:
 # Public Factory Functions
 # ─────────────────────────────────────────────────────────────
 
-def create_chatbot_service(user_id: str) -> ChatbotService:
+def create_chatbot_service(user_id: str, *, db=None) -> ChatbotService:
     """Create a new ChatbotService instance for the given user."""
-    return ChatbotService(user_id=user_id)
+    return ChatbotService(user_id=user_id, db=db)
 
 
 def is_api_key_configured() -> bool:

@@ -20,8 +20,14 @@ class NotificationWorker:
     abandoned PROCESSING rows recoverable by another worker.
     """
 
-    def __init__(self, db: "Database", *, worker_id: Optional[str] = None) -> None:
-        self.service = NotificationService(db)
+    def __init__(
+        self,
+        db: "Database",
+        *,
+        worker_id: Optional[str] = None,
+        push_providers=None,
+    ) -> None:
+        self.service = NotificationService(db, push_providers=push_providers)
         self.worker_id = worker_id
 
     def run_once(
@@ -38,6 +44,9 @@ class NotificationWorker:
         )
         if push["attempted"] or push["cancelled"]:
             result["push"] = push
+        result["queue_lag_seconds"] = self.service.repository.queue_lag_seconds(
+            now=now_utc
+        )
         return result
 
     def run_push_once(

@@ -1,0 +1,1 @@
+"""CoachAI database migration package."""

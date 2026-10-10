@@ -15,15 +15,14 @@ from planning_request import (
     StructuredPlanningRequest,
 )
 from services import (
-    apply_future_plan,
+    apply_future_plan_durable as apply_future_plan,
     get_current_user_id,
     get_database,
     load_future_planning_candidates,
     preview_structured_future_plan,
-    reconcile_schedule_calendar_operation,
     transcribe_voice_note,
     understand_future_planning_text,
-    undo_smart_schedule,
+    undo_smart_schedule_durable as undo_smart_schedule,
 )
 from timezone_utils import user_today
 
@@ -197,7 +196,10 @@ def _preview_request(request: StructuredPlanningRequest, user_id: str) -> None:
         st.session_state[PREVIEW_KEY] = preview_structured_future_plan(request, user_id)
         st.session_state[REQUEST_KEY] = request
     except Exception as exc:
-        st.error(f"Nothing was changed: {exc}")
+        st.error(
+            "Nothing was changed because the preview was rejected. "
+            f"Support reference: {type(exc).__name__}."
+        )
 
 
 def _render_preview(user_id: str) -> None:
@@ -242,15 +244,16 @@ def _render_preview(user_id: str) -> None:
         try:
             operation_id = apply_future_plan(preview, user_id)
             st.session_state[OPERATION_KEY] = operation_id
-            reconciliation = reconcile_schedule_calendar_operation(operation_id, user_id)
-            if reconciliation.get("errors"):
-                st.warning("The plan was saved, but Calendar reconciliation is pending retry.")
-            else:
-                st.success("Future plan saved as one atomic operation.")
+            st.success(
+                "Future plan saved atomically. Calendar reconciliation is queued."
+            )
             _clear_after_method()
             st.rerun()
         except Exception as exc:
-            st.error(f"Nothing was saved: {exc}")
+            st.error(
+                "Nothing was saved because the request was rejected. "
+                f"Support reference: {type(exc).__name__}."
+            )
 
 
 page_setup(title="Future Planning", icon="🗓️")
@@ -341,7 +344,9 @@ if method_change.button("Change input", use_container_width=True):
 try:
     candidates = load_future_planning_candidates(planning_start, planning_end, user_id)
 except Exception as exc:
-    st.error(str(exc))
+    st.error(
+        f"Future-planning data is unavailable. Support reference: {type(exc).__name__}."
+    )
     st.stop()
 
 candidate_by_id = {int(task["task_id"]): task for task in candidates}
@@ -352,11 +357,16 @@ if method in {PlanningInputMethod.WRITE, PlanningInputMethod.VOICE}:
         if recording is not None and st.button("Transcribe recording", use_container_width=True):
             try:
                 st.session_state["future_voice_text"] = transcribe_voice_note(
-                    recording.getvalue(), getattr(recording, "type", "audio/wav")
+                    recording.getvalue(),
+                    getattr(recording, "type", "audio/wav"),
+                    user_id=user_id,
                 )
                 st.rerun()
             except Exception as exc:
-                st.error(f"Voice transcription is unavailable: {exc}")
+                st.error(
+                    "Voice transcription is unavailable. "
+                    f"Support reference: {type(exc).__name__}."
+                )
         text_key = "future_voice_text"
         prompt_label = "Review the transcript"
     else:
@@ -383,7 +393,10 @@ if method in {PlanningInputMethod.WRITE, PlanningInputMethod.VOICE}:
         except PlanningClarificationRequired as exc:
             st.warning(str(exc))
         except Exception as exc:
-            st.error(str(exc))
+            st.error(
+                "The request could not be interpreted safely. "
+                f"Support reference: {type(exc).__name__}."
+            )
 
     request = st.session_state.get(REQUEST_KEY)
     if request is not None:
@@ -504,7 +517,10 @@ else:
             )
             _preview_request(request, user_id)
         except Exception as exc:
-            st.error(f"Nothing was changed: {exc}")
+            st.error(
+                "Nothing was changed because the request was invalid. "
+                f"Support reference: {type(exc).__name__}."
+            )
 
 _render_preview(user_id)
 

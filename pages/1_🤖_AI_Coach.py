@@ -116,24 +116,26 @@ if target_plan_id is not None:
             st.session_state.last_recommendation = result
             st.session_state.last_recommendation_plan_id = target_plan_id
             status.update(label="✅ Coaching report ready", state="complete", expanded=False)
-        except ValueError as e:
+        except ValueError:
             status.update(label="⚠️ Could not generate report", state="error", expanded=False)
-            st.warning(f"**Nothing to analyse yet.** {e}")
+            st.warning(
+                "**Nothing to analyse yet.** Choose a plan with tasks and try again."
+            )
             st.session_state.last_recommendation = None
-        except RuntimeError as e:
+        except RuntimeError:
             status.update(label="❌ AI Coach unavailable", state="error", expanded=False)
             st.error(
-                "**The AI Coach couldn't reach the model right now.** "
-                "This usually means the Gemini API key is missing, invalid, or rate-limited."
+                "**The AI Coach is unavailable right now.** "
+                "Please wait a moment and try again."
             )
             if st.session_state.get("debug_mode"):
-                st.exception(e)
+                st.caption("Support reference: AI_COACH_UNAVAILABLE")
             st.session_state.last_recommendation = None
-        except Exception as e:
+        except Exception:
             status.update(label="❌ Unexpected error", state="error", expanded=False)
             st.error("**Something went wrong while generating your coaching report.**")
             if st.session_state.get("debug_mode"):
-                st.exception(e)
+                st.caption("Support reference: AI_COACH_REQUEST_FAILED")
             st.session_state.last_recommendation = None
 
 

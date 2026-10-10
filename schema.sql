@@ -14,7 +14,9 @@ CREATE TABLE users (
     display_name TEXT NOT NULL,
     timezone TEXT NOT NULL DEFAULT 'UTC',
     password_hash TEXT,
-    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    is_disabled INTEGER NOT NULL DEFAULT 0 CHECK (is_disabled IN (0, 1)),
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 -- ==========================================================
@@ -76,6 +78,7 @@ CREATE TABLE tasks (
     paused_at DATETIME,
     timer_total_paused_seconds INTEGER NOT NULL DEFAULT 0,
     timer_version INTEGER NOT NULL DEFAULT 0,
+    version INTEGER NOT NULL DEFAULT 0 CHECK (version >= 0),
     order_index INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'pending' 
         CHECK (status IN ('pending', 'in_progress', 'completed', 'failed')), 
@@ -450,6 +453,100 @@ CREATE TABLE IF NOT EXISTS google_calendar_events (
 );
 
 -- ==========================================================
+-- MOBILE COMMAND REPLAY + APPLICATION DATA SYNC
+-- ==========================================================
+CREATE TABLE idempotency_records (
+    record_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    response_json TEXT,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at DATETIME,
+    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+    UNIQUE(user_id, operation, idempotency_key)
+);
+
+CREATE TABLE rate_limit_buckets (
+    user_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    window_key INTEGER NOT NULL,
+    request_count INTEGER NOT NULL DEFAULT 0 CHECK (request_count >= 0),
+    expires_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+    PRIMARY KEY(user_id, scope, window_key)
+);
+
+CREATE TABLE application_sync_state (
+    user_id TEXT PRIMARY KEY,
+    sync_revision INTEGER NOT NULL DEFAULT 0 CHECK (sync_revision >= 0),
+    minimum_available_revision INTEGER NOT NULL DEFAULT 0,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+);
+
+CREATE TABLE application_changes (
+    sequence_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    change_id TEXT NOT NULL UNIQUE,
+    user_id TEXT NOT NULL,
+    sync_revision INTEGER NOT NULL,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    change_type TEXT NOT NULL CHECK (change_type IN ('upsert','delete')),
+    entity_version INTEGER,
+    payload TEXT NOT NULL DEFAULT '{}',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+    UNIQUE(user_id, sync_revision)
+);
+
+CREATE TABLE oauth_states (
+    state_hash TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    redirect_uri TEXT NOT NULL,
+    code_verifier TEXT,
+    expires_at DATETIME NOT NULL,
+    used_at DATETIME,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+);
+
+CREATE TABLE calendar_sync_state (
+    user_id TEXT NOT NULL,
+    calendar_id TEXT NOT NULL,
+    range_start DATE NOT NULL,
+    range_end DATE NOT NULL,
+    sync_token TEXT,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','running','fresh','error')),
+    last_error TEXT,
+    last_success_at DATETIME,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+    UNIQUE(user_id, calendar_id)
+);
+
+CREATE TABLE calendar_operations (
+    operation_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    operation_type TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued','processing','completed','failed','cancelled')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    available_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    locked_at DATETIME,
+    locked_by TEXT,
+    last_error TEXT,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at DATETIME,
+    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+    UNIQUE(user_id, operation_type, idempotency_key)
+);
+
+-- ==========================================================
 -- INDEXES
 -- ==========================================================
 
@@ -519,3 +616,8 @@ CREATE INDEX idx_user_badges_user_id ON user_badges(user_id);
 -- Google Calendar
 CREATE INDEX IF NOT EXISTS idx_gcal_events_user_date ON google_calendar_events(user_id, event_date);
 CREATE INDEX IF NOT EXISTS idx_gcal_selected_user ON google_selected_calendars(user_id);
+CREATE INDEX idx_idempotency_user_created ON idempotency_records(user_id, created_at);
+CREATE INDEX idx_rate_limit_expiry ON rate_limit_buckets(expires_at);
+CREATE INDEX idx_app_changes_user_revision ON application_changes(user_id, sync_revision);
+CREATE INDEX idx_oauth_states_user_expiry ON oauth_states(user_id, expires_at);
+CREATE INDEX idx_calendar_operations_ready ON calendar_operations(status, available_at);

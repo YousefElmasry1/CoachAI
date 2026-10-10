@@ -223,7 +223,8 @@ class NotificationService:
                 self.db.connection.rollback()
                 permanent = isinstance(exc, (ValueError, OwnershipError, json.JSONDecodeError))
                 self.repository.mark_outbox_failed(
-                    row["outbox_id"], row["user_id"], str(exc), now=now_utc,
+                    row["outbox_id"], row["user_id"],
+                    "notification_processing_failed", now=now_utc,
                     worker_id=owner, permanent=permanent,
                     max_attempts=max_attempts,
                 )

@@ -39,8 +39,8 @@ from services import (
     draft_plan_total_minutes,
     check_capacity_for_today,
     add_task_to_plan,
-    add_and_schedule_today_task,
-    move_task_today,
+    add_and_schedule_today_task_durable as add_and_schedule_today_task,
+    move_task_today_durable as move_task_today,
     delete_task,
     defer_task_to_tomorrow,
     save_draft_tasks_to_plan,
@@ -54,7 +54,7 @@ from services import (
     get_task_paused_seconds,
     is_task_timer_paused,
     load_pause_matrix,
-    run_scheduler_for_today,
+    run_scheduler_for_today_durable as run_scheduler_for_today,
     get_last_scheduling_conflicts,
     get_persisted_scheduling_conflicts,
     get_last_fixed_task_conflicts,
@@ -64,20 +64,20 @@ from services import (
     get_last_unplaced_tasks,
     get_last_schedule_operation_id,
     get_last_calendar_reconciliation_errors,
-    undo_smart_schedule,
+    undo_smart_schedule_durable as undo_smart_schedule,
     add_break_to_plan,
     reschedule_break,
     start_break,
     complete_break,
     transcribe_voice_note,
     is_google_calendar_connected,
-    sync_google_calendar,
+    queue_google_calendar_sync as sync_google_calendar,
     get_last_sync_time,
     get_last_sync_minutes_ago,
     get_google_calendar_events_today,
     import_calendar_event_as_task,
     get_selected_calendars,
-    export_all_scheduled_tasks,
+    queue_all_scheduled_tasks_export as export_all_scheduled_tasks,
     get_stale_export_count,
 )
 from voice_service import VoiceTranscriptionError
@@ -313,10 +313,13 @@ try:
         _should_sync = _mins_ago is None or _mins_ago > 15
         if _should_sync:
             sync_google_calendar(user_id)
-except Exception:
+except Exception as exc:
     # Calendar availability must never prevent the schedule itself from
     # loading, but the failure still needs an operational trace.
-    logger.exception("Google Calendar auto-sync failed for user_id=%s", user_id)
+    logger.warning(
+        "Calendar auto-sync failed | error_type=%s",
+        type(exc).__name__,
+    )
 
 plan = load_today_plan(user_id=user_id)
 
@@ -559,22 +562,23 @@ def _handle_ai_generation(
     with st.spinner("The AI Planner is splitting your day into tasks..."):
         try:
             draft = draft_today_plan(raw_input=raw_input, user_id=user_id)
-        except ValueError as e:
-            st.warning(f"**Nothing to plan yet.** {e}")
+        except ValueError:
+            st.warning(
+                "**Nothing to plan yet.** Describe at least one task and try again."
+            )
             return
-        except RuntimeError as e:
+        except RuntimeError:
             st.error(
-                "**The AI Planner couldn't reach the model right now.** "
-                "This usually means the Gemini API key is missing, invalid, "
-                "or rate-limited."
+                "**The AI Planner is unavailable right now.** "
+                "Please wait a moment and try again."
             )
             if st.session_state.get("debug_mode"):
-                st.exception(e)
+                st.caption("Support reference: AI_PLANNER_UNAVAILABLE")
             return
-        except Exception as e:
+        except Exception:
             st.error("**Something went wrong while generating your plan.**")
             if st.session_state.get("debug_mode"):
-                st.exception(e)
+                st.caption("Support reference: AI_PLANNER_REQUEST_FAILED")
             return
 
     draft_minutes = draft_plan_total_minutes(draft)
@@ -757,13 +761,19 @@ def _render_voice_tab(key_prefix: str) -> None:
                     st.session_state[transcript_key] = transcribe_voice_note(
                         audio_value.getvalue(),
                         mime_type=getattr(audio_value, "type", None) or "audio/wav",
+                        user_id=user_id,
                     )
-                except VoiceTranscriptionError as e:
-                    st.error(f"**Couldn't transcribe that recording.** {e}")
-                except Exception as e:
+                except VoiceTranscriptionError:
+                    st.error(
+                        "**Couldn't transcribe that recording.** "
+                        "Check the audio format and length, then try again."
+                    )
+                    if st.session_state.get("debug_mode"):
+                        st.caption("Support reference: VOICE_TRANSCRIPTION_REJECTED")
+                except Exception:
                     st.error("**Something went wrong while transcribing.**")
                     if st.session_state.get("debug_mode"):
-                        st.exception(e)
+                        st.caption("Support reference: VOICE_TRANSCRIPTION_FAILED")
 
     transcript = st.session_state.get(transcript_key)
     if transcript:
@@ -1165,7 +1175,12 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
             st.session_state[CONFLICTS_KEY] = []
             error_detail = get_last_scheduler_error()
             if error_detail:
-                st.error(f"Scheduling failed: {error_detail}")
+                st.error(
+                    "Scheduling failed because the plan could not be processed. "
+                    "Review the task times and try again."
+                )
+                if st.session_state.get("debug_mode"):
+                    st.caption("Support reference: SCHEDULER_OPERATION_FAILED")
             else:
                 st.error("Scheduling failed. Make sure today's plan has at least one task.")
 
@@ -1199,8 +1214,12 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
     for unplaced in st.session_state.get("_last_unplaced_tasks", []):
         label = "Not enough free time" if unplaced.reason == "capacity_shortfall" else "Too fragmented for the 3-segment limit"
         st.warning(f"**{unplaced.title}** was not placed — {label}. {unplaced.message}")
-    for calendar_error in get_last_calendar_reconciliation_errors():
-        st.warning(f"Calendar reconciliation is pending: {calendar_error}")
+    calendar_reconciliation_errors = get_last_calendar_reconciliation_errors()
+    if calendar_reconciliation_errors:
+        st.warning(
+            "Calendar reconciliation is still pending. Your schedule was saved; "
+            "calendar updates will be retried."
+        )
 
     # ── Persistent conflict banner + resolution actions ──
     # Shown on every render until resolved (unlike st.warning above the
@@ -1332,8 +1351,8 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
         st.markdown("<div style='height:0.6rem;'></div>", unsafe_allow_html=True)
         st.markdown("**📤 Export to Google Calendar**")
         st.caption(
-            "Create events in your Primary Google Calendar for each "
-            "scheduled task."
+            "Queue events for the Calendar worker. The schedule remains "
+            "usable while provider delivery is retried in the background."
         )
         stale_count = get_stale_export_count(user_id)
         if stale_count:
@@ -1347,17 +1366,17 @@ with st.expander("⏱️ Run / Re-run the Scheduler", expanded=not is_scheduled)
             "📤 Export Scheduled Tasks",
             use_container_width=True,
         ):
-            with st.spinner("Exporting..."):
+            with st.spinner("Queueing Calendar updates..."):
                 export_result = export_all_scheduled_tasks(user_id)
             if export_result.get("errors"):
                 st.warning(
-                    f"Exported {export_result.get('exported', 0)} task(s) "
-                    f"with {export_result['errors']} error(s).",
+                    f"Queued {export_result.get('queued', 0)} task(s); "
+                    f"{export_result['errors']} task(s) could not be queued.",
                     icon="⚠️",
                 )
             else:
                 st.toast(
-                    f"Exported {export_result.get('exported', 0)} task(s) to Google Calendar!",
+                    f"Queued {export_result.get('queued', 0)} Calendar update(s).",
                     icon="📤",
                 )
 

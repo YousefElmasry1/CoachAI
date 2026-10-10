@@ -62,6 +62,11 @@ class NotificationDeviceTests(NotificationTestCase):
             self.repo.register_device(
                 "u1", device_id="bad", platform="ios", provider="apns", locale="fr",
             )
+        with self.assertRaises(ValueError):
+            self.repo.register_device(
+                "u1", device_id="bad", platform="android", provider="none",
+                timezone_name="Not/A_Real_Zone",
+            )
 
 
 if __name__ == "__main__":

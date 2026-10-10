@@ -95,12 +95,12 @@ class HistoricalGuestLoginTests(unittest.TestCase):
         with (
             patch("services.get_database", return_value=self.db),
             patch.object(self.db, "execute", side_effect=fail_profile_insert),
-            self.assertLogs("services", level="ERROR") as logs,
+            self.assertLogs("services", level="WARNING") as logs,
         ):
             user_id = services.create_guest_user("mohamed")
 
         self.assertIsNone(user_id)
-        self.assertIn("Guest session creation failed", "\n".join(logs.output))
+        self.assertIn("guest_session_creation_failed", "\n".join(logs.output))
         self.assertEqual(
             self.db.fetch_one("SELECT COUNT(*) AS count FROM users")["count"], 0
         )

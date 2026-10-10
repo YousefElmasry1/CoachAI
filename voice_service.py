@@ -20,10 +20,21 @@ Usage:
 from __future__ import annotations
 
 import os
+import re
+import time
 from typing import Any, Optional
 
 from dotenv import load_dotenv
-import google.generativeai as genai
+from google import genai
+from google.genai import types
+
+from backend_errors import ConfigurationError
+from domain_validation import (
+    MAX_AI_OUTPUT_TOKENS,
+    MAX_AUDIO_BYTES,
+    MAX_TRANSCRIPT_CHARS,
+)
+from operational_metrics import BackendMetrics
 
 
 # ---------------------------------------------------------------------------
@@ -33,7 +44,6 @@ import google.generativeai as genai
 load_dotenv()
 
 _GOOGLE_API_KEY: Optional[str] = os.getenv("GOOGLE_API_KEY")
-_genai_configured: bool = False
 
 
 def _require_google_api_key() -> str:
@@ -45,18 +55,48 @@ def _require_google_api_key() -> str:
     """
     key = os.getenv("GOOGLE_API_KEY") or _GOOGLE_API_KEY
     if not key:
-        raise EnvironmentError(
-            "GOOGLE_API_KEY not found. Please create a .env file with:\n"
-            "GOOGLE_API_KEY=your_key_here"
-        )
+        raise ConfigurationError("The AI provider is not configured.")
     return key
 
 
-def _ensure_genai_configured() -> None:
-    global _genai_configured
-    if not _genai_configured:
-        genai.configure(api_key=_require_google_api_key())
-        _genai_configured = True
+def _ai_timeout_seconds() -> float:
+    try:
+        value = float(os.getenv("COACHAI_AI_TIMEOUT_SECONDS", "20"))
+    except ValueError as exc:
+        raise ConfigurationError("COACHAI_AI_TIMEOUT_SECONDS must be numeric.") from exc
+    if not 0.1 <= value <= 120:
+        raise ConfigurationError(
+            "COACHAI_AI_TIMEOUT_SECONDS must be between 0.1 and 120 seconds."
+        )
+    return value
+
+
+def _model_name() -> str:
+    """Return one bounded model identifier for this deployment."""
+    value = os.getenv("COACHAI_VOICE_MODEL", _DEFAULT_MODEL_NAME).strip()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", value):
+        raise ConfigurationError("COACHAI_VOICE_MODEL is invalid.")
+    return value
+
+
+def _new_client(api_key: str) -> genai.Client:
+    """Create a supported SDK client with finite request and retry bounds."""
+    timeout_ms = max(100, int(_ai_timeout_seconds() * 1_000))
+    return genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(
+            api_version="v1",
+            timeout=timeout_ms,
+            retry_options=types.HttpRetryOptions(
+                attempts=3,
+                initial_delay=0.5,
+                max_delay=2.0,
+                exp_base=2.0,
+                jitter=0.2,
+                http_status_codes=[408, 429, 500, 502, 503, 504],
+            ),
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +105,18 @@ def _ensure_genai_configured() -> None:
 
 # Same model family used by planner.py / recommendation.py, for one
 # consistent Gemini version across the whole app.
-_MODEL_NAME: str = "gemini-3.8-flash"
+_DEFAULT_MODEL_NAME: str = "gemini-3.8-flash"
+
+_ALLOWED_AUDIO_MIME_TYPES = frozenset({
+    "audio/flac",
+    "audio/mp3",
+    "audio/mp4",
+    "audio/mpeg",
+    "audio/ogg",
+    "audio/wav",
+    "audio/webm",
+    "audio/x-wav",
+})
 
 _TRANSCRIBE_PROMPT: str = (
     "You are an automatic speech recognition (ASR) engine, not an AI "
@@ -109,7 +160,12 @@ class VoiceTranscriptionError(Exception):
 # Public API
 # ---------------------------------------------------------------------------
 
-def transcribe_audio(audio_bytes: bytes, mime_type: str = "audio/wav") -> str:
+def transcribe_audio(
+    audio_bytes: bytes,
+    mime_type: str = "audio/wav",
+    *,
+    metrics: BackendMetrics | None = None,
+) -> str:
     """
     Transcribe raw audio bytes into plain text using Gemini.
 
@@ -139,34 +195,84 @@ def transcribe_audio(audio_bytes: bytes, mime_type: str = "audio/wav") -> str:
     """
     if not audio_bytes:
         raise ValueError("audio_bytes cannot be empty.")
+    if not isinstance(audio_bytes, (bytes, bytearray, memoryview)):
+        raise ValueError("audio_bytes must contain binary audio data.")
+    if len(audio_bytes) > MAX_AUDIO_BYTES:
+        raise ValueError(
+            f"Audio cannot exceed {MAX_AUDIO_BYTES} bytes."
+        )
+    normalized_mime = str(mime_type or "").split(";", 1)[0].strip().lower()
+    if normalized_mime not in _ALLOWED_AUDIO_MIME_TYPES:
+        raise ValueError("Unsupported audio MIME type.")
 
-    _ensure_genai_configured()
+    api_key = _require_google_api_key()
+    model_name = _model_name()
+    metric_sink = metrics or BackendMetrics()
+    started = time.monotonic()
+    client: genai.Client | None = None
 
     try:
-        model = genai.GenerativeModel(_MODEL_NAME)
-        response = model.generate_content(
-            [
-                _TRANSCRIBE_PROMPT,
-                {"mime_type": mime_type, "data": audio_bytes},
+        client = _new_client(api_key)
+        response = client.models.generate_content(
+            model=model_name,
+            contents=[
+                types.Part.from_text(text=_TRANSCRIBE_PROMPT),
+                types.Part.from_bytes(
+                    data=bytes(audio_bytes), mime_type=normalized_mime
+                ),
             ],
-            generation_config=genai.types.GenerationConfig(
+            config=types.GenerateContentConfig(
                 # Deterministic, literal transcription rather than the
                 # model's default "creative" temperature — this is what
                 # stops it from confidently inventing plausible-sounding
                 # speech when it isn't sure what it heard.
                 temperature=0.0,
                 candidate_count=1,
+                max_output_tokens=min(MAX_AI_OUTPUT_TOKENS, 4096),
             ),
         )
     except Exception as exc:
+        metric_sink.ai_call(
+            "google",
+            model_name,
+            succeeded=False,
+            duration_seconds=time.monotonic() - started,
+        )
         raise VoiceTranscriptionError(
-            f"Failed to transcribe audio via Gemini. "
-            f"Underlying error: {type(exc).__name__}: {exc}"
+            "The audio provider could not transcribe this recording."
         ) from exc
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                # Closing a completed request must not change its outcome.
+                pass
 
     text = _extract_text(response)
     if not text:
+        metric_sink.ai_call(
+            "google",
+            model_name,
+            succeeded=False,
+            duration_seconds=time.monotonic() - started,
+        )
         raise VoiceTranscriptionError(_diagnose_empty_response(response))
+    if len(text) > MAX_TRANSCRIPT_CHARS:
+        metric_sink.ai_call(
+            "google",
+            model_name,
+            succeeded=False,
+            duration_seconds=time.monotonic() - started,
+        )
+        raise VoiceTranscriptionError("The transcript exceeds the supported size.")
+
+    metric_sink.ai_call(
+        "google",
+        model_name,
+        succeeded=True,
+        duration_seconds=time.monotonic() - started,
+    )
 
     return text
 
@@ -201,14 +307,11 @@ def _extract_text(response: Any) -> str:
 
 
 def _diagnose_empty_response(response: Any) -> str:
-    """Turn an empty Gemini response into a specific, actionable message."""
+    """Turn an empty response into a stable, provider-neutral message."""
     feedback = getattr(response, "prompt_feedback", None)
     block_reason = getattr(feedback, "block_reason", None)
     if block_reason:
-        return (
-            f"Gemini blocked this recording (reason: {block_reason}). "
-            "Try recording again."
-        )
+        return "The recording could not be transcribed. Please record it again."
 
     candidates = getattr(response, "candidates", None) or []
     if candidates:
@@ -216,13 +319,12 @@ def _diagnose_empty_response(response: Any) -> str:
         # 1 / "STOP" is a normal completion; anything else explains the gap.
         if finish_reason not in (None, 1, "STOP"):
             return (
-                f"Gemini stopped without producing a transcript "
-                f"(finish_reason: {finish_reason}). This can mean the audio "
-                "format wasn't recognised — try recording again."
+                "The recording ended without a transcript. Check the audio "
+                "format and try recording again."
             )
 
     return (
-        "Gemini couldn't make out any speech in that recording — it may be "
+        "No clear speech was detected in that recording — it may be "
         "silent, too quiet, or too short. Please try recording again, a bit "
         "closer to the mic."
     )

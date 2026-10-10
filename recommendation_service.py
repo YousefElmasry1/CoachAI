@@ -4,7 +4,7 @@ from typing import Optional
 from recommendation import RecommendationEngine, RecommendationOutput
 from database import Database
 from analytics import AnalyticsEngine, AnalyticsFormatter
-from rate_limiter import RateLimiter
+from rate_limiter import DatabaseRateLimiter
 
 _ARABIC_CHARS_PATTERN = re.compile(r"[\u0600-\u06FF]")
 
@@ -26,13 +26,6 @@ _TASK_LINE_FORMAT: str = "{start} - {end} | {title} ({minutes} min)"
 # regardless of how many tasks a user logs per day.
 _HISTORY_WINDOW_DAYS: int = 30
 
-# Per-user rate limit on AI coaching requests: a coaching report is a
-# relatively heavy call (full analytics profile + LLM), and normal
-# usage requests one only occasionally, so the window is generous but
-# still stops a rapid-fire loop.
-_RECOMMENDATION_RATE_LIMITER = RateLimiter(max_requests=6, window_seconds=60.0)
-
-
 # ---------------------------------------------------------------------------
 # Recommendation Service
 # ---------------------------------------------------------------------------
@@ -50,6 +43,12 @@ class RecommendationService:
         self._engine: Optional[RecommendationEngine] = None
         self._analytics_engine: Optional[AnalyticsEngine] = None
         self._analytics_formatter: Optional[AnalyticsFormatter] = None
+        self._rate_limiter = DatabaseRateLimiter(
+            db,
+            scope="ai.recommendation",
+            max_requests=6,
+            window_seconds=60,
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -167,7 +166,7 @@ class RecommendationService:
         """
         tasks = self.db.get_tasks_with_segments(plan_id, user_id)
         if not tasks:
-            raise ValueError(f"Plan {plan_id} has no tasks to analyze.")
+            raise ValueError("The requested plan has no tasks to analyze.")
         return self._format_schedule_text(tasks)
 
     def _generate_recommendations(
@@ -200,7 +199,7 @@ class RecommendationService:
         schedule_text = self._format_schedule_text_for_plan(plan_id, user_id)
         language = _detect_language(schedule_text)
 
-        _RECOMMENDATION_RATE_LIMITER.check(str(user_id))
+        self._rate_limiter.check(str(user_id))
 
         # 2. Build analytics profile (single DB load, all metrics computed)
         analytics_engine = self._get_analytics_engine()
@@ -248,8 +247,8 @@ class RecommendationService:
         plan = self.db.get_today_plan(user_id)
         if plan is None:
             raise ValueError(
-                f"No plan found for user {user_id} today. "
-                "Cannot generate recommendations without a schedule."
+                "No plan was found for today. Cannot generate recommendations "
+                "without a schedule."
             )
 
         plan_id: int = int(plan["plan_id"])
@@ -283,8 +282,6 @@ class RecommendationService:
         """
         plan = self.db.get_plan_by_id(plan_id, user_id)
         if plan is None:
-            raise ValueError(
-                f"No plan found with plan_id {plan_id} for user {user_id!r}."
-            )
+            raise ValueError("The requested plan was not found.")
 
         return self._generate_recommendations(plan_id=plan_id, user_id=user_id)

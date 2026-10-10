@@ -33,6 +33,8 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
+from datetime import datetime, timezone
+import re
 from typing import Deque, Dict, Optional
 
 
@@ -125,3 +127,83 @@ class RateLimiter:
         """Clear all history. Mainly useful for tests."""
         with self._lock:
             self._hits.clear()
+
+
+class DatabaseRateLimiter:
+    """Atomic database-coordinated fixed-window rate limiter.
+
+    This is the production limiter for authenticated, high-cost operations.
+    The canonical database is the shared coordination point, so separate API
+    processes cannot bypass one another and a process restart does not erase
+    the active window.  Only counters are stored; request content is never
+    persisted here.
+    """
+
+    _SCOPE = re.compile(r"^[a-z][a-z0-9_.:-]{0,79}$")
+
+    def __init__(
+        self,
+        db,
+        *,
+        scope: str,
+        max_requests: int,
+        window_seconds: int,
+        wall_clock=time.time,
+    ) -> None:
+        if not self._SCOPE.fullmatch(str(scope)):
+            raise ValueError("Rate-limit scope must be a short stable identifier.")
+        if max_requests <= 0 or window_seconds <= 0:
+            raise ValueError("Rate-limit bounds must be positive.")
+        self.db = db
+        self.scope = str(scope)
+        self.max_requests = int(max_requests)
+        self.window_seconds = int(window_seconds)
+        self._wall_clock = wall_clock
+
+    def check(self, key: Optional[str]) -> None:
+        if not key:
+            raise ValueError("A non-empty authenticated identity is required.")
+        principal_id = str(key)
+        now_epoch = float(self._wall_clock())
+        window_key = int(now_epoch // self.window_seconds)
+        expires_epoch = (window_key + 1) * self.window_seconds
+        now_value = datetime.fromtimestamp(now_epoch, timezone.utc).replace(tzinfo=None)
+        expires_value = datetime.fromtimestamp(
+            expires_epoch, timezone.utc
+        ).replace(tzinfo=None)
+
+        with self.db.transaction():
+            # Bounded opportunistic cleanup avoids an ever-growing table while
+            # keeping the delete scoped to this principal/operation pair.
+            self.db.execute(
+                """DELETE FROM rate_limit_buckets
+                   WHERE user_id=? AND scope=? AND expires_at<=?""",
+                (principal_id, self.scope, now_value),
+            )
+            row = self.db.fetch_one(
+                """INSERT INTO rate_limit_buckets
+                       (user_id,scope,window_key,request_count,expires_at,updated_at)
+                   VALUES (?,?,?,1,?,CURRENT_TIMESTAMP)
+                   ON CONFLICT(user_id,scope,window_key) DO UPDATE SET
+                       request_count=rate_limit_buckets.request_count+1,
+                       expires_at=excluded.expires_at,
+                       updated_at=CURRENT_TIMESTAMP
+                   RETURNING request_count""",
+                (principal_id, self.scope, window_key, expires_value),
+            )
+            count = int(row["request_count"]) if row is not None else 0
+            if count > self.max_requests:
+                # Raising inside the transaction rolls the rejected increment
+                # back, keeping the stored counter pinned at the actual limit.
+                raise RateLimitExceeded(
+                    retry_after_seconds=max(0.0, expires_epoch - now_epoch)
+                )
+
+    def reset(self, key: str) -> None:
+        """Clear this scope for one principal. Intended for deterministic tests."""
+
+        with self.db.transaction():
+            self.db.execute(
+                "DELETE FROM rate_limit_buckets WHERE user_id=? AND scope=?",
+                (str(key), self.scope),
+            )

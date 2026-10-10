@@ -11,7 +11,10 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import threading
+from alembic import command
+from alembic.config import Config
 from sqlalchemy import inspect, text
+from sqlalchemy import create_engine
 from sqlalchemy.engine import make_url
 
 from database import Database, OwnershipError
@@ -39,6 +42,15 @@ def main() -> None:
         raise RuntimeError("PostgreSQL verification requires a PostgreSQL URL.")
     if url.host not in {"127.0.0.1", "localhost"} or url.database != "coachai_notifications":
         raise RuntimeError("Refusing to run against a non-disposable PostgreSQL target.")
+
+    migration_engine = create_engine(raw_url, future=True)
+    try:
+        with migration_engine.begin() as connection:
+            config = Config("alembic.ini")
+            config.attributes["connection"] = connection
+            command.upgrade(config, "head")
+    finally:
+        migration_engine.dispose()
 
     db = Database(raw_url)
     try:

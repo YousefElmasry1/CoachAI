@@ -253,7 +253,7 @@ class CalendarSegmentTests(unittest.TestCase):
         self.assertEqual("old-owned", self.fake.created[0]["event_id"])
         self.assertEqual("09:00:00", self.fake.created[0]["start_time"])
 
-    def test_partial_task_delete_is_retryable_and_idempotent(self):
+    def test_task_delete_is_durable_and_queues_remote_cleanup(self):
         task = self.db.add_task(self.plan, "u", "Delete", estimated_minutes=60)
         revision = self.db.get_plan_by_id(self.plan, "u")["schedule_revision"]
         self.db.replace_plan_segments(self.plan, "u", {task: [
@@ -266,11 +266,19 @@ class CalendarSegmentTests(unittest.TestCase):
         with patch.object(services, "get_database", return_value=self.db), patch.object(
             services, "_get_google_client", return_value=flaky
         ):
-            self.assertFalse(services.delete_task(task, "u"))
-            self.assertIsNotNone(self.db.get_task(task, "u"))
             self.assertTrue(services.delete_task(task, "u"))
         self.assertIsNone(self.db.get_task(task, "u"))
-        self.assertEqual(set(), flaky.remote_ids)
+        self.assertEqual({"one", "two"}, flaky.remote_ids)
+        queued = self.db.fetch_one(
+            """SELECT operation_type,status,payload FROM calendar_operations
+               WHERE user_id=?""",
+            ("u",),
+        )
+        self.assertIsNotNone(queued)
+        self.assertEqual("delete_task_events", queued["operation_type"])
+        self.assertEqual("queued", queued["status"])
+        self.assertIn('"google_event_id": "one"', queued["payload"])
+        self.assertIn('"google_event_id": "two"', queued["payload"])
 
     def test_self_events_do_not_block_but_external_events_do(self):
         task = self.db.add_task(self.plan, "u", "Owned", estimated_minutes=60)

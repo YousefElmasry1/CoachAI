@@ -18,7 +18,8 @@ class MiscRegressionTests(unittest.TestCase):
 
         class DeleteRequest:
             @staticmethod
-            def execute():
+            def execute(*, num_retries=0):
+                self.assertEqual(3, num_retries)
                 raise GoneError("deleted tombstone")
 
         class Events:

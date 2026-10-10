@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta, timezone
+import hashlib
+import json
 from typing import Optional, TYPE_CHECKING
 
 from timezone_utils import safe_zoneinfo
@@ -37,11 +39,40 @@ class NotificationReconciler:
         self.db = db
         self.repository = NotificationRepository(db)
 
-    def _lead_minutes(self, user_id: str) -> Optional[int]:
+    def _reminder_configuration(
+        self, user_id: str,
+    ) -> tuple[dict, Optional[int], str]:
         preferences = self.repository.get_preferences(user_id)
         override = self.repository.get_type_preference(user_id, NotificationType.TASK_REMINDER)
-        lead = override.get("lead_minutes") if override and override.get("lead_minutes") is not None else preferences.get("default_reminder_lead_minutes")
-        return None if lead in (None, 0) else int(lead)
+        enabled = override is None or bool(override.get("enabled", 1))
+        lead = (
+            override.get("lead_minutes")
+            if override and override.get("lead_minutes") is not None
+            else preferences.get("default_reminder_lead_minutes")
+        )
+        resolved_lead = None if not enabled or lead in (None, 0) else int(lead)
+        preference_fields = (
+            "tone", "default_reminder_lead_minutes", "quiet_hours_start",
+            "quiet_hours_end", "privacy_mode", "sound_enabled",
+            "vibration_enabled", "multi_device_policy", "locale", "time_format",
+            "timezone",
+        )
+        override_fields = (
+            "enabled", "preferred_channel", "lead_minutes", "cooldown_seconds",
+            "interruption_level",
+        )
+        material = {
+            "preferences": {
+                key: preferences.get(key) for key in preference_fields
+            },
+            "task_reminder": {
+                key: override.get(key) for key in override_fields
+            } if override else {},
+        }
+        generation = hashlib.sha256(
+            json.dumps(material, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()[:12]
+        return preferences, resolved_lead, generation
 
     def current_identity(self, user_id: str, task_id: int, segment_index: int) -> Optional[tuple[int, int, int]]:
         row = self.db.fetch_one(
@@ -70,6 +101,16 @@ class NotificationReconciler:
         )
         if row is None or row["status"] != "pending":
             return False
+        event_timezone = str(event.payload.get("timezone") or "")
+        if event_timezone and event_timezone != str(row["timezone"]):
+            return False
+        event_generation = str(event.payload.get("preference_generation") or "")
+        if event_generation:
+            _preferences, _lead, current_generation = self._reminder_configuration(
+                event.user_id
+            )
+            if event_generation != current_generation:
+                return False
         end_utc = _local_wall_to_utc(date.fromisoformat(str(row["scheduled_date"])), row["scheduled_end"], row["timezone"])
         return end_utc > (now_utc or utc_now_naive()).replace(tzinfo=None)
 
@@ -90,10 +131,11 @@ class NotificationReconciler:
         task = self.repository.ensure_task(user_id, task_id)
         if task["status"] != "pending":
             return {"scheduled": 0, "cancelled": self.cancel_task_notifications(user_id, task_id)}
-        lead = self._lead_minutes(user_id)
+        preferences, lead, preference_generation = self._reminder_configuration(
+            user_id
+        )
         if lead is None:
             return {"scheduled": 0, "cancelled": self.cancel_task_notifications(user_id, task_id, reason="reminders_off")}
-        preferences = self.repository.get_preferences(user_id)
         segments = self.db.fetch_all(
             """SELECT s.*,p.schedule_revision,p.plan_date
                FROM task_segments s JOIN tasks t ON t.task_id=s.task_id
@@ -114,7 +156,13 @@ class NotificationReconciler:
             if end_utc <= now:
                 continue
             fire_at = max(now, start_utc - timedelta(minutes=lead))
-            identity = f"task:{task_id}:{day.isoformat()}:{index}:reminder:rev{revision}"
+            timezone_generation = hashlib.sha256(
+                str(preferences["timezone"]).encode("utf-8")
+            ).hexdigest()[:12]
+            identity = (
+                f"task:{task_id}:{day.isoformat()}:{index}:reminder:"
+                f"rev{revision}:tz{timezone_generation}:cfg{preference_generation}"
+            )
             event = DomainEvent.create(
                 user_id=user_id, event_type=NotificationEventType.TASK_REMINDER_DUE,
                 task_id=task_id, segment_id=int(segment["segment_id"]),
@@ -125,6 +173,8 @@ class NotificationReconciler:
                     "task_title": str(task["title"]),
                     "scheduled_for": fire_at.isoformat(),
                     "expires_at": end_utc.isoformat(),
+                    "timezone": str(preferences["timezone"]),
+                    "preference_generation": preference_generation,
                     "dedupe_key": f"notification:{identity}",
                     "actions": {"open_task": int(task_id)},
                 },

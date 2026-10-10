@@ -27,7 +27,7 @@ from services import (
     fetch_google_calendars,
     save_selected_calendars,
     get_selected_calendars,
-    sync_google_calendar,
+    queue_google_calendar_sync as sync_google_calendar,
     get_last_sync_time,
     get_last_sync_label,
     load_user,
@@ -92,7 +92,9 @@ with tabs[0]:
 
     if chosen_timezone != current_timezone:
         if st.button("💾 Save Timezone", type="primary"):
-            set_user_timezone(user_id, chosen_timezone)
+            if not set_user_timezone(user_id, chosen_timezone):
+                st.error("Timezone could not be changed safely. Please try again.")
+                st.stop()
             st.toast(f"Timezone set to {chosen_label}.", icon="🌍")
             st.rerun()
 
@@ -147,7 +149,9 @@ with tabs[2]:
         st.metric("Database Size", db_status.get("size_display", "—"))
 
     if not db_status["connected"]:
-        st.error(f"Database error: {db_status.get('error', 'unknown')}")
+        st.error("The database health check failed. Please contact support.")
+        if st.session_state.get("debug_mode"):
+            st.caption("Support reference: DATABASE_HEALTH_CHECK_FAILED")
 
     st.markdown("#### Versions")
     v1, v2, v3, v4 = st.columns(4)
@@ -246,9 +250,10 @@ with tabs[5]:
     # Handle OAuth callback (code in query params)
     query_params = st.query_params
     auth_code = query_params.get("code")
+    oauth_state = query_params.get("state")
     if auth_code and not is_google_calendar_connected(user_id):
         with st.spinner("Connecting to Google Calendar..."):
-            if connect_google_calendar(auth_code, user_id):
+            if connect_google_calendar(auth_code, user_id, state=oauth_state):
                 st.query_params.clear()
                 st.toast("Google Calendar connected!", icon="✅")
                 st.rerun()
@@ -273,21 +278,20 @@ with tabs[5]:
         )
         st.markdown("<div style='height:0.5rem;'></div>", unsafe_allow_html=True)
         try:
-            auth_url = get_google_auth_url()
+            auth_url = get_google_auth_url(user_id)
             st.link_button(
                 "🔗 Connect Google Calendar",
                 url=auth_url,
                 type="primary",
                 use_container_width=True,
             )
-        except Exception as e:
+        except Exception:
             st.error(
-                "Could not generate Google sign-in link. "
-                "Make sure GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET "
-                "are set in your .env file."
+                "Could not generate the Google sign-in link. "
+                "Please try again later or contact support."
             )
             if st.session_state.get("debug_mode"):
-                st.exception(e)
+                st.caption("Support reference: CALENDAR_SIGN_IN_UNAVAILABLE")
     else:
         selected = get_selected_calendars(user_id)
         picking = st.session_state.get("_gcal_picking", not selected)
@@ -398,17 +402,17 @@ with tabs[5]:
                     "🔄 Sync Now",
                     use_container_width=True,
                 ):
-                    with st.spinner("Syncing..."):
+                    with st.spinner("Queueing a Calendar refresh..."):
                         result = sync_google_calendar(user_id)
                     if result.get("error"):
                         st.warning(
-                            f"Sync issue: {result['error']}",
+                            "Calendar sync could not finish. Your existing schedule "
+                            "was not changed; please try again later.",
                             icon="⚠️",
                         )
                     else:
                         st.toast(
-                            f"Synced {result.get('synced_count', 0)} event(s) "
-                            f"from {result.get('calendars_synced', 0)} calendar(s)!",
+                            f"Queued {result.get('queued_count', 0)} Calendar refresh job(s).",
                             icon="🔄",
                         )
                         st.rerun()

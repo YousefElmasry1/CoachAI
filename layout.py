@@ -198,7 +198,7 @@ def ensure_authenticated() -> None:
                 su_email = st.text_input("Email", key="_signup_email")
                 su_password = st.text_input(
                     "Password", type="password", key="_signup_password",
-                    help="At least 6 characters.",
+                    help="12 to 128 characters.",
                 )
                 submitted = st.form_submit_button(
                     "Create Account →", type="primary", use_container_width=True
@@ -247,6 +247,7 @@ def _handle_google_oauth_callback() -> None:
     """
     query_params = st.query_params
     auth_code = query_params.get("code")
+    oauth_state = query_params.get("state")
     oauth_error = query_params.get("error")
 
     if oauth_error:
@@ -271,7 +272,7 @@ def _handle_google_oauth_callback() -> None:
         return
 
     with st.spinner("Connecting to Google Calendar..."):
-        success = connect_google_calendar(auth_code, user_id)
+        success = connect_google_calendar(auth_code, user_id, state=oauth_state)
 
     st.session_state["_gcal_code_processed"] = auth_code
     st.query_params.clear()

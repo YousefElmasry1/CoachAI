@@ -14,6 +14,8 @@ from unittest.mock import patch
 
 import psycopg2
 import sqlalchemy
+from alembic import command
+from alembic.config import Config
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import SQLAlchemyError
@@ -43,7 +45,11 @@ def _reset_disposable_schema() -> None:
     engine = create_engine(_checked_url(), future=True)
     try:
         metadata.drop_all(engine)
-        metadata.create_all(engine)
+        with engine.begin() as connection:
+            connection.execute(text("DROP TABLE IF EXISTS alembic_version"))
+            config = Config("alembic.ini")
+            config.attributes["connection"] = connection
+            command.upgrade(config, "head")
     finally:
         engine.dispose()
 

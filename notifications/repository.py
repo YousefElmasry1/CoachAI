@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 import json
 from typing import Any, Mapping, Optional, TYPE_CHECKING
 import uuid
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from database import OwnershipError
 
@@ -237,6 +238,11 @@ class NotificationRepository:
             raise ValueError("Device provider must be apns, fcm, or none.")
         if locale not in {"ar", "en"}:
             raise ValueError("Device locale must be ar or en.")
+        timezone_name = str(timezone_name or "").strip()
+        try:
+            ZoneInfo(timezone_name)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError("Device timezone must be a valid IANA timezone name.") from exc
         with self.db.transaction():
             existing = self.db.fetch_one(
                 "SELECT user_id FROM notification_devices WHERE device_id=?",
@@ -444,6 +450,38 @@ class NotificationRepository:
                     claimed_row["locked_by"] = owner
                     claimed.append(claimed_row)
         return claimed
+
+    def queue_lag_seconds(self, *, now: Optional[datetime] = None) -> dict[str, float]:
+        """Return age of the oldest currently-ready outbox/push work."""
+
+        current = now or utc_now_naive()
+        if current.tzinfo is not None:
+            current = current.replace(tzinfo=None)
+        outbox = self.db.fetch_one(
+            """SELECT MIN(created_at) AS oldest FROM notification_outbox
+               WHERE status IN ('queued','failed') AND available_at<=?""",
+            (current,),
+        )
+        push = self.db.fetch_one(
+            """SELECT MIN(queued_at) AS oldest FROM notification_deliveries
+               WHERE channel='push' AND status IN ('queued','retrying')
+                 AND COALESCE(next_attempt_at,queued_at)<=?""",
+            (current,),
+        )
+
+        def age(row: Optional[dict]) -> float:
+            raw = row.get("oldest") if row else None
+            if not raw:
+                return 0.0
+            try:
+                parsed = raw if isinstance(raw, datetime) else datetime.fromisoformat(str(raw))
+            except (TypeError, ValueError):
+                return 0.0
+            if parsed.tzinfo is not None:
+                parsed = parsed.replace(tzinfo=None)
+            return max(0.0, (current - parsed).total_seconds())
+
+        return {"outbox": age(outbox), "push": age(push)}
 
     def mark_outbox_processed(
         self, outbox_id: str, user_id: str, *, worker_id: Optional[str] = None,
@@ -880,6 +918,8 @@ class NotificationRepository:
         self.ensure_user(user_id)
         if int(revision) < 0:
             raise ValueError("Sync revision cannot be negative.")
+        if not 1 <= int(limit) <= 500:
+            raise ValueError("Notification sync limit must be between 1 and 500.")
         current = self.get_sync_revision(user_id)
         rows = self.db.fetch_all(
             """SELECT * FROM notifications
@@ -990,6 +1030,7 @@ class NotificationRepository:
         user_id: str,
         *,
         task_id: Optional[int] = None,
+        notification_type: NotificationType | str | None = None,
         except_identities: Optional[set[tuple[int, int, int]]] = None,
         reason: str = "reconciled",
     ) -> int:
@@ -999,6 +1040,13 @@ class NotificationRepository:
         if task_id is not None:
             conditions.append("task_id=?")
             params.append(int(task_id))
+        if notification_type is not None:
+            kind = NotificationType(notification_type).value
+            conditions.append(
+                "notification_id IN (SELECT notification_id FROM notifications "
+                "WHERE user_id=? AND notification_type=?)"
+            )
+            params.extend((user_id, kind))
         rows = self.db.fetch_all(
             f"SELECT * FROM notification_local_schedules WHERE {' AND '.join(conditions)}",
             tuple(params),
