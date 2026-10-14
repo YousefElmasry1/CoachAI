@@ -5,6 +5,8 @@ from __future__ import annotations
 from threading import Lock
 from typing import Callable
 
+from sqlalchemy.engine import URL
+
 from database import Database
 
 
@@ -16,9 +18,16 @@ class DatabaseFactory:
     out connection; closing the factory disposes the process pool.
     """
 
-    def __init__(self, database_url: str) -> None:
-        self.database_url = database_url
-        self.engine = Database.create_pool(database_url)
+    def __init__(self, database_url: str | URL) -> None:
+        # ``str(URL)`` deliberately masks passwords as ``***``. Preserve the
+        # credential for the internal engine handoff without ever logging or
+        # returning the resulting connection string.
+        self.database_url = (
+            database_url.render_as_string(hide_password=False)
+            if isinstance(database_url, URL)
+            else database_url
+        )
+        self.engine = Database.create_pool(self.database_url)
         self._schema_validated = False
         self._lock = Lock()
         self._closed = False

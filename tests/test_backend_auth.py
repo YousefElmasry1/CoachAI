@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import sys
 import tempfile
+from types import ModuleType
 import unittest
+from unittest.mock import patch
 
 from backend_errors import AuthenticationRequired
 from database import Database
@@ -64,6 +67,39 @@ class FirebaseAuthenticationTests(unittest.TestCase):
             with self.subTest(claims=claims):
                 with self.assertRaises(AuthenticationRequired):
                     self.verifier(claims).verify("token")
+
+    def test_default_adapter_initializes_official_admin_app(self):
+        firebase_admin = ModuleType("firebase_admin")
+        auth = ModuleType("firebase_admin.auth")
+        firebase_app = object()
+        calls = []
+
+        def get_app():
+            raise ValueError("no default app")
+
+        def initialize_app(*, options):
+            calls.append(("initialize", options))
+            return firebase_app
+
+        def verify_id_token(token, *, app, check_revoked):
+            calls.append(("verify", token, app, check_revoked))
+            return self.claims()
+
+        firebase_admin.get_app = get_app
+        firebase_admin.initialize_app = initialize_app
+        firebase_admin.auth = auth
+        auth.verify_id_token = verify_id_token
+        with patch.dict(
+            sys.modules,
+            {"firebase_admin": firebase_admin, "firebase_admin.auth": auth},
+        ):
+            principal = FirebaseTokenVerifier(project_id=self.project_id).verify(
+                "signed-token"
+            )
+
+        self.assertEqual("firebase-u1", principal.user_id)
+        self.assertEqual(("initialize", {"projectId": self.project_id}), calls[0])
+        self.assertEqual(("verify", "signed-token", firebase_app, True), calls[1])
 
 
 class PrincipalProvisioningTests(unittest.TestCase):

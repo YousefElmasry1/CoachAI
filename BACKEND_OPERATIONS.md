@@ -1,8 +1,8 @@
 # CoachAI Backend Operations
 
 This runbook describes how to deploy and operate the framework-neutral CoachAI
-backend core. It does not define a web API and it does not authorize starting
-background work inside a future FastAPI process.
+backend core and its thin authenticated FastAPI transport. It does not
+authorize starting background work inside a FastAPI process.
 
 ## Production invariants
 
@@ -39,9 +39,9 @@ Run these as separate deployment roles, each with its own process lifecycle:
 5. **Maintenance worker** — runs `python main.py`. It performs idempotent,
    timezone-aware stale-task cleanup. `main.py` intentionally exposes no web
    application.
-6. **Future transport process** — not part of this patch. When introduced, it
-   must construct a request-scoped unit of work and `CoachAIApplication`; it
-   must not embed any of the workers above.
+6. **FastAPI transport process** — runs
+   `python -m uvicorn fastapi_app:app`. It exposes operational probes and the
+   reviewed API routes documented in `FRONTEND_HANDOFF.md`; it embeds no worker.
 
 Use a real process supervisor or container orchestrator with restart policies,
 termination grace periods, and one role per process. Multiple notification or
@@ -239,9 +239,9 @@ defence in depth, not permission to pass arbitrary objects to the logger.
 
 ## Liveness, readiness, and worker supervision
 
-`operational_health.py` provides framework-neutral primitives; it does not
-publish an HTTP route. A future transport, sidecar, or supervisor adapter must
-expose them without adding business logic.
+`operational_health.py` provides framework-neutral primitives. The FastAPI
+transport exposes process-only `GET /health` and dependency-aware `GET /ready`
+without adding business logic or returning configuration and exception details.
 
 - **Liveness** answers whether the process loop is responsive. Do not make it
   depend on a remote provider.

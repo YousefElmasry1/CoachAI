@@ -51,12 +51,29 @@ class FirebaseTokenVerifier:
         if self._verify_callable is not None:
             return self._verify_callable
         try:
+            import firebase_admin
             from firebase_admin import auth
         except ImportError as exc:
             raise ConfigurationError(
                 "firebase-admin is required for real Firebase token verification."
             ) from exc
-        return auth.verify_id_token
+        try:
+            firebase_app = firebase_admin.get_app()
+        except ValueError:
+            try:
+                firebase_app = firebase_admin.initialize_app(
+                    options={"projectId": self.project_id}
+                )
+            except ValueError:
+                # Another request may have initialized the default app between
+                # get_app() and initialize_app(). Reuse it without exposing the
+                # provider exception or credential details.
+                firebase_app = firebase_admin.get_app()
+
+        def verify_id_token(token: str, **kwargs: Any) -> Mapping[str, Any]:
+            return auth.verify_id_token(token, app=firebase_app, **kwargs)
+
+        return verify_id_token
 
     def verify(self, token: str) -> AuthenticatedPrincipal:
         if not token or not token.strip():

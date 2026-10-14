@@ -4,8 +4,38 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+from urllib.parse import urlsplit
 
 from backend_errors import ConfigurationError
+
+
+def cors_allowed_origins(value: str | None = None) -> tuple[str, ...]:
+    """Return a validated exact browser-origin allowlist."""
+
+    raw = os.getenv("COACHAI_CORS_ALLOWED_ORIGINS", "") if value is None else value
+    origins: list[str] = []
+    for candidate in raw.split(","):
+        origin = candidate.strip()
+        if not origin:
+            continue
+        parsed = urlsplit(origin)
+        if (
+            "*" in origin
+            or parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ConfigurationError(
+                "COACHAI_CORS_ALLOWED_ORIGINS must contain exact HTTP(S) origins."
+            )
+        normalized = f"{parsed.scheme}://{parsed.netloc}"
+        if normalized not in origins:
+            origins.append(normalized)
+    return tuple(origins)
 
 
 def _int(

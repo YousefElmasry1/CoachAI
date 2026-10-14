@@ -6,7 +6,7 @@ notification runtime.
 
 ## Current architecture
 
-- Streamlit multipage application
+- Streamlit multipage application with a separate thin FastAPI transport
 - PostgreSQL through SQLAlchemy and `psycopg2`
 - Smart Scheduler with task segments, schedule revisions, atomic apply/undo,
   ownership enforcement, and optimistic concurrency
@@ -21,9 +21,10 @@ notification runtime.
 - Versioned Alembic migrations and standalone notification, Calendar, and
   maintenance workers
 
-There is intentionally no FastAPI application yet. A future transport will sit
-above the existing application-service boundary; it must not host background
-workers or duplicate domain rules.
+The FastAPI transport exposes `GET /health`, `GET /ready`, authenticated task
+listing, and one versioned/idempotent task-update route. It sits above the
+existing application-service boundary, does not host background workers, and
+does not duplicate domain rules. See `FRONTEND_HANDOFF.md` for the exact API.
 
 PostgreSQL is the normal development/runtime database. SQLite compatibility is
 retained only for explicit isolated tests and legacy-schema utilities; there is
@@ -54,13 +55,24 @@ no automatic runtime fallback to `coach_ai.db`.
    ```
 
 5. Run each background role under a process supervisor, separately from the UI
-   and from any future web workers:
+   and API workers:
 
    ```powershell
    python -m notifications
    python calendar_worker.py
    python main.py
    ```
+
+6. Run the API as its own process role:
+
+   ```powershell
+   python -m uvicorn fastapi_app:app --env-file .env --host 127.0.0.1 --port 8000
+   ```
+
+   `GET /health` is process-only and does not access PostgreSQL. `GET /ready`
+   validates mandatory configuration, PostgreSQL connectivity, and the current
+   Alembic schema revision without returning connection details. Authenticated
+   routes require `FIREBASE_PROJECT_ID` and a valid Firebase ID token.
 
 Install or upgrade the PostgreSQL schema with Alembic before starting the
 application. A missing or invalid `DATABASE_URL` fails clearly and never falls

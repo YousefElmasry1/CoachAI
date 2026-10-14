@@ -14,7 +14,7 @@ from backend_errors import (
 )
 from config import FAILURE_REASONS
 from database import Database, OwnershipError
-from domain_validation import validate_task_fields
+from domain_validation import MAX_TASK_LIST_OFFSET, validate_task_fields
 from identity import AuthenticatedPrincipal
 from mobile_repository import MobileRepository, public_task
 from timezone_utils import user_today
@@ -77,6 +77,35 @@ class TaskApplicationService:
             # Do not reveal whether the referenced identifier exists for a
             # different tenant.
             raise ResourceNotFound("A referenced resource was not found.") from exc
+
+    def list_tasks(self, *, limit: int = 50, offset: int = 0) -> dict:
+        """Return a stable, bounded, principal-scoped task page."""
+
+        if int(limit) < 1 or int(limit) > 100:
+            raise ValidationError("Task page size must be between 1 and 100.")
+        if int(offset) < 0 or int(offset) > MAX_TASK_LIST_OFFSET:
+            raise ValidationError(
+                f"Task page offset must be between 0 and {MAX_TASK_LIST_OFFSET}."
+            )
+        rows = self.db.fetch_all(
+            """SELECT t.* FROM tasks t
+               JOIN plans p ON p.plan_id=t.plan_id
+               WHERE p.user_id=?
+               ORDER BY p.plan_date DESC,t.order_index,t.task_id
+               LIMIT ? OFFSET ?""",
+            (self.user_id, int(limit) + 1, int(offset)),
+        )
+        has_more = len(rows) > int(limit)
+        items = [public_task(row) for row in rows[: int(limit)]]
+        next_offset = int(offset) + len(items) if has_more else None
+        if next_offset is not None and next_offset > MAX_TASK_LIST_OFFSET:
+            raise ValidationError("Task pagination exceeded the supported window.")
+        return {
+            "items": items,
+            "limit": int(limit),
+            "offset": int(offset),
+            "next_offset": next_offset,
+        }
 
     @staticmethod
     def _require_version(task: dict, expected_version: int) -> None:
