@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 import json
 from pathlib import Path
 import tempfile
@@ -21,7 +21,8 @@ class PrincipalBoundApplicationTests(unittest.TestCase):
         self.db = Database(f"sqlite:///{path.as_posix()}")
         for user_id in ("u1", "u2"):
             self.db.create_user(user_id, f"{user_id}@example.com", user_id, "UTC")
-        self.plan1 = self.db.create_plan("u1", date(2026, 10, 9), "test")
+        from timezone_utils import user_today
+        self.plan1 = self.db.create_plan("u1", user_today(self.db, "u1"), "test")
         self.principal = AuthenticatedPrincipal(
             "u1", "u1@example.com", "u1", {"sub": "u1"}
         )
@@ -52,6 +53,104 @@ class PrincipalBoundApplicationTests(unittest.TestCase):
             self.app.scheduling.schedule_plan(
                 self.plan1, expected_revision=expected, work_day_start=time(8),
                 idempotency_key="schedule-stale",
+            )
+
+    def test_today_plan_is_created_once_and_reused(self):
+        # setUp creates today's plan for the other service tests; remove it so
+        # this case can verify both the initial creation and later reuse.
+        self.db.execute("DELETE FROM plans WHERE plan_id=?", (self.plan1,))
+        first = self.app.tasks.ensure_today_plan(idempotency_key="today-1")
+        second = self.app.tasks.ensure_today_plan(idempotency_key="today-2")
+
+        self.assertTrue(first["created"])
+        self.assertFalse(second["created"])
+        self.assertEqual(first["plan_id"], second["plan_id"])
+        self.assertEqual(
+            1,
+            int(
+                self.db.fetch_one(
+                    "SELECT COUNT(*) AS count FROM plans WHERE user_id=? AND plan_date=?",
+                    ("u1", str(first["plan_date"])),
+                )["count"]
+            ),
+        )
+
+    def test_mobile_today_plan_schedule_move_and_undo_flow(self):
+        target = self.app.tasks.ensure_today_plan(idempotency_key="flow-plan")
+        created = self.app.tasks.create_task(
+            plan_id=target["plan_id"],
+            title="Mobile focus block",
+            estimated_minutes=45,
+            idempotency_key="flow-task",
+        )
+        revision = int(
+            self.db.get_plan_by_id(target["plan_id"], "u1")["schedule_revision"]
+        )
+        scheduled = self.app.scheduling.schedule_plan(
+            target["plan_id"],
+            expected_revision=revision,
+            work_day_start=time(8),
+            idempotency_key="flow-schedule",
+        )
+        moved = self.app.scheduling.move_task(
+            created["task_id"],
+            expected_schedule_revision=scheduled["schedule_revision"],
+            new_start=time(15),
+            idempotency_key="flow-move",
+        )
+        undone = self.app.scheduling.undo(
+            moved["operation_id"],
+            idempotency_key="flow-undo",
+        )
+
+        self.assertTrue(moved["success"])
+        self.assertTrue(undone["undone"])
+        self.assertGreater(
+            undone["schedule_revisions"][str(target["plan_id"])],
+            moved["schedule_revision"],
+        )
+
+    def test_mobile_future_day_can_be_created_loaded_and_scheduled(self):
+        from timezone_utils import user_today
+
+        future_day = user_today(self.db, "u1") + timedelta(days=5)
+        target = self.app.tasks.ensure_plan_date(
+            future_day,
+            idempotency_key="future-day-plan",
+        )
+        created = self.app.tasks.create_task(
+            plan_id=target["plan_id"],
+            title="Prepare next week",
+            estimated_minutes=30,
+            idempotency_key="future-day-task",
+        )
+        loaded = self.app.tasks.get_plan_day(future_day)
+
+        self.assertEqual(target["plan_id"], loaded["plan"]["plan_id"])
+        self.assertEqual(created["task_id"], loaded["plan"]["tasks"][0]["task_id"])
+        self.assertEqual(future_day, loaded["date"])
+
+    def test_past_day_is_read_only_at_every_planning_boundary(self):
+        from timezone_utils import user_today
+
+        past_day = user_today(self.db, "u1") - timedelta(days=1)
+        past_plan = self.db.create_plan("u1", past_day, "history")
+
+        with self.assertRaises(ValidationError):
+            self.app.tasks.ensure_plan_date(past_day, idempotency_key="past-plan")
+        with self.assertRaises(ValidationError):
+            self.app.tasks.create_task(
+                plan_id=past_plan,
+                title="Must not be added",
+                estimated_minutes=30,
+                idempotency_key="past-task",
+            )
+        with self.assertRaises(ValidationError):
+            self.app.scheduling.schedule_plan(
+                past_plan,
+                expected_revision=0,
+                work_day_start=time(9),
+                idempotency_key="past-schedule",
             )
 
     def test_device_tenant_is_principal_bound_and_tokens_are_never_returned(self):
@@ -88,6 +187,39 @@ class PrincipalBoundApplicationTests(unittest.TestCase):
             ("u1", "timezone_reconcile"),
         )
         self.assertEqual("queued", queued["status"])
+
+    def test_display_name_change_is_durable_and_idempotent(self):
+        first = self.app.account.change_display_name(
+            "  Ahmed H.  ", idempotency_key="display-name-change"
+        )
+        replay = self.app.account.change_display_name(
+            "Ahmed H.", idempotency_key="display-name-change"
+        )
+        self.assertEqual("Ahmed H.", first["display_name"])
+        self.assertFalse(first["idempotent_replay"])
+        self.assertTrue(replay["idempotent_replay"])
+        self.assertEqual("Ahmed H.", self.app.account.get_profile()["display_name"])
+
+    def test_notification_preferences_round_trip(self):
+        defaults = self.app.notifications.get_preferences()
+        self.assertEqual(10, defaults["default_reminder_lead_minutes"])
+        self.assertEqual(1, defaults["sound_enabled"])
+        changed = self.app.notifications.update_preferences(
+            idempotency_key="notification-preferences",
+            changes={
+                "daily_summary_enabled": True,
+                "coach_checkins_enabled": True,
+                "quiet_hours_start": "22:00",
+                "quiet_hours_end": "07:00",
+                "sound_enabled": False,
+            },
+        )
+        self.assertEqual(1, changed["daily_summary_enabled"])
+        self.assertEqual(1, changed["coach_checkins_enabled"])
+        self.assertEqual(0, changed["sound_enabled"])
+        current = self.app.notifications.get_preferences()
+        self.assertEqual("22:00", str(current["quiet_hours_start"])[:5])
+        self.assertEqual("07:00", str(current["quiet_hours_end"])[:5])
 
     def test_notification_mobile_contract_ack_type_preferences_and_limits(self):
         registered = self.app.notifications.register_device(

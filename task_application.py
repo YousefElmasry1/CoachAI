@@ -18,6 +18,7 @@ from domain_validation import MAX_TASK_LIST_OFFSET, validate_task_fields
 from identity import AuthenticatedPrincipal
 from mobile_repository import MobileRepository, public_task
 from timezone_utils import user_today
+from config import MAX_FUTURE_PLANNING_WEEKS
 
 
 def _utc_now() -> datetime:
@@ -55,9 +56,18 @@ class TaskApplicationService:
             raise ResourceNotFound("Task was not found.")
         return task
 
-    def _require_plan(self, plan_id: int) -> None:
-        if self.db.get_plan_by_id(int(plan_id), self.user_id) is None:
+    def _require_plan(self, plan_id: int) -> dict:
+        plan = self.db.get_plan_by_id(int(plan_id), self.user_id)
+        if plan is None:
             raise ResourceNotFound("Plan was not found.")
+        return plan
+
+    def _require_mutable_plan(self, plan_id: int) -> dict:
+        plan = self._require_plan(plan_id)
+        plan_date = date.fromisoformat(str(plan["plan_date"])[:10])
+        if plan_date < user_today(self.db, self.user_id):
+            raise ValidationError("Past plans are read-only.")
+        return plan
 
     def _require_category(self, category_id: int | None) -> None:
         if category_id is None:
@@ -107,6 +117,152 @@ class TaskApplicationService:
             "next_offset": next_offset,
         }
 
+    def get_today_home(self) -> dict:
+        """Return a bounded, principal-scoped snapshot for the Home screen.
+
+        The date is resolved on the server from the authenticated user's
+        timezone. No caller-supplied user or date selector is accepted.
+        """
+
+        local_date = user_today(self.db, self.user_id)
+        profile = self.db.fetch_one(
+            "SELECT display_name FROM users WHERE user_id=?",
+            (self.user_id,),
+        )
+        plan = self.db.get_plan_by_date(self.user_id, local_date)
+        response: dict[str, Any] = {
+            "date": local_date,
+            "display_name": profile.get("display_name") if profile else None,
+            "plan": None,
+        }
+        if plan is None:
+            return response
+
+        task_limit = 100
+        task_rows = self.db.fetch_all(
+            """SELECT t.* FROM tasks t
+               JOIN plans p ON p.plan_id=t.plan_id
+               WHERE t.plan_id=? AND p.user_id=?
+               ORDER BY t.order_index ASC,t.task_id ASC
+               LIMIT ?""",
+            (int(plan["plan_id"]), self.user_id, task_limit),
+        )
+        counts = self.db.fetch_one(
+            """SELECT
+                 COUNT(*) AS total,
+                 SUM(CASE WHEN t.status='completed' THEN 1 ELSE 0 END) AS completed,
+                 SUM(CASE WHEN t.status='in_progress' THEN 1 ELSE 0 END) AS in_progress,
+                 SUM(CASE WHEN t.status='pending' THEN 1 ELSE 0 END) AS pending,
+                 SUM(CASE WHEN t.status='failed' THEN 1 ELSE 0 END) AS failed
+               FROM tasks t
+               JOIN plans p ON p.plan_id=t.plan_id
+               WHERE t.plan_id=? AND p.user_id=?""",
+            (int(plan["plan_id"]), self.user_id),
+        ) or {}
+        progress = {
+            key: int(counts.get(key) or 0)
+            for key in ("completed", "in_progress", "pending", "failed", "total")
+        }
+        response["plan"] = {
+            "plan_id": int(plan["plan_id"]),
+            "plan_date": plan["plan_date"],
+            "status": str(plan["status"]),
+            "schedule_revision": int(plan.get("schedule_revision") or 0),
+            "tasks": [public_task(row) for row in task_rows],
+            "tasks_truncated": progress["total"] > len(task_rows),
+            "progress": progress,
+        }
+        return response
+
+    def get_plan_day(self, plan_date: date) -> dict:
+        """Return one principal-owned day within the supported horizon."""
+
+        local_today = user_today(self.db, self.user_id)
+        maximum = local_today + timedelta(weeks=MAX_FUTURE_PLANNING_WEEKS)
+        minimum = local_today - timedelta(weeks=MAX_FUTURE_PLANNING_WEEKS)
+        if plan_date < minimum or plan_date > maximum:
+            raise ValidationError("The requested day is outside the supported planning horizon.")
+        plan = self.db.get_plan_by_date(self.user_id, plan_date)
+        response: dict[str, Any] = {"date": plan_date, "display_name": None, "plan": None}
+        if plan is None:
+            return response
+        rows = self.db.get_tasks_by_plan(int(plan["plan_id"]), self.user_id)[:100]
+        counts = {"completed": 0, "in_progress": 0, "pending": 0, "failed": 0}
+        for row in self.db.get_tasks_by_plan(int(plan["plan_id"]), self.user_id):
+            status = str(row.get("status") or "pending")
+            if status in counts:
+                counts[status] += 1
+        counts["total"] = sum(counts.values())
+        response["plan"] = {
+            "plan_id": int(plan["plan_id"]),
+            "plan_date": plan_date,
+            "status": str(plan["status"]),
+            "schedule_revision": int(plan.get("schedule_revision") or 0),
+            "tasks": [public_task(row) for row in rows],
+            "tasks_truncated": counts["total"] > len(rows),
+            "progress": counts,
+        }
+        return response
+
+    def ensure_today_plan(self, *, idempotency_key: str) -> dict:
+        """Return today's principal-owned plan, creating it exactly once.
+
+        The date is always resolved from the user's server-side timezone.  An
+        insert with a uniqueness conflict is intentionally treated as success
+        so parallel mobile task creates converge on the same daily plan.
+        """
+
+        return self.ensure_plan_date(
+            user_today(self.db, self.user_id),
+            idempotency_key=idempotency_key,
+        )
+
+    def ensure_plan_date(self, local_date: date, *, idempotency_key: str) -> dict:
+        today = user_today(self.db, self.user_id)
+        if local_date < today:
+            raise ValidationError("Past plans cannot be created or changed.")
+        if local_date > today + timedelta(weeks=MAX_FUTURE_PLANNING_WEEKS):
+            raise ValidationError("The requested day is outside the future-planning horizon.")
+        request = {"plan_date": local_date.isoformat()}
+
+        def mutation() -> dict:
+            inserted = self.db.execute(
+                """INSERT INTO plans (user_id,plan_date,raw_input,status)
+                   VALUES (?,?,?,?)
+                   ON CONFLICT(user_id,plan_date) DO NOTHING""",
+                (
+                    self.user_id,
+                    local_date.isoformat(),
+                    "Created from the mobile schedule",
+                    "active",
+                ),
+            )
+            plan = self.db.get_plan_by_date(self.user_id, local_date)
+            if plan is None:
+                raise RuntimeError("Today's plan could not be created.")
+            sync_revision = self.mobile.record_plan_bundle(
+                user_id=self.user_id,
+                plan_id=int(plan["plan_id"]),
+            )
+            return {
+                "plan_id": int(plan["plan_id"]),
+                "plan_date": local_date,
+                "status": str(plan["status"]),
+                "schedule_revision": int(plan.get("schedule_revision") or 0),
+                "created": inserted.rowcount > 0,
+                "sync_revision": sync_revision,
+            }
+
+        result, replayed = self._execute_idempotent(
+            user_id=self.user_id,
+            operation="plan.ensure_date",
+            idempotency_key=idempotency_key,
+            request_payload=request,
+            mutation=mutation,
+        )
+        result["idempotent_replay"] = replayed
+        return result
+
     @staticmethod
     def _require_version(task: dict, expected_version: int) -> None:
         if int(task.get("version") or 0) != int(expected_version):
@@ -153,7 +309,7 @@ class TaskApplicationService:
         )
         if int(priority) not in range(1, 6):
             raise ValidationError("Priority must be between 1 and 5.")
-        self._require_plan(plan_id)
+        self._require_mutable_plan(plan_id)
         self._require_category(category_id)
         request = {
             "plan_id": int(plan_id), "title": clean_title,
@@ -201,6 +357,7 @@ class TaskApplicationService:
             raise ValidationError(f"Unsupported task fields: {', '.join(sorted(unknown))}.")
         normalized = dict(changes)
         current = self._task(task_id)
+        self._require_mutable_plan(int(current["plan_id"]))
         if any(key in normalized for key in ("title", "description", "estimated_minutes")):
             title, description, minutes = validate_task_fields(
                 title=normalized.get("title", current["title"]),
@@ -257,6 +414,7 @@ class TaskApplicationService:
         def mutation() -> dict:
             task = self._task(task_id)
             plan_id = int(task["plan_id"])
+            self._require_mutable_plan(plan_id)
             self._require_version(task, expected_version)
             if task["status"] == "in_progress":
                 raise InvalidStateTransition(
@@ -334,6 +492,7 @@ class TaskApplicationService:
 
         def mutation() -> dict:
             task = self._task(task_id)
+            self._require_mutable_plan(int(task["plan_id"]))
             self._require_version(task, expected_version)
             status = str(task["status"])
             running = bool(task.get("timer_segment_started_at"))

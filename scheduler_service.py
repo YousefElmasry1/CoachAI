@@ -325,7 +325,18 @@ class SchedulerService:
         """
         tasks: list[ScheduledTask] = []
         for row in rows:
-            is_fixed = bool(self._row_get(row, "is_fixed_time", 0))
+            explicitly_fixed = bool(self._row_get(row, "is_fixed_time", 0))
+            status = str(self._row_get(row, "status", "pending") or "pending")
+            # Work already in progress, or preserved in history, is not
+            # movable when a newly-created task triggers a day re-plan.
+            # Treat its saved interval as an occupied fixed window while
+            # leaving the database's explicit is_fixed_time flag unchanged.
+            locked_by_progress = (
+                status in {"in_progress", "completed"}
+                and self._row_get(row, "scheduled_start") is not None
+                and self._row_get(row, "scheduled_end") is not None
+            )
+            is_fixed = explicitly_fixed or locked_by_progress
             fixed_start = None
             fixed_end = None
             if is_fixed:

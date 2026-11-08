@@ -257,13 +257,34 @@ def _get_api_key() -> Optional[str]:
 
 def _ai_timeout_seconds() -> float:
     try:
-        value = float(os.getenv("COACHAI_AI_TIMEOUT_SECONDS", "20"))
+        value = float(os.getenv("COACHAI_AI_TIMEOUT_SECONDS", "15"))
     except ValueError as exc:
         raise ConfigurationError("COACHAI_AI_TIMEOUT_SECONDS must be numeric.") from exc
     if not 0.1 <= value <= 120:
         raise ConfigurationError(
             "COACHAI_AI_TIMEOUT_SECONDS must be between 0.1 and 120 seconds."
         )
+    return value
+
+
+def _chat_tool_round_limit() -> int:
+    """Keep interactive chat responsive while still allowing grounded tools."""
+    try:
+        value = int(os.getenv("COACHAI_CHAT_TOOL_ROUNDS", "2"))
+    except ValueError as exc:
+        raise ConfigurationError("COACHAI_CHAT_TOOL_ROUNDS must be an integer.") from exc
+    if not 1 <= value <= 3:
+        raise ConfigurationError("COACHAI_CHAT_TOOL_ROUNDS must be between 1 and 3.")
+    return value
+
+
+def _chat_output_tokens() -> int:
+    try:
+        value = int(os.getenv("COACHAI_CHAT_OUTPUT_TOKENS", "1024"))
+    except ValueError as exc:
+        raise ConfigurationError("COACHAI_CHAT_OUTPUT_TOKENS must be an integer.") from exc
+    if not 256 <= value <= 4096:
+        raise ConfigurationError("COACHAI_CHAT_OUTPUT_TOKENS must be between 256 and 4096.")
     return value
 
 
@@ -933,8 +954,6 @@ class ChatbotService:
     CoachAI Assistant. Each instance is tied to a specific user.
     """
 
-    _MAX_TOOL_ROUNDS: int = 5  # Safety limit on tool-call loops
-
     # Chat is naturally higher-frequency than the planner/coach calls,
     # but each message can still trigger multiple tool-calling round
     # trips to Gemini, so it still needs a ceiling against a rapid-fire
@@ -950,6 +969,7 @@ class ChatbotService:
         )
         self._chat: Any = None
         self._client: Any = None
+        self._max_tool_rounds = _chat_tool_round_limit()
 
         api_key = _get_api_key()
         if not api_key:
@@ -968,7 +988,7 @@ class ChatbotService:
                 api_version="v1",
                 timeout=max(100, int(_ai_timeout_seconds() * 1_000)),
                 retry_options=types.HttpRetryOptions(
-                    attempts=3,
+                    attempts=2,
                     initial_delay=0.5,
                     max_delay=2.0,
                     exp_base=2.0,
@@ -990,7 +1010,7 @@ class ChatbotService:
             system_instruction=system_prompt,
             tools=[_build_tool_declarations()],
             temperature=0.2,
-            max_output_tokens=MAX_AI_OUTPUT_TOKENS,
+            max_output_tokens=_chat_output_tokens(),
         )
 
         self._chat = self._client.chats.create(
@@ -1049,7 +1069,7 @@ class ChatbotService:
         from google.genai import types
 
         rounds = 0
-        while rounds < self._MAX_TOOL_ROUNDS:
+        while rounds < self._max_tool_rounds:
             # Check if there are any function calls in the response
             function_calls = []
             try:
@@ -1182,7 +1202,7 @@ class ChatbotService:
             fc_parts = collected_fc
             rounds = 0
 
-            while fc_parts and rounds < self._MAX_TOOL_ROUNDS:
+            while fc_parts and rounds < self._max_tool_rounds:
                 # Execute all requested tools
                 fr_response = []
                 for p in fc_parts:

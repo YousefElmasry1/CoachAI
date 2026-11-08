@@ -269,9 +269,10 @@ class SafeAiBoundaryTests(unittest.TestCase):
         options = client_type.call_args.kwargs["http_options"]
         self.assertEqual("v1", options.api_version)
         self.assertEqual(1500, options.timeout)
-        self.assertEqual(3, options.retry_options.attempts)
+        self.assertEqual(2, options.retry_options.attempts)
         config = client.chats.create.call_args.kwargs["config"]
-        self.assertEqual(MAX_AI_OUTPUT_TOKENS, config.max_output_tokens)
+        self.assertEqual(1024, config.max_output_tokens)
+        self.assertEqual(2, chatbot._max_tool_rounds)
         self.assertIn(
             "too long",
             chatbot.send_message("x" * (MAX_AI_INPUT_CHARS + 1)).lower(),

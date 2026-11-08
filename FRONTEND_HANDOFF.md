@@ -1,21 +1,32 @@
 # CoachAI Frontend Handoff
 
-Verified locally: 2026-10-14 (Africa/Cairo)
+Verified locally: 2026-11-08 (Africa/Cairo)
 
 ## Current integration boundary
 
-The local PostgreSQL runtime, FastAPI readiness, Firebase bearer adapter,
-request-scoped database lifetime, task listing, and task update route are
-implemented and tested. The available API is intentionally small:
+The FastAPI runtime, Firebase bearer adapter, request-scoped database lifetime,
+and Android application-service routes are implemented. Important route groups
+include:
 
 - `GET /health`
 - `GET /ready`
+- `GET /v1/home`
+- `GET|PATCH /v1/profile`
+- `GET|POST /v1/plans/...`
 - `GET /v1/tasks`
+- `POST /v1/tasks`
 - `PATCH /v1/tasks/{task_id}`
+- task lifecycle routes (`start`, `pause`, `resume`, `complete`, `fail`, `defer`)
+- `/v1/scheduling/*` including apply, move, and undo
+- `/v1/future-planning/*` including candidates, preview, apply, and undo
+- `GET /v1/analytics`
+- `/v1/coach/*`
+- `/v1/notifications/*`
+- `/v1/calendar/*`
 
-Task creation, plans, sync, Calendar, notifications, AI, analytics, and account
-routes are not implemented. Do not infer routes from application-service
-methods or `MOBILE_BACKEND_CONTRACTS.md`.
+Use the running server's `/docs` or `/openapi.json` as the source of truth for
+request/response fields. Mutating routes require an `Idempotency-Key` where
+documented, and tenant identity always comes from the Firebase bearer token.
 
 ## Local startup
 

@@ -1,0 +1,478 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#faf9f7">
+  <title>Zen Maestro — Log in</title>
+  <style>
+    :root {
+      --background: #faf9f7;
+      --surface: #ffffff;
+      --text: #241e1b;
+      --muted: #706863;
+      --subtle: #8c837d;
+      --border: #e2ddd8;
+      --accent: #ff7a45;
+      --accent-pressed: #e86431;
+      --accent-soft: #ffeee6;
+      --danger: #d94848;
+      --shadow: 0 18px 50px rgba(36, 30, 27, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body { min-height: 100%; }
+
+    body {
+      margin: 0;
+      min-height: 100dvh;
+      background:
+        radial-gradient(circle at 20% 0%, rgba(255, 122, 69, 0.07), transparent 30rem),
+        var(--background);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    button, input { font: inherit; }
+
+    .screen {
+      width: min(100%, 480px);
+      min-height: 100dvh;
+      margin: 0 auto;
+      padding: max(28px, env(safe-area-inset-top)) 24px max(28px, env(safe-area-inset-bottom));
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+    }
+
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      width: fit-content;
+      margin-bottom: clamp(34px, 7vh, 64px);
+      color: var(--text);
+      font-size: 18px;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+    }
+
+    .brand-mark {
+      width: 36px;
+      height: 36px;
+      display: grid;
+      place-items: center;
+      border-radius: 12px;
+      background: var(--accent);
+      color: white;
+      box-shadow: 0 8px 20px rgba(255, 122, 69, 0.25);
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(40px, 10vw, 54px);
+      line-height: 1.03;
+      letter-spacing: -0.055em;
+      font-weight: 850;
+    }
+
+    .subtitle {
+      margin: 14px 0 38px;
+      color: var(--muted);
+      font-size: 18px;
+      line-height: 1.5;
+    }
+
+    .field { margin-bottom: 21px; }
+
+    label {
+      display: block;
+      margin-bottom: 10px;
+      font-size: 15px;
+      line-height: 1.2;
+      font-weight: 750;
+    }
+
+    .input-wrap {
+      height: 68px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 0 18px;
+      border: 1.5px solid var(--border);
+      border-radius: 20px;
+      background: var(--surface);
+      transition: border-color 160ms ease, box-shadow 160ms ease, transform 160ms ease;
+    }
+
+    .input-wrap:focus-within {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 4px var(--accent-soft);
+    }
+
+    .input-wrap.invalid {
+      border-color: var(--danger);
+      box-shadow: 0 0 0 4px rgba(217, 72, 72, 0.08);
+    }
+
+    .icon {
+      width: 23px;
+      height: 23px;
+      flex: 0 0 auto;
+      color: var(--subtle);
+    }
+
+    input {
+      width: 100%;
+      min-width: 0;
+      border: 0;
+      outline: 0;
+      background: transparent;
+      color: var(--text);
+      font-size: 17px;
+    }
+
+    input::placeholder { color: #9b938e; }
+
+    .icon-button {
+      width: 42px;
+      height: 42px;
+      margin-right: -10px;
+      display: grid;
+      place-items: center;
+      border: 0;
+      border-radius: 12px;
+      background: transparent;
+      color: var(--subtle);
+      cursor: pointer;
+    }
+
+    .icon-button:hover { background: #f5f1ee; }
+
+    .error {
+      min-height: 18px;
+      margin: 7px 3px 0;
+      color: var(--danger);
+      font-size: 13px;
+      line-height: 1.35;
+    }
+
+    .forgot-row {
+      display: flex;
+      justify-content: flex-end;
+      margin: -5px 2px 24px;
+    }
+
+    .text-button {
+      padding: 6px 0;
+      border: 0;
+      background: transparent;
+      color: #c94f1f;
+      font-size: 15px;
+      font-weight: 750;
+      cursor: pointer;
+    }
+
+    .primary-button,
+    .google-button {
+      width: 100%;
+      height: 66px;
+      border-radius: 20px;
+      font-weight: 800;
+      cursor: pointer;
+      transition: transform 150ms ease, background 150ms ease, box-shadow 150ms ease;
+    }
+
+    .primary-button {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 14px;
+      border: 0;
+      background: var(--accent);
+      color: white;
+      font-size: 17px;
+      box-shadow: 0 14px 28px rgba(255, 122, 69, 0.22);
+    }
+
+    .primary-button:hover { background: var(--accent-pressed); }
+    .primary-button:active, .google-button:active { transform: scale(0.985); }
+
+    .arrow { width: 21px; height: 21px; }
+
+    .divider {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr;
+      align-items: center;
+      gap: 15px;
+      margin: 27px 0;
+      color: var(--subtle);
+      font-size: 14px;
+    }
+
+    .divider::before, .divider::after {
+      content: "";
+      height: 1px;
+      background: var(--border);
+    }
+
+    .google-button {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 13px;
+      border: 1.5px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+      font-size: 16px;
+      box-shadow: 0 5px 18px rgba(36, 30, 27, 0.025);
+    }
+
+    .google-button:hover {
+      border-color: #c9c1bc;
+      box-shadow: var(--shadow);
+    }
+
+    .google-mark {
+      width: 26px;
+      height: 26px;
+      display: grid;
+      place-items: center;
+      border-radius: 50%;
+      background: conic-gradient(from -40deg, #4285f4 0 25%, #34a853 0 47%, #fbbc05 0 70%, #ea4335 0 100%);
+      color: white;
+      font: 900 16px/1 Arial, sans-serif;
+    }
+
+    .google-mark::after {
+      content: "G";
+      width: 19px;
+      height: 19px;
+      display: grid;
+      place-items: center;
+      border-radius: 50%;
+      background: white;
+      color: #4285f4;
+    }
+
+    .signup {
+      margin: 30px 0 0;
+      text-align: center;
+      color: var(--muted);
+      font-size: 15px;
+    }
+
+    .signup button { margin-left: 6px; }
+
+    .status {
+      display: none;
+      margin: 18px 0 0;
+      padding: 12px 14px;
+      border-radius: 14px;
+      background: #eaf7f0;
+      color: #168554;
+      text-align: center;
+      font-size: 14px;
+      font-weight: 700;
+    }
+
+    .status.visible { display: block; }
+
+    .view { animation: view-in 220ms ease both; }
+    .view[hidden] { display: none; }
+
+    .back-button {
+      width: 44px;
+      height: 44px;
+      margin: 0 0 26px -8px;
+      display: grid;
+      place-items: center;
+      border: 1.5px solid var(--border);
+      border-radius: 14px;
+      background: var(--surface);
+      color: var(--text);
+      cursor: pointer;
+    }
+
+    .back-button:hover { border-color: var(--accent); color: var(--accent); }
+
+    .back-button svg { width: 21px; height: 21px; }
+
+    @keyframes view-in {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    @media (min-width: 600px) {
+      body { padding: 26px; }
+      .screen {
+        min-height: calc(100dvh - 52px);
+        padding: 54px 48px;
+        border: 1px solid rgba(226, 221, 216, 0.8);
+        border-radius: 34px;
+        background: rgba(255, 255, 255, 0.88);
+        box-shadow: var(--shadow);
+      }
+    }
+
+    @media (max-height: 760px) {
+      .screen { justify-content: flex-start; }
+      .brand { margin-bottom: 32px; }
+      .subtitle { margin-bottom: 28px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="screen">
+    <div class="brand" aria-label="Zen Maestro">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M6 3h9a3 3 0 0 1 3 3v12H9a3 3 0 0 0-3 3V3Z"/><path d="M6 18h12"/><path d="M10 7h4M10 11h4"/>
+        </svg>
+      </span>
+      <span>Zen Maestro</span>
+    </div>
+
+    <section class="view" id="loginView">
+      <h1>Welcome back</h1>
+      <p class="subtitle">Pick up where you left off and keep moving forward.</p>
+
+      <form id="loginForm" novalidate>
+        <div class="field">
+          <label for="loginEmail">Email address</label>
+          <div class="input-wrap">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7 9 6 9-6"/></svg>
+            <input id="loginEmail" type="email" inputmode="email" autocomplete="email" placeholder="you@example.com">
+          </div>
+          <p class="error" aria-live="polite"></p>
+        </div>
+        <div class="field">
+          <label for="loginPassword">Password</label>
+          <div class="input-wrap">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3"/></svg>
+            <input id="loginPassword" type="password" autocomplete="current-password" placeholder="Enter your password">
+            <button class="icon-button password-toggle" type="button" aria-label="Show password"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z"/><circle cx="12" cy="12" r="2.8"/></svg></button>
+          </div>
+          <p class="error" aria-live="polite"></p>
+        </div>
+        <div class="forgot-row"><button class="text-button" type="button" data-open="forgotView">Forgot password?</button></div>
+        <button class="primary-button" type="submit"><span>Log in</span><svg class="arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M5 12h14M13 6l6 6-6 6"/></svg></button>
+        <p class="status" role="status">Design preview — login is ready for Firebase connection.</p>
+      </form>
+
+      <div class="divider"><span>or</span></div>
+      <button class="google-button preview-action" type="button"><span class="google-mark" aria-hidden="true"></span><span>Continue with Google</span></button>
+      <p class="signup">New here?<button class="text-button" type="button" data-open="signupView">Create account</button></p>
+    </section>
+
+    <section class="view" id="signupView" hidden>
+      <button class="back-button" type="button" data-open="loginView" aria-label="Back to log in"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="m15 18-6-6 6-6"/></svg></button>
+      <h1>Create account</h1>
+      <p class="subtitle">Start building better days with Zen Maestro.</p>
+      <form id="signupForm" novalidate>
+        <div class="field">
+          <label for="signupName">Name</label>
+          <div class="input-wrap"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg><input id="signupName" autocomplete="name" placeholder="Your name"></div>
+          <p class="error" aria-live="polite"></p>
+        </div>
+        <div class="field">
+          <label for="signupEmail">Email address</label>
+          <div class="input-wrap"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7 9 6 9-6"/></svg><input id="signupEmail" type="email" inputmode="email" autocomplete="email" placeholder="you@example.com"></div>
+          <p class="error" aria-live="polite"></p>
+        </div>
+        <div class="field">
+          <label for="signupPassword">Password</label>
+          <div class="input-wrap"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3"/></svg><input id="signupPassword" type="password" autocomplete="new-password" placeholder="At least 8 characters"><button class="icon-button password-toggle" type="button" aria-label="Show password"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z"/><circle cx="12" cy="12" r="2.8"/></svg></button></div>
+          <p class="error" aria-live="polite"></p>
+        </div>
+        <button class="primary-button" type="submit"><span>Create account</span><svg class="arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M5 12h14M13 6l6 6-6 6"/></svg></button>
+        <p class="status" role="status">Account form is ready for Firebase connection.</p>
+      </form>
+      <div class="divider"><span>or</span></div>
+      <button class="google-button preview-action" type="button"><span class="google-mark"></span><span>Continue with Google</span></button>
+      <p class="signup">Already a member?<button class="text-button" type="button" data-open="loginView">Log in</button></p>
+    </section>
+
+    <section class="view" id="forgotView" hidden>
+      <button class="back-button" type="button" data-open="loginView" aria-label="Back to log in"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="m15 18-6-6 6-6"/></svg></button>
+      <h1>Reset password</h1>
+      <p class="subtitle">Enter your email and we’ll send you a password reset link.</p>
+      <form id="forgotForm" novalidate>
+        <div class="field">
+          <label for="forgotEmail">Email address</label>
+          <div class="input-wrap"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7 9 6 9-6"/></svg><input id="forgotEmail" type="email" inputmode="email" autocomplete="email" placeholder="you@example.com"></div>
+          <p class="error" aria-live="polite"></p>
+        </div>
+        <button class="primary-button" type="submit"><span>Send reset link</span><svg class="arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M5 12h14M13 6l6 6-6 6"/></svg></button>
+        <p class="status" role="status">Reset link preview sent. Firebase will handle the real email.</p>
+      </form>
+      <p class="signup">Remembered it?<button class="text-button" type="button" data-open="loginView">Back to log in</button></p>
+    </section>
+  </main>
+
+  <script>
+    const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+    function openView(id) {
+      document.querySelectorAll('.view').forEach(view => view.hidden = view.id !== id);
+      document.querySelectorAll('.status').forEach(status => status.classList.remove('visible'));
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+
+    document.querySelectorAll('[data-open]').forEach(button => {
+      button.addEventListener('click', () => openView(button.dataset.open));
+    });
+
+    document.querySelectorAll('.password-toggle').forEach(button => {
+      button.addEventListener('click', () => {
+        const input = button.parentElement.querySelector('input');
+        const show = input.type === 'password';
+        input.type = show ? 'text' : 'password';
+        button.setAttribute('aria-label', show ? 'Hide password' : 'Show password');
+        input.focus();
+      });
+    });
+
+    function validateField(input, message, test) {
+      const wrap = input.closest('.input-wrap');
+      const error = wrap.nextElementSibling;
+      const valid = test(input.value.trim());
+      wrap.classList.toggle('invalid', !valid);
+      error.textContent = valid ? '' : message;
+      input.addEventListener('input', () => {
+        wrap.classList.remove('invalid');
+        error.textContent = '';
+        input.closest('form').querySelector('.status').classList.remove('visible');
+      }, { once: true });
+      return valid;
+    }
+
+    document.getElementById('loginForm').addEventListener('submit', event => {
+      event.preventDefault();
+      const emailOk = validateField(document.getElementById('loginEmail'), 'Enter a valid email address.', value => emailPattern.test(value));
+      const passwordOk = validateField(document.getElementById('loginPassword'), 'Password must be at least 8 characters.', value => value.length >= 8);
+      if (emailOk && passwordOk) event.currentTarget.querySelector('.status').classList.add('visible');
+    });
+
+    document.getElementById('signupForm').addEventListener('submit', event => {
+      event.preventDefault();
+      const nameOk = validateField(document.getElementById('signupName'), 'Enter your name.', value => value.length >= 2);
+      const emailOk = validateField(document.getElementById('signupEmail'), 'Enter a valid email address.', value => emailPattern.test(value));
+      const passwordOk = validateField(document.getElementById('signupPassword'), 'Use at least 8 characters.', value => value.length >= 8);
+      if (nameOk && emailOk && passwordOk) event.currentTarget.querySelector('.status').classList.add('visible');
+    });
+
+    document.getElementById('forgotForm').addEventListener('submit', event => {
+      event.preventDefault();
+      const emailOk = validateField(document.getElementById('forgotEmail'), 'Enter a valid email address.', value => emailPattern.test(value));
+      if (emailOk) event.currentTarget.querySelector('.status').classList.add('visible');
+    });
+
+    document.querySelectorAll('.preview-action').forEach(button => {
+      button.addEventListener('click', () => alert('Google sign-in will work after Firebase is connected.'));
+    });
+  </script>
+</body>
+</html>

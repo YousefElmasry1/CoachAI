@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from datetime import date
 from pathlib import Path
+import asyncio
 import tempfile
 import unittest
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
+from httpx import ASGITransport, AsyncClient
 
 from fastapi_app import create_app
 from identity import AuthenticatedPrincipal
@@ -126,6 +128,137 @@ class FastAPITaskRouteTests(unittest.TestCase):
         self.assertEqual("VALIDATION_ERROR", invalid.json()["code"])
         self.assertNotIn("unknown", invalid.text)
 
+    def test_notification_preferences_are_private_scoped_and_idempotent(self) -> None:
+        with TestClient(self.app) as client:
+            initial_u1 = client.get(
+                "/v1/notifications/preferences", headers=self.headers("token-u1")
+            )
+            initial_u2 = client.get(
+                "/v1/notifications/preferences", headers=self.headers("token-u2")
+            )
+            headers = self.headers("token-u1", "notification-key")
+            updated = client.patch(
+                "/v1/notifications/preferences",
+                json={"daily_summary_enabled": True, "quiet_hours_start": "22:15:00", "quiet_hours_end": "07:30:00"},
+                headers=headers,
+            )
+            replay = client.patch(
+                "/v1/notifications/preferences",
+                json={"daily_summary_enabled": True, "quiet_hours_start": "22:15:00", "quiet_hours_end": "07:30:00"},
+                headers=headers,
+            )
+            unchanged_u2 = client.get(
+                "/v1/notifications/preferences", headers=self.headers("token-u2")
+            )
+
+        self.assertEqual("u1", initial_u1.json()["user_id"])
+        self.assertEqual("u2", initial_u2.json()["user_id"])
+        self.assertEqual("no-store", initial_u1.headers["cache-control"])
+        self.assertEqual("Authorization", initial_u1.headers["vary"])
+        self.assertEqual(200, updated.status_code)
+        self.assertTrue(updated.json()["daily_summary_enabled"])
+        self.assertFalse(updated.json()["idempotent_replay"])
+        self.assertTrue(replay.json()["idempotent_replay"])
+        self.assertEqual("no-store", updated.headers["cache-control"])
+        self.assertEqual(
+            initial_u2.json()["daily_summary_enabled"],
+            unchanged_u2.json()["daily_summary_enabled"],
+        )
+
+    def test_notification_preferences_reject_invalid_or_unauthenticated_requests(self) -> None:
+        with TestClient(self.app) as client:
+            unauthenticated = client.get("/v1/notifications/preferences")
+            invalid = client.patch(
+                "/v1/notifications/preferences",
+                json={"default_reminder_lead_minutes": 999},
+                headers=self.headers("token-u1", "bad-notification-key"),
+            )
+
+        self.assertEqual(401, unauthenticated.status_code)
+        self.assertEqual(422, invalid.status_code)
+        self.assertEqual("VALIDATION_ERROR", invalid.json()["code"])
+
+    def test_notification_device_registration_is_private_and_token_safe(self) -> None:
+        payload = {
+            "device_id": "android-installation-1",
+            "push_token": "private-fcm-token",
+            "app_identifier": "com.zenmaestro.app",
+            "app_version": "0.1.0",
+            "locale": "en",
+            "timezone": "Africa/Cairo",
+        }
+        async def scenario():
+            async with AsyncClient(
+                transport=ASGITransport(app=self.app), base_url="http://test",
+            ) as client:
+                registered = await client.post(
+                    "/v1/notifications/devices",
+                    json=payload,
+                    headers=self.headers("token-u1", "device-register-1"),
+                )
+                replay = await client.post(
+                    "/v1/notifications/devices",
+                    json=payload,
+                    headers=self.headers("token-u1", "device-register-1"),
+                )
+                invalidated = await client.delete(
+                    "/v1/notifications/devices/android-installation-1",
+                    headers=self.headers("token-u1", "device-invalidate-1"),
+                )
+                return registered, replay, invalidated
+
+        registered, replay, invalidated = asyncio.run(scenario())
+
+        self.assertEqual(200, registered.status_code)
+        self.assertEqual("android-installation-1", registered.json()["device_id"])
+        self.assertEqual("fcm", registered.json()["provider"])
+        self.assertNotIn("push_token", registered.text)
+        self.assertNotIn("private-fcm-token", registered.text)
+        self.assertFalse(registered.json()["idempotent_replay"])
+        self.assertTrue(replay.json()["idempotent_replay"])
+        self.assertEqual(200, invalidated.status_code)
+        self.assertTrue(invalidated.json()["invalidated"])
+
+    def test_mobile_task_create_lifecycle_and_delete_routes(self) -> None:
+        with TestClient(self.app) as client:
+            created = client.post(
+                "/v1/tasks",
+                json={"plan_id": self.plan_u1, "title": "Mobile task", "estimated_minutes": 20},
+                headers=self.headers("token-u1", "mobile-create"),
+            )
+            task_id = created.json()["task_id"]
+            started = client.post(
+                f"/v1/tasks/{task_id}/start",
+                json={"expected_version": created.json()["version"]},
+                headers=self.headers("token-u1", "mobile-start"),
+            )
+            completed = client.post(
+                f"/v1/tasks/{task_id}/complete",
+                json={"expected_version": started.json()["version"]},
+                headers=self.headers("token-u1", "mobile-complete"),
+            )
+            delete_terminal = client.delete(
+                f"/v1/tasks/{task_id}?expected_version={completed.json()['version']}",
+                headers=self.headers("token-u1", "mobile-delete"),
+            )
+
+        self.assertEqual(200, created.status_code)
+        self.assertEqual("in_progress", started.json()["status"])
+        self.assertEqual("completed", completed.json()["status"])
+        self.assertEqual(200, delete_terminal.status_code)
+        self.assertTrue(delete_terminal.json()["deleted"])
+
+    def test_coach_routes_fail_safely_without_provider_configuration(self) -> None:
+        with patch.dict("os.environ", {"GOOGLE_API_KEY": "", "GEMINI_API_KEY": ""}, clear=False):
+            with TestClient(self.app) as client:
+                chat = client.post(
+                    "/v1/coach/chat",
+                    json={"message": "Help me plan"},
+                    headers=self.headers("token-u1"),
+                )
+        self.assertEqual(503, chat.status_code)
+        self.assertEqual("CONFIGURATION_ERROR", chat.json()["code"])
+
     def test_failure_after_mutation_rolls_back_route_transaction(self) -> None:
         with patch(
             "mobile_repository.MobileRepository.record_change",
@@ -150,12 +283,49 @@ class FastAPITaskRouteTests(unittest.TestCase):
             spec = client.get("/openapi.json").json()
 
         self.assertEqual(
-            {"/v1/tasks", "/v1/tasks/{task_id}"},
+            {
+                "/v1/tasks", "/v1/tasks/{task_id}", "/v1/tasks/{task_id}/{command}", "/v1/analytics",
+                "/v1/home",
+                "/v1/profile", "/v1/profile/display-name", "/v1/profile/timezone",
+                "/v1/notifications/preferences", "/v1/notifications/devices", "/v1/notifications/devices/{device_id}",
+                "/v1/calendar", "/v1/calendar/oauth/start", "/v1/calendar/oauth/complete",
+                "/v1/calendar/calendars", "/v1/calendar/sync", "/v1/calendar/disconnect",
+                "/v1/coach/recommendations/today", "/v1/coach/chat",
+                "/v1/planning/draft",
+            },
             set(spec["paths"]),
         )
         operation = spec["paths"]["/v1/tasks/{task_id}"]["patch"]
         self.assertIn("Idempotency-Key", [p["name"] for p in operation["parameters"]])
         self.assertIn("422", operation["responses"])
+
+    def test_calendar_mobile_status_is_private_and_reports_configuration_safely(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"GOOGLE_CLIENT_ID": "", "GOOGLE_CLIENT_SECRET": "", "COACHAI_TOKEN_ENCRYPTION_KEY": ""},
+            clear=False,
+        ):
+            with TestClient(self.app) as client:
+                unauthenticated = client.get("/v1/calendar")
+                u1 = client.get("/v1/calendar", headers=self.headers("token-u1"))
+                start = client.post("/v1/calendar/oauth/start", headers=self.headers("token-u1"))
+                callback = client.get(
+                    "/v1/calendar/oauth/callback?code=safe-code&state=safe-state",
+                    follow_redirects=False,
+                )
+
+        self.assertEqual(401, unauthenticated.status_code)
+        self.assertEqual(200, u1.status_code)
+        self.assertEqual({"provider": "google", "connected": False, "selected_calendars": []}, u1.json())
+        self.assertEqual("no-store", u1.headers["cache-control"])
+        self.assertEqual(503, start.status_code)
+        self.assertEqual("CONFIGURATION_ERROR", start.json()["code"])
+        self.assertEqual(302, callback.status_code)
+        self.assertEqual(
+            "coachai://calendar/oauth?code=safe-code&state=safe-state",
+            callback.headers["location"],
+        )
+        self.assertEqual("no-store", callback.headers["cache-control"])
 
     def test_database_integer_and_pagination_bounds_fail_before_access(self) -> None:
         enormous = 10**100

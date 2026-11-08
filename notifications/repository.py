@@ -113,6 +113,13 @@ class NotificationRepository:
             raise ValueError(f"Unsupported notification preference(s): {', '.join(sorted(unknown))}.")
         current = self.get_preferences(user_id)
         merged = {key: changes.get(key, current[key]) for key in PREFERENCE_DEFAULTS}
+        # FastAPI validates these fields as datetime.time values. Persist their
+        # stable ISO representation so SQLite and PostgreSQL receive the same
+        # wire value instead of a driver-specific Python object.
+        for key in ("quiet_hours_start", "quiet_hours_end"):
+            value = merged[key]
+            if value is not None and hasattr(value, "isoformat"):
+                merged[key] = value.isoformat()
         if merged["tone"] not in {item.value for item in Tone}:
             raise ValueError("Invalid notification tone.")
         lead = merged["default_reminder_lead_minutes"]
@@ -250,6 +257,21 @@ class NotificationRepository:
             )
             if existing is not None and existing["user_id"] != user_id:
                 raise OwnershipError("Device is already registered to another user.")
+            if push_token:
+                token_row = self.db.fetch_one(
+                    """SELECT device_id,user_id FROM notification_devices
+                       WHERE provider=? AND push_token=?""",
+                    (provider, push_token),
+                )
+                if token_row is not None and token_row["user_id"] != user_id:
+                    raise OwnershipError("Push token is already registered to another user.")
+                if token_row is not None and token_row["device_id"] != device_id:
+                    # Firebase can rotate an installation identity while
+                    # retaining the same token. Keep one canonical row.
+                    self.db.execute(
+                        "DELETE FROM notification_devices WHERE device_id=? AND user_id=?",
+                        (token_row["device_id"], user_id),
+                    )
             if is_primary:
                 self.db.execute(
                     "UPDATE notification_devices SET is_primary=0 WHERE user_id=?",

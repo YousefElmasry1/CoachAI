@@ -1,12 +1,14 @@
 # CoachAI
 
-CoachAI is a Streamlit productivity coach with deterministic scheduling,
+Zen Maestro (package `com.zenmaestro.app`) is an Android-first productivity
+coach with deterministic scheduling,
 future planning, analytics, Google Calendar integration, and a durable
 notification runtime.
 
 ## Current architecture
 
-- Streamlit multipage application with a separate thin FastAPI transport
+- Native Android application built with Kotlin and Jetpack Compose
+- Streamlit tooling plus a FastAPI mobile transport
 - PostgreSQL through SQLAlchemy and `psycopg2`
 - Smart Scheduler with task segments, schedule revisions, atomic apply/undo,
   ownership enforcement, and optimistic concurrency
@@ -21,10 +23,11 @@ notification runtime.
 - Versioned Alembic migrations and standalone notification, Calendar, and
   maintenance workers
 
-The FastAPI transport exposes `GET /health`, `GET /ready`, authenticated task
-listing, and one versioned/idempotent task-update route. It sits above the
-existing application-service boundary, does not host background workers, and
-does not duplicate domain rules. See `FRONTEND_HANDOFF.md` for the exact API.
+The FastAPI transport exposes authenticated Home, profile, task lifecycle,
+scheduling, Future Planning, analytics, coach, notification-preference, and
+Calendar routes. It sits above the existing application-service boundary and
+does not host background workers. See `FRONTEND_HANDOFF.md` and the generated
+OpenAPI document at `/docs` for the exact contract.
 
 PostgreSQL is the normal development/runtime database. SQLite compatibility is
 retained only for explicit isolated tests and legacy-schema utilities; there is
@@ -73,6 +76,25 @@ no automatic runtime fallback to `coach_ai.db`.
    validates mandatory configuration, PostgreSQL connectivity, and the current
    Alembic schema revision without returning connection details. Authenticated
    routes require `FIREBASE_PROJECT_ID` and a valid Firebase ID token.
+
+## Android setup
+
+1. Install Android Studio/JDK 17 and Android SDK 37.
+2. Put the Firebase Android configuration at
+   `android/app/google-services.json`. This file is intentionally ignored and
+   must never be committed.
+3. For USB development, start the API on port 8000 and run:
+
+   ```powershell
+   adb reverse tcp:8000 tcp:8000
+   cd android
+   .\gradlew.bat testDebugUnitTest assembleDebug
+   .\gradlew.bat installDebug
+   ```
+
+Debug builds allow the loopback HTTP URL used by `adb reverse`. Release builds
+require an HTTPS API URL via `COACHAI_RELEASE_API_BASE_URL` and reject cleartext
+traffic.
 
 Install or upgrade the PostgreSQL schema with Alembic before starting the
 application. A missing or invalid `DATABASE_URL` fails clearly and never falls

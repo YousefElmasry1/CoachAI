@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from threading import Lock
+import os
 from typing import Annotated
 
 from fastapi import Depends
@@ -38,7 +39,20 @@ class FirebaseBearerAuthenticator:
                     raise ConfigurationError(
                         "FIREBASE_PROJECT_ID is required for authenticated API routes."
                     )
-                self._verifier = FirebaseTokenVerifier(project_id=project_id)
+                raw_check_revoked = os.getenv("FIREBASE_CHECK_REVOKED", "true").strip().lower()
+                if raw_check_revoked not in {"true", "false"}:
+                    raise ConfigurationError(
+                        "FIREBASE_CHECK_REVOKED must be true or false."
+                    )
+                environment = os.getenv("COACHAI_ENVIRONMENT", "production").strip().lower()
+                if raw_check_revoked == "false" and environment not in {"development", "test"}:
+                    raise ConfigurationError(
+                        "FIREBASE_CHECK_REVOKED=false is allowed only in development or test."
+                    )
+                self._verifier = FirebaseTokenVerifier(
+                    project_id=project_id,
+                    check_revoked=raw_check_revoked == "true",
+                )
             return self._verifier
 
     def __call__(

@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+  <title>Zen Maestro Home</title>
+  <script>document.documentElement.dataset.theme=new URLSearchParams(location.search).get('theme')==='dark'?'dark':'light';</script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700;800&family=Noto+Sans+Arabic:wght@400;500;600;700&display=swap');
+    :root {
+      color-scheme: light;
+      --bg:#faf9f7; --surface:#ffffff; --card:#ffffff; --raised:#f4f1ee;
+      --line:#e2ddd8; --line-soft:#ede9e5; --accent:#ff7a45; --accent-soft:#ffeee6;
+      --accent-line:#ffc2a6; --text:#241e1b; --muted:#706863; --subtle:#7e756f;
+      --text-secondary:#3f3834; --warm-muted:#b64b21;
+      --success:#168554; --danger:#d94848; --amber:#a66a16;
+    }
+    * { box-sizing:border-box; }
+    html, body { margin:0; min-height:100%; background:var(--bg); color:var(--text); }
+    body { font-family:Figtree,"Noto Sans Arabic",system-ui,sans-serif; }
+    button, a { font:inherit; color:inherit; }
+    button { border:0; }
+    a { text-decoration:none; }
+    .device {
+      width:100%; min-height:100vh; position:relative; overflow:hidden;
+      background:radial-gradient(circle at 92% -8%,rgba(255,122,69,.10),transparent 15rem),var(--bg);
+    }
+    .status-bar {
+      height:28px; padding:0 18px; display:flex; align-items:center; justify-content:space-between;
+      color:#3f3834; font-size:12px; font-weight:750; letter-spacing:.01em;
+    }
+    .system-icons { display:flex; align-items:center; gap:6px; }
+    .signal { display:flex; align-items:flex-end; gap:1.5px; height:10px; }
+    .signal i { width:2px; border-radius:1px; background:#3f3834; }
+    .signal i:nth-child(1){height:4px}.signal i:nth-child(2){height:6px}.signal i:nth-child(3){height:8px}.signal i:nth-child(4){height:10px}
+    .wifi { width:12px; height:9px; border:2px solid #3f3834; border-left-color:transparent; border-right-color:transparent; border-bottom-color:transparent; border-radius:50%; position:relative; }
+    .wifi:after { content:""; position:absolute; width:3px; height:3px; border-radius:50%; background:#3f3834; left:2.5px; top:4px; }
+    .battery { width:18px; height:9px; border:1.5px solid #3f3834; border-radius:2px; padding:1px; position:relative; }
+    .battery:after { content:""; position:absolute; width:2px; height:4px; right:-4px; top:1px; border-radius:0 1px 1px 0; background:#3f3834; }
+    .battery i { display:block; width:80%; height:100%; border-radius:1px; background:#3f3834; }
+    .top-app-bar { height:56px; padding:0 18px; display:flex; align-items:center; gap:10px; }
+    .brand-mark { width:32px; height:32px; display:grid; place-items:center; border-radius:10px; background:var(--accent); color:#1c110c; font-size:18px; font-weight:800; }
+    .app-title { flex:1; font-size:19px; font-weight:800; letter-spacing:-.35px; }
+    .app-title i { display:inline-block; width:6px; height:6px; margin-left:2px; border-radius:2px; background:var(--accent); }
+    .avatar { width:34px; height:34px; display:grid; place-items:center; border:1px solid var(--accent-line); border-radius:50%; background:var(--accent-soft); color:#c94f1f; font-size:11px; font-weight:800; }
+    .sample-label { height:24px; padding:0 18px; display:flex; align-items:center; gap:7px; color:var(--muted); font-size:9px; font-weight:700; letter-spacing:.07em; text-transform:uppercase; }
+    .sample-label i { width:5px; height:5px; border-radius:50%; background:var(--accent); }
+    .scroll-content { height:calc(100vh - 178px); overflow-y:auto; overscroll-behavior:contain; padding:8px 14px 22px; scrollbar-width:none; }
+    .scroll-content::-webkit-scrollbar { display:none; }
+    .hero { position:relative; overflow:hidden; padding:17px 18px 15px; border:1px solid var(--line); border-radius:20px; background:linear-gradient(135deg,#fff0e8 0%,#ffffff 64%,#faf9f7 100%); }
+    .hero:after { content:""; position:absolute; width:170px; height:170px; right:-88px; top:-100px; border-radius:50%; background:radial-gradient(circle,rgba(255,122,69,.19),transparent 68%); }
+    .date { display:flex; align-items:center; gap:6px; color:var(--muted); font-size:10px; font-weight:650; }
+    .date i { width:4px; height:4px; border-radius:50%; background:var(--accent); }
+    h1 { margin:7px 0 3px; font-size:28px; line-height:1.08; letter-spacing:-.8px; }
+    .subtitle { margin:0; color:var(--muted); font-size:12px; }
+    .quote { margin-top:13px; padding-top:11px; border-top:1px solid var(--line-soft); display:flex; gap:8px; color:var(--text-secondary); font-size:11px; line-height:1.35; }
+    .quote-mark { color:var(--accent); font-size:24px; line-height:.7; font-weight:800; }
+    .quote cite { display:block; margin-top:3px; color:var(--subtle); font-size:9px; font-style:normal; }
+    .card { margin-top:10px; border:1px solid var(--line); border-radius:17px; background:var(--card); }
+    .card-header { padding:13px 15px 0; display:flex; justify-content:space-between; align-items:center; gap:10px; }
+    .eyebrow { margin:0 0 1px; color:var(--warm-muted); font-size:9px; font-weight:800; letter-spacing:.1em; text-transform:uppercase; }
+    h2 { margin:0; font-size:16px; letter-spacing:-.25px; }
+    .card-header h2 { color:var(--text); }
+    .streak { padding:5px 8px; border:1px solid var(--accent-line); border-radius:999px; background:var(--accent-soft); color:#c94f1f; font-size:9px; font-weight:800; }
+    .progress-content { padding:12px 15px 14px; display:flex; align-items:center; gap:14px; }
+    .ring { --value:60; position:relative; width:76px; height:76px; flex:0 0 auto; display:grid; place-items:center; border-radius:50%; background:conic-gradient(var(--accent) calc(var(--value)*1%),#e5e0db 0); }
+    .ring:before { content:""; position:absolute; width:58px; height:58px; border-radius:50%; background:var(--card); }
+    .ring strong { z-index:1; font-size:18px; }
+    .progress-summary { flex:1; min-width:0; }
+    .progress-summary strong { display:block; font-size:20px; letter-spacing:-.35px; }
+    .progress-summary p { margin:2px 0 9px; color:var(--muted); font-size:10px; }
+    .status-chips { display:flex; gap:5px; flex-wrap:wrap; }
+    .status-chips span { padding:4px 7px; border-radius:999px; background:var(--raised); color:var(--muted); font-size:8px; font-weight:750; }
+    .status-chips b { color:var(--text); }
+    .open-link { min-height:32px; display:flex; align-items:center; color:#c94f1f; font-size:10px; font-weight:750; }
+    .task-list { padding:5px 9px 7px; }
+    .task { min-height:55px; padding:8px 7px; display:grid; grid-template-columns:55px 1fr auto; align-items:center; gap:8px; }
+    .task + .task { border-top:1px solid var(--line-soft); }
+    .time { color:var(--muted); font-size:9px; font-weight:750; font-variant-numeric:tabular-nums; }
+    .task-copy { min-width:0; }
+    .task-title { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:11px; font-weight:750; }
+    .task-meta { margin-top:2px; color:var(--muted); font-size:8px; }
+    .state { padding:4px 6px; border:1px solid var(--line); border-radius:999px; color:var(--muted); font-size:7px; font-weight:800; letter-spacing:.04em; text-transform:uppercase; }
+    .state.done { border-color:rgba(61,214,140,.32); background:rgba(61,214,140,.08); color:var(--success); }
+    .state.live { border-color:var(--accent-line); background:var(--accent-soft); color:#c94f1f; }
+    .insight { padding:13px 15px; display:flex; align-items:flex-start; gap:11px; background:linear-gradient(120deg,#fff0e8,#ffffff 62%); }
+    .insight-icon { width:32px; height:32px; flex:0 0 auto; display:grid; place-items:center; border:1px solid var(--accent-line); border-radius:10px; background:var(--accent-soft); color:#c94f1f; font-size:15px; }
+    .insight h2 { color:var(--text-secondary); font-size:12px; line-height:1.3; }
+    .insight p { margin:4px 0 0; color:var(--muted); font-size:9px; line-height:1.35; }
+    .actions { padding:12px 13px 13px; }
+    .actions h2 { margin-bottom:9px; font-size:13px; }
+    .action-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:7px; }
+    .action { min-width:0; min-height:62px; padding:6px 3px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:5px; border:1px solid var(--line); border-radius:12px; background:var(--raised); font-size:8px; font-weight:750; text-align:center; }
+    .action.primary { border-color:var(--accent); background:var(--accent); color:#1b110d; }
+    .action-icon { font-size:17px; line-height:1; }
+    .bottom-nav { position:absolute; left:0; right:0; bottom:24px; height:88px; padding:8px 6px; display:grid; grid-template-columns:repeat(4,1fr); border-top:1px solid var(--line-soft); background:rgba(255,255,255,.98); backdrop-filter:blur(16px); }
+    .nav-item { min-width:72px; min-height:68px; padding:5px 4px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:5px; border:0; border-radius:14px; background:transparent; color:var(--muted); font-size:11px; font-weight:750; cursor:pointer; touch-action:manipulation; -webkit-tap-highlight-color:transparent; }
+    .nav-item .icon { width:50px; height:30px; display:grid; place-items:center; border-radius:999px; font-size:21px; line-height:1; }
+    .nav-item.active { color:#c94f1f; }
+    .nav-item.active .icon { background:var(--accent-soft); }
+    .gesture-bar { position:absolute; left:0; right:0; bottom:0; height:24px; display:grid; place-items:center; background:#ffffff; }
+    .gesture-bar:after { content:""; width:108px; height:4px; border-radius:999px; background:#514943; opacity:.82; }
+    .bottom-nav, .gesture-bar { display:none; }
+    html, body { width:100%; height:100%; min-height:100%; overflow:hidden; }
+    .device { height:100%; min-height:100%; overflow:hidden; }
+    .scroll-content { height:calc(100% - 108px); min-height:0; overflow-y:auto; overscroll-behavior:contain; touch-action:pan-y; -webkit-overflow-scrolling:touch; padding-bottom:28px; }
+    @media (min-width:600px) {
+      .device { max-width:720px; margin:auto; }
+      .scroll-content { padding-left:24px; padding-right:24px; }
+      .hero { padding:22px 24px 20px; }
+      .dashboard-grid { display:grid; grid-template-columns:1fr 1.25fr; gap:12px; }
+      .dashboard-grid .card { height:calc(100% - 10px); }
+      .lower-grid { display:grid; grid-template-columns:1.3fr 1fr; gap:12px; }
+      .lower-grid .card { height:calc(100% - 10px); }
+    }
+  </style>
+  <style id="coachai-dark-theme">
+    html[data-theme="dark"]{color-scheme:dark;--bg:#08080a;--surface:#111113;--card:#18181b;--raised:#1e1e22;--line:#303036;--line-soft:#252529;--accent:#ff7a45;--accent-soft:#3a2418;--accent-line:#754229;--text:#f1f0f2;--muted:#aaa7ae;--subtle:#77747d;--text-secondary:#d4d1d6;--warm-muted:#c48d73;--success:#3dd68c;--danger:#ff6b6b;--amber:#d4a25a}
+    html[data-theme="dark"] .status-bar{color:#dedee2}
+    html[data-theme="dark"] .signal i,html[data-theme="dark"] .wifi:after,html[data-theme="dark"] .battery:after,html[data-theme="dark"] .battery i{background:#dedee2}
+    html[data-theme="dark"] .wifi{border-color:#dedee2;border-left-color:transparent;border-right-color:transparent;border-bottom-color:transparent}
+    html[data-theme="dark"] .battery{border-color:#dedee2}
+    html[data-theme="dark"] .avatar{color:#ffb590}
+    html[data-theme="dark"] .sample-label{color:#a7a7ae}
+    html[data-theme="dark"] .hero{background:linear-gradient(135deg,#211814 0%,#18181b 58%,#141416 100%)}
+    html[data-theme="dark"] .date{color:#c9c4c8}
+    html[data-theme="dark"] .quote{border-top-color:rgba(255,255,255,.08);color:#d6d6db}
+    html[data-theme="dark"] .card{background:rgba(24,24,27,.96)}
+    html[data-theme="dark"] .streak,html[data-theme="dark"] .state.live{color:#ffb590}
+    html[data-theme="dark"] .ring{background:conic-gradient(var(--accent) calc(var(--value)*1%),#303035 0)}
+    html[data-theme="dark"] .status-chips span{background:#202024;color:#c3c3c9}
+    html[data-theme="dark"] .open-link,html[data-theme="dark"] .nav-item.active{color:#ff9b70}
+    html[data-theme="dark"] .time{color:#b2b2b9}
+    html[data-theme="dark"] .state{color:#bdbdc3}
+    html[data-theme="dark"] .insight{background:linear-gradient(120deg,rgba(58,36,24,.54),rgba(24,24,27,.98) 58%)}
+    html[data-theme="dark"] .insight-icon{color:#ffad88}
+    html[data-theme="dark"] .bottom-nav{background:rgba(13,13,15,.98)}
+    html[data-theme="dark"] .nav-item{color:#9b9ba3}
+    html[data-theme="dark"] .gesture-bar{background:#0d0d0f}
+    html[data-theme="dark"] .gesture-bar:after{background:#d7d7da}
+  </style>
+</head>
+<body>
+  <main class="device" aria-label="Zen Maestro Home screen">
+    <div class="status-bar" aria-label="Android status bar"><span>2:41</span><span class="system-icons"><span class="signal"><i></i><i></i><i></i><i></i></span><span class="wifi"></span><span class="battery"><i></i></span></span></div>
+    <header class="top-app-bar"><span class="brand-mark">Z</span><span class="app-title">Zen Maestro<i></i></span><span class="avatar" aria-label="Sample profile">MP</span></header>
+    <div class="scroll-content">
+      <section class="hero">
+        <div class="date"><i></i>Thursday, October 15</div>
+        <h1>Good afternoon, Maya.</h1>
+        <p class="subtitle">You have a clear plan. Keep the next step small.</p>
+        <div class="quote"><span class="quote-mark">“</span><div>The secret of getting ahead is getting started.<cite>— Mark Twain</cite></div></div>
+      </section>
+
+      <div class="dashboard-grid">
+        <section class="card">
+          <div class="card-header"><div><p class="eyebrow">Today</p><h2>Your progress</h2></div><span class="streak">↗ 5-day streak</span></div>
+          <div class="progress-content">
+            <div class="ring" style="--value:60"><strong>60%</strong></div>
+            <div class="progress-summary"><strong>3 of 5 done</strong><p>Two tasks are still open today.</p><div class="status-chips"><span><b>1</b> active</span><span><b>1</b> pending</span></div></div>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="card-header"><div><p class="eyebrow">Next up</p><h2>Today's schedule</h2></div><a class="open-link" href="#">See all →</a></div>
+          <div class="task-list">
+            <div class="task"><span class="time">10:00 AM</span><div class="task-copy"><div class="task-title">Database normalization</div><div class="task-meta">Study · 90 min · High</div></div><span class="state done">Done</span></div>
+            <div class="task"><span class="time">1:00 PM</span><div class="task-copy"><div class="task-title">Team follow-up</div><div class="task-meta">Work · 30 min · Fixed</div></div><span class="state live">Active</span></div>
+            <div class="task"><span class="time">3:00 PM</span><div class="task-copy"><div class="task-title">Portfolio polish</div><div class="task-meta">Personal · 45 min · Medium</div></div><span class="state">Pending</span></div>
+          </div>
+        </section>
+      </div>
+
+      <section class="card insight"><div class="insight-icon">◇</div><div><p class="eyebrow">One smart insight</p><h2>Your strongest focus window starts around 10 AM.</h2><p>Shown only when existing analytics evidence supports it.</p></div></section>
+    </div>
+
+    <nav class="bottom-nav" aria-label="Primary navigation">
+      <button type="button" class="nav-item active" data-destination="home"><span class="icon">⌂</span><span>Home</span></button>
+      <button type="button" class="nav-item" data-destination="schedule"><span class="icon">◷</span><span>Schedule</span></button>
+      <button type="button" class="nav-item" data-destination="coach"><span class="icon">◇</span><span>Coach</span></button>
+      <button type="button" class="nav-item" data-destination="more"><span class="icon">•••</span><span>More</span></button>
+    </nav>
+    <div class="gesture-bar" aria-hidden="true"></div>
+  </main>
+</body>
+</html>

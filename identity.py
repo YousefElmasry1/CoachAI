@@ -8,10 +8,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import logging
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Protocol
 
 from backend_errors import AuthenticationRequired, ConfigurationError
+
+
+logger = logging.getLogger("coachai.auth")
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,9 +65,26 @@ class FirebaseTokenVerifier:
             firebase_app = firebase_admin.get_app()
         except ValueError:
             try:
-                firebase_app = firebase_admin.initialize_app(
-                    options={"projectId": self.project_id}
-                )
+                if self.check_revoked:
+                    firebase_app = firebase_admin.initialize_app(
+                        options={"projectId": self.project_id}
+                    )
+                else:
+                    # Local signature-only verification deliberately avoids
+                    # Application Default Credentials. Public Firebase signing
+                    # certificates still verify the JWT below; production uses
+                    # the default check_revoked=True path with Admin credentials.
+                    from firebase_admin import credentials
+                    from google.auth.credentials import AnonymousCredentials
+
+                    class SignatureOnlyCredential(credentials.Base):
+                        def get_credential(self):
+                            return AnonymousCredentials()
+
+                    firebase_app = firebase_admin.initialize_app(
+                        SignatureOnlyCredential(),
+                        options={"projectId": self.project_id},
+                    )
             except ValueError:
                 # Another request may have initialized the default app between
                 # get_app() and initialize_app(). Reuse it without exposing the
@@ -84,6 +105,10 @@ class FirebaseTokenVerifier:
             )
         except Exception as exc:
             # Provider exception details are deliberately not exposed.
+            logger.warning(
+                "Firebase token verification failed (%s).",
+                type(exc).__name__,
+            )
             raise AuthenticationRequired("The Firebase ID token is invalid.") from exc
 
         subject = str(claims.get("uid") or claims.get("sub") or "").strip()

@@ -80,9 +80,14 @@ class FCMProvider:
         if initialization is not None:
             return initialization
         try:
+            # Data-only delivery ensures Android always routes the message through
+            # CoachFirebaseMessagingService, including while the app is in the
+            # background. That keeps the user's sound/vibration channel choice
+            # authoritative instead of letting FCM render on its default channel.
+            data = dict(message.data)
+            data.update({"title": message.title, "body": message.body})
             request = self._messaging.Message(
-                notification=self._messaging.Notification(title=message.title, body=message.body),
-                data=dict(message.data), token=message.token,
+                data=data, fid=message.token,
             )
             message_id = self._messaging.send(request, dry_run=self.config.dry_run, app=self._app)
             return ProviderResult(True, provider_message_id=str(message_id))

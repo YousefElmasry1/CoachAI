@@ -43,6 +43,7 @@ from planner_service import PlannerService
 from rate_limiter import DatabaseRateLimiter, RateLimitExceeded
 from recommendation_service import RecommendationService
 from scheduler import SchedulingPreferences, UserBreak
+from timezone_utils import user_today
 from scheduler_service import SchedulerService
 from task_application import TaskApplicationService
 
@@ -112,6 +113,13 @@ class PrincipalService:
             raise ResourceNotFound("Plan was not found.")
         return plan
 
+    def _require_mutable_plan(self, plan_id: int) -> dict:
+        plan = self._require_plan(plan_id)
+        plan_date = date.fromisoformat(str(plan["plan_date"])[:10])
+        if plan_date < user_today(self.db, self.user_id):
+            raise ValidationError("Past plans are read-only.")
+        return plan
+
     def _record_plan_state(self, plan_id: int, *, tasks: bool = True) -> int:
         revision = self.mobile.record_plan_bundle(
             user_id=self.user_id, plan_id=int(plan_id),
@@ -163,7 +171,7 @@ class SchedulingApplicationService(PrincipalService):
         breaks: list[tuple[time, int]] | None = None,
         blocked_slots: list[tuple] | None = None,
     ) -> dict:
-        self._require_plan(plan_id)
+        self._require_mutable_plan(plan_id)
         user_breaks = [
             UserBreak(start_time=start, duration_minutes=int(minutes))
             for start, minutes in (breaks or [])
@@ -190,6 +198,7 @@ class SchedulingApplicationService(PrincipalService):
             except StaleScheduleError as exc:
                 raise VersionConflict() from exc
             revision = self._record_plan_state(plan_id)
+            updated_plan = self._require_plan(plan_id)
             calendar_operation_id = self._queue_calendar_reconciliation(
                 operation_id=self.scheduler.last_operation_id,
                 plan_ids=[int(plan_id)], key=f"schedule:{self.scheduler.last_operation_id}",
@@ -204,6 +213,7 @@ class SchedulingApplicationService(PrincipalService):
                     + list(self.scheduler.last_fixed_conflicts)
                 ),
                 "sync_revision": revision,
+                "schedule_revision": int(updated_plan.get("schedule_revision") or 0),
                 "calendar_operation_id": calendar_operation_id,
                 "calendar_reconciliation_pending": bool(calendar_operation_id),
             }
@@ -232,7 +242,7 @@ class SchedulingApplicationService(PrincipalService):
         order_index: int = 0,
         blocked_slots: list[tuple] | None = None,
     ) -> dict:
-        self._require_plan(plan_id)
+        self._require_mutable_plan(plan_id)
         clean_title, clean_description, minutes = validate_task_fields(
             title=title, description=description, estimated_minutes=estimated_minutes,
         )
@@ -260,8 +270,10 @@ class SchedulingApplicationService(PrincipalService):
             except StaleScheduleError as exc:
                 raise VersionConflict() from exc
             revision = self._record_plan_state(plan_id)
+            updated_plan = self._require_plan(plan_id)
             result = _jsonable(outcome)
             result["sync_revision"] = revision
+            result["schedule_revision"] = int(updated_plan.get("schedule_revision") or 0)
             result["calendar_operation_id"] = self._queue_calendar_reconciliation(
                 operation_id=outcome.operation_id, plan_ids=[int(plan_id)],
                 key=f"schedule:{outcome.operation_id}",
@@ -291,6 +303,7 @@ class SchedulingApplicationService(PrincipalService):
         if task is None:
             raise ResourceNotFound("Task was not found.")
         plan_id = int(task["plan_id"])
+        self._require_mutable_plan(plan_id)
         request = {
             "task_id": int(task_id),
             "expected_schedule_revision": int(expected_schedule_revision),
@@ -307,8 +320,10 @@ class SchedulingApplicationService(PrincipalService):
             except StaleScheduleError as exc:
                 raise VersionConflict() from exc
             revision = self._record_plan_state(plan_id)
+            updated_plan = self._require_plan(plan_id)
             result = _jsonable(outcome)
             result["sync_revision"] = revision
+            result["schedule_revision"] = int(updated_plan.get("schedule_revision") or 0)
             result["calendar_operation_id"] = self._queue_calendar_reconciliation(
                 operation_id=outcome.operation_id, plan_ids=[plan_id],
                 key=f"schedule:{outcome.operation_id}",
@@ -328,6 +343,92 @@ class SchedulingApplicationService(PrincipalService):
     def preview_future(self, request: Any) -> FuturePlanPreview:
         """Pure deterministic preview; no transaction and no persistence."""
         return self.future.preview_request(self.user_id, request)
+
+    def future_candidates(self, planning_start: date, planning_end: date) -> dict:
+        """Return only safe, editable tasks owned by the authenticated principal."""
+        try:
+            self.future.validate_horizon(planning_start, planning_end)
+            from timezone_utils import user_today
+
+            if planning_start < user_today(self.db, self.user_id):
+                raise ValueError("Future Planning cannot include dates before today.")
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(str(exc)) from exc
+        rows = self.db.get_future_planning_tasks(
+            self.user_id, planning_start, planning_end,
+        )
+        tasks = []
+        for row in rows:
+            if (
+                bool(row.get("is_fixed_time"))
+                or bool(row.get("is_break"))
+                or str(row.get("status")) in {"completed", "failed"}
+                or bool(row.get("started_at"))
+            ):
+                continue
+            estimated = int(row.get("estimated_minutes") or 0)
+            actual = int(row.get("actual_minutes") or 0)
+            tasks.append({
+                "task_id": int(row["task_id"]),
+                "plan_date": str(row["plan_date"]),
+                "title": str(row["title"]),
+                "description": str(row.get("description") or ""),
+                "remaining_minutes": max(0, estimated - actual),
+                "priority": int(row.get("priority") or 3),
+                "earliest_start": (
+                    str(row.get("earliest_start")) if row.get("earliest_start") else None
+                ),
+                "deadline": str(row.get("deadline")) if row.get("deadline") else None,
+            })
+        return {
+            "planning_start": planning_start.isoformat(),
+            "planning_end": planning_end.isoformat(),
+            "tasks": tasks,
+        }
+
+    def public_future_preview(self, request: Any) -> dict:
+        try:
+            preview = self.preview_future(request)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(str(exc)) from exc
+        return {
+            "planning_start": preview.planning_start.isoformat(),
+            "planning_end": preview.planning_end.isoformat(),
+            "work_day_start": preview.work_day_start.isoformat(timespec="minutes"),
+            "outcomes": _jsonable(preview.outcomes),
+            "changes": _jsonable(preview.changes),
+            "placed_count": sum(1 for item in preview.outcomes if item.placed),
+            "unplaced_count": sum(1 for item in preview.outcomes if not item.placed),
+        }
+
+    def preview_and_apply_future(
+        self, request: Any, *, idempotency_key: str,
+    ) -> dict:
+        """Apply one structured request idempotently without re-previewing on replay."""
+        request_fingerprint = (
+            request.model_dump(mode="json")
+            if hasattr(request, "model_dump")
+            else _jsonable(request)
+        )
+
+        def mutation() -> dict:
+            try:
+                preview = self.preview_future(request)
+            except (TypeError, ValueError) as exc:
+                raise ValidationError(str(exc)) from exc
+            result = self._apply_future_preview(preview)
+            result["preview"] = {
+                "placed_count": sum(1 for item in preview.outcomes if item.placed),
+                "unplaced_count": sum(1 for item in preview.outcomes if not item.placed),
+            }
+            return result
+
+        return self._idempotent(
+            operation="future_plan.request.apply",
+            idempotency_key=idempotency_key,
+            request=request_fingerprint,
+            mutation=mutation,
+        )
 
     @staticmethod
     def _future_fingerprint(preview: FuturePlanPreview) -> dict:
@@ -349,36 +450,38 @@ class SchedulingApplicationService(PrincipalService):
             raise ResourceNotFound("Future-planning preview was not found.")
         request = self._future_fingerprint(preview)
 
-        def mutation() -> dict:
-            try:
-                operation_id = self.future.apply(preview)
-            except StaleScheduleError as exc:
-                raise VersionConflict() from exc
-            plans = self.db.get_plans_in_range(
-                self.user_id, preview.planning_start, preview.planning_end,
-            )
-            revision = self.mobile.current_revision(self.user_id)
-            for plan in plans:
-                revision = self._record_plan_state(int(plan["plan_id"]))
-            plan_ids = [int(plan["plan_id"]) for plan in plans]
-            calendar_operation_id = self._queue_calendar_reconciliation(
-                operation_id=operation_id, plan_ids=plan_ids,
-                key=f"future-plan:{operation_id}",
-            )
-            return {
-                "operation_id": operation_id,
-                "plan_ids": plan_ids,
-                "sync_revision": revision,
-                "calendar_operation_id": calendar_operation_id,
-                "calendar_reconciliation_pending": bool(calendar_operation_id),
-            }
-
         return self._idempotent(
             operation="future_plan.apply",
             idempotency_key=idempotency_key,
             request=request,
-            mutation=mutation,
+            mutation=lambda: self._apply_future_preview(preview),
         )
+
+    def _apply_future_preview(self, preview: FuturePlanPreview) -> dict:
+        if preview.user_id != self.user_id:
+            raise ResourceNotFound("Future-planning preview was not found.")
+        try:
+            operation_id = self.future.apply(preview)
+        except StaleScheduleError as exc:
+            raise VersionConflict() from exc
+        plans = self.db.get_plans_in_range(
+            self.user_id, preview.planning_start, preview.planning_end,
+        )
+        revision = self.mobile.current_revision(self.user_id)
+        for plan in plans:
+            revision = self._record_plan_state(int(plan["plan_id"]))
+        plan_ids = [int(plan["plan_id"]) for plan in plans]
+        calendar_operation_id = self._queue_calendar_reconciliation(
+            operation_id=operation_id, plan_ids=plan_ids,
+            key=f"future-plan:{operation_id}",
+        )
+        return {
+            "operation_id": operation_id,
+            "plan_ids": plan_ids,
+            "sync_revision": revision,
+            "calendar_operation_id": calendar_operation_id,
+            "calendar_reconciliation_pending": bool(calendar_operation_id),
+        }
 
     def undo(self, operation_id: str, *, idempotency_key: str) -> dict:
         operation = self.db.fetch_one(
@@ -415,6 +518,13 @@ class SchedulingApplicationService(PrincipalService):
                 "calendar_reconciliation_pending": True,
                 "calendar_operation_id": calendar_operation.operation_id,
                 "sync_revision": revision,
+                "schedule_revisions": {
+                    str(plan_id): int(
+                        self._require_plan(plan_id).get("schedule_revision") or 0
+                    )
+                    for plan_id in sorted(plan_ids)
+                    if self.db.get_plan_by_id(plan_id, self.user_id) is not None
+                },
             }
 
         return self._idempotent(
@@ -565,6 +675,9 @@ class NotificationApplicationService(PrincipalService):
             request=changes,
             mutation=mutation,
         )
+
+    def get_preferences(self) -> dict:
+        return dict(self.repository.get_preferences(self.user_id))
 
     def get_type_preference(self, notification_type: str) -> dict | None:
         row = self.repository.get_type_preference(self.user_id, notification_type)
@@ -821,6 +934,62 @@ class CalendarApplicationService(PrincipalService):
         except BackendError:
             connected = False
         return {"provider": "google", "connected": connected}
+
+    def overview(self) -> dict:
+        status = self.connection_status()
+        selected = [
+            {
+                "calendar_id": str(row["calendar_id"]),
+                "name": str(row.get("calendar_name") or ""),
+                "color": str(row.get("color") or "#4285F4"),
+                "is_primary": bool(row.get("is_primary")),
+                "selected": True,
+            }
+            for row in self.db.get_selected_calendars(self.user_id)
+        ]
+        return {**status, "selected_calendars": selected}
+
+    def list_available_calendars(self) -> list[dict]:
+        credentials = self._tokens().get(self.principal)
+        if credentials is None:
+            from backend_errors import AuthenticationRequired
+
+            raise AuthenticationRequired("Google Calendar is not connected.")
+        client_id, client_secret, _redirect_uri = self._oauth_config()
+        client = GoogleCalendarClient(
+            credentials.access_token,
+            credentials.refresh_token,
+            credentials.token_expiry,
+            client_id=client_id,
+            client_secret=client_secret,
+        )
+        try:
+            refreshed = client.refresh_if_expired()
+            if refreshed:
+                self._tokens().save(
+                    self.principal,
+                    access_token=str(refreshed["access_token"]),
+                    refresh_token=None,
+                    token_expiry=refreshed["token_expiry"],
+                    scopes=credentials.scopes,
+                )
+            calendars = client.list_calendars()
+        except GoogleCalendarError as exc:
+            raise ExternalProviderFailure(
+                "Google Calendar list could not be loaded."
+            ) from exc
+        selected_ids = set(self.db.get_selected_calendar_ids(self.user_id))
+        return [
+            {
+                "calendar_id": str(item.get("calendar_id") or ""),
+                "name": str(item.get("name") or "")[:300],
+                "color": str(item.get("color") or "#4285F4")[:32],
+                "is_primary": bool(item.get("is_primary")),
+                "selected": str(item.get("calendar_id") or "") in selected_ids,
+            }
+            for item in calendars
+            if str(item.get("calendar_id") or "").strip()
+        ]
 
     def disconnect(self, *, idempotency_key: str) -> dict:
         def mutation() -> dict:
@@ -1089,6 +1258,41 @@ class AccountApplicationService(PrincipalService):
             request={"name": cleaned, "color": color}, mutation=mutation,
         )
 
+    def change_display_name(
+        self, display_name: str, *, idempotency_key: str,
+    ) -> dict:
+        cleaned = str(display_name or "").strip()
+        if not cleaned or len(cleaned) > 100:
+            raise ValidationError(
+                "Display name must be between 1 and 100 characters."
+            )
+
+        def mutation() -> dict:
+            self.db.execute(
+                """UPDATE users
+                   SET display_name=?,updated_at=CURRENT_TIMESTAMP
+                   WHERE user_id=?""",
+                (cleaned, self.user_id),
+            )
+            revision = self.mobile.record_change(
+                user_id=self.user_id,
+                entity_type="account_settings",
+                entity_id=self.user_id,
+                change_type="upsert",
+                entity_version=None,
+                payload={"display_name": cleaned},
+            )
+            result = dict(self.get_profile())
+            result["sync_revision"] = revision
+            return result
+
+        return self._idempotent(
+            operation="account.display_name.change",
+            idempotency_key=idempotency_key,
+            request={"display_name": cleaned},
+            mutation=mutation,
+        )
+
     def change_timezone(self, timezone_name: str, *, idempotency_key: str) -> dict:
         try:
             ZoneInfo(str(timezone_name))
@@ -1216,6 +1420,8 @@ class AIPlanningApplicationService(PrincipalService):
             result["sync_revision"] = self._record_plan_state(
                 int(result["plan_id"]), tasks=True,
             )
+            plan = self.db.get_plan_by_id(int(result["plan_id"]), self.user_id)
+            result["schedule_revision"] = int(plan.get("schedule_revision") or 0)
             return result
 
         return self._idempotent(

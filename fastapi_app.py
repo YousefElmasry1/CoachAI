@@ -30,8 +30,20 @@ from operational_health import (
 )
 from identity import TokenVerifier
 from api_auth import FirebaseBearerAuthenticator
+from request_limits import RequestBodyLimitMiddleware
 from api_dependencies import RequestUnitOfWorkProvider
-from api_routes import create_task_router
+from api_routes import (
+    create_calendar_router,
+    create_coach_router,
+    create_planning_router,
+    create_scheduling_router,
+    create_future_planning_router,
+    create_analytics_router,
+    create_home_router,
+    create_notification_router,
+    create_profile_router,
+    create_task_router,
+)
 
 
 logger = logging.getLogger("coachai.api")
@@ -198,7 +210,7 @@ def create_app(
             probe.close()
 
     app = FastAPI(
-        title="CoachAI API",
+        title="Zen Maestro API",
         version="0.2.0",
         lifespan=lifespan,
     )
@@ -212,14 +224,24 @@ def create_app(
             CORSMiddleware,
             allow_origins=list(origins),
             allow_credentials=False,
-            allow_methods=["GET", "PATCH", "OPTIONS"],
+            allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
             allow_headers=["Authorization", "Content-Type", "Idempotency-Key"],
             expose_headers=["X-Correlation-ID"],
         )
+    app.add_middleware(RequestBodyLimitMiddleware)
     app.state.authenticate = authenticate
     app.state.unit_of_work = request_units
     app.state.application = application_dependency
+    app.include_router(create_home_router(application_dependency))
     app.include_router(create_task_router(application_dependency))
+    app.include_router(create_analytics_router(application_dependency))
+    app.include_router(create_profile_router(application_dependency))
+    app.include_router(create_notification_router(application_dependency))
+    app.include_router(create_calendar_router(application_dependency))
+    app.include_router(create_coach_router(application_dependency))
+    app.include_router(create_planning_router(application_dependency))
+    app.include_router(create_scheduling_router(application_dependency))
+    app.include_router(create_future_planning_router(application_dependency))
 
     @app.middleware("http")
     async def correlation_middleware(request: Request, call_next):

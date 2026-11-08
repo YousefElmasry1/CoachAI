@@ -737,6 +737,7 @@ class Database:
         engine_options: dict[str, Any] = {
             "future": True,
             "pool_pre_ping": True,
+            "hide_parameters": True,
         }
         if make_url(db_url).get_backend_name() == "postgresql":
             # CoachAI persists instants as UTC and applies the user's IANA
@@ -1950,13 +1951,22 @@ class Database:
         existing = self.get_user(user_id)
         if existing is not None:
             return existing
-
-        created_user_id = self.create_user(
-            user_id=user_id,
-            email=email,
-            display_name=display_name,
-            timezone=timezone,
-        )
+        try:
+            created_user_id = self.create_user(
+                user_id=user_id,
+                email=email,
+                display_name=display_name,
+                timezone=timezone,
+            )
+        except IntegrityError:
+            # Several mobile screens load concurrently after sign-in. Another
+            # request may have provisioned this same verified Firebase uid
+            # between the read above and the insert. The unique key is the
+            # authority here; after its transaction commits, reuse that row.
+            concurrent = self.get_user(user_id)
+            if concurrent is not None:
+                return concurrent
+            raise
         return self.get_user(created_user_id)
 
     def get_user(self, user_id: str) -> Optional[sqlite3.Row]:

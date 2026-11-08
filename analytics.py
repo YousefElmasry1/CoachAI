@@ -3768,6 +3768,7 @@ class AnalyticsFormatter:
             "habits": profile.habits.model_dump(),
             "burnout": profile.burnout.model_dump(),
             "best_hour": profile.best_hour.model_dump(),
+            "capacity": profile.capacity.model_dump(),
         }
 
     def to_json(self, profile: AnalyticsProfile) -> str:

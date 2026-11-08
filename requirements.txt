@@ -22,4 +22,6 @@ psycopg2-binary>=2.9.9
 # Patch 3 server-side push providers. No mobile/client SDKs are used.
 firebase-admin>=7.7.0,<8.0.0
 httpx[http2]>=0.28.1,<1.0.0
+# Starlette 1.7 TestClient runtime used by the API contract suite.
+httpx2>=2.16.0,<3.0.0
 cryptography>=49.0.0,<51.0.0

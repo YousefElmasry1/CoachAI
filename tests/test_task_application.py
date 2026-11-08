@@ -14,6 +14,7 @@ from backend_errors import (
 from database import Database, OwnershipError
 from identity import AuthenticatedPrincipal
 from task_application import TaskApplicationService
+from timezone_utils import user_today
 
 
 class TaskApplicationTests(unittest.TestCase):
@@ -23,8 +24,8 @@ class TaskApplicationTests(unittest.TestCase):
         self.db = Database(f"sqlite:///{path.as_posix()}")
         for user_id in ("u1", "u2"):
             self.db.create_user(user_id, f"{user_id}@example.com", user_id, "Africa/Cairo")
-        self.plan1 = self.db.create_plan("u1", date(2026, 10, 8), "test")
-        self.plan2 = self.db.create_plan("u2", date(2026, 10, 8), "test")
+        self.plan1 = self.db.create_plan("u1", user_today(self.db, "u1"), "test")
+        self.plan2 = self.db.create_plan("u2", user_today(self.db, "u2"), "test")
         self.category1 = self.db.create_category("u1", "Work")
         self.category2 = self.db.create_category("u2", "Private")
         self.now = datetime(2026, 10, 8, 8, 0, 0)

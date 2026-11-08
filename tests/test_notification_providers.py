@@ -92,7 +92,10 @@ class ProviderContractTests(unittest.TestCase):
         result = provider.send(self.message())
         self.assertTrue(result.accepted)
         self.assertEqual("projects/test/messages/1", result.provider_message_id)
-        self.assertEqual("test-token", _FakeMessaging.last_message.values["token"])
+        self.assertEqual("test-token", _FakeMessaging.last_message.values["fid"])
+        self.assertNotIn("notification", _FakeMessaging.last_message.values)
+        self.assertEqual("Title", _FakeMessaging.last_message.values["data"]["title"])
+        self.assertEqual("Body", _FakeMessaging.last_message.values["data"]["body"])
         self.assertEqual(10.0, provider._app["options"]["httpTimeout"])
 
     def test_provider_timeout_configuration_is_bounded_and_failure_safe(self):
